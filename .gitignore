@@ -3,6 +3,7 @@
 *.o
 *.so
 *.la
+*.dep
 .libs/
 modules/
 build/
@@ -19,6 +20,7 @@ config.nice
 config.status
 config.sub
 configure
+configure.ac
 configure.ac.bak
 libtool
 mkinstalldirs
@@ -34,7 +36,6 @@ tests/*.exp
 tests/*.log
 tests/*.out
 tests/*.php.bak
-tests/*.sh
 
 # Encoding output / scratch (never commit encoded blobs or test keys)
 *.bcenc
