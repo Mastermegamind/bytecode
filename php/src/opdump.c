@@ -25,6 +25,14 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef _WIN32
+# include <direct.h>
+# include <windows.h>
+# ifndef PATH_MAX
+#  define PATH_MAX MAX_PATH
+# endif
+# define realpath(path, resolved) _fullpath((resolved), (path), PATH_MAX)
+#endif
 
 static zend_op_array *(*opdump_orig_compile_file)(zend_file_handle *file_handle, int type);
 
@@ -35,6 +43,24 @@ typedef struct _opdump_map_entry {
 } opdump_map_entry;
 
 static opdump_map_entry *opdump_tree_map = NULL;
+
+#ifdef _WIN32
+static FILE *opdump_fmemopen(const void *buf, size_t len, const char *mode)
+{
+    (void) mode;
+    FILE *f = tmpfile();
+    if (!f) {
+        return NULL;
+    }
+    if (len && fwrite(buf, 1, len, f) != len) {
+        fclose(f);
+        return NULL;
+    }
+    rewind(f);
+    return f;
+}
+# define fmemopen(buf, len, mode) opdump_fmemopen((buf), (len), (mode))
+#endif
 
 /* ---- binary format helpers ---- */
 
@@ -324,33 +350,66 @@ static char *opdump_strdup_range(const char *start, size_t len)
     return out;
 }
 
+static bool opdump_is_path_separator(char c)
+{
+#ifdef _WIN32
+    return c == '/' || c == '\\';
+#else
+    return c == '/';
+#endif
+}
+
+static bool opdump_is_absolute_path(const char *path)
+{
+    if (!path || !path[0]) {
+        return false;
+    }
+#ifdef _WIN32
+    if ((path[0] >= 'A' && path[0] <= 'Z') || (path[0] >= 'a' && path[0] <= 'z')) {
+        return path[1] == ':' && opdump_is_path_separator(path[2]);
+    }
+    return opdump_is_path_separator(path[0]) && opdump_is_path_separator(path[1]);
+#else
+    return path[0] == '/';
+#endif
+}
+
 static char *opdump_dirname_dup(const char *path)
 {
-    const char *slash = strrchr(path, '/');
+    const char *slash = NULL;
+    for (const char *p = path; *p; p++) {
+        if (opdump_is_path_separator(*p)) {
+            slash = p;
+        }
+    }
     if (!slash) {
         return strdup(".");
     }
     if (slash == path) {
-        return strdup("/");
+        return opdump_strdup_range(path, 1);
     }
     return opdump_strdup_range(path, (size_t)(slash - path));
 }
 
 static char *opdump_join_path(const char *base, const char *path)
 {
-    if (!path || path[0] == '/') {
+    if (!path || opdump_is_absolute_path(path)) {
         return path ? strdup(path) : NULL;
     }
     size_t base_len = strlen(base);
     size_t path_len = strlen(path);
-    bool need_slash = base_len > 0 && base[base_len - 1] != '/';
+    bool need_slash = base_len > 0 && !opdump_is_path_separator(base[base_len - 1]);
     char *out = (char *) malloc(base_len + (need_slash ? 1 : 0) + path_len + 1);
     if (!out) {
         return NULL;
     }
     memcpy(out, base, base_len);
     if (need_slash) {
+#ifdef _WIN32
+        out[base_len++] = '\\';
+#else
         out[base_len++] = '/';
+#endif
     }
     memcpy(out + base_len, path, path_len);
     out[base_len + path_len] = '\0';

@@ -56,6 +56,21 @@ BYTECODE_KEY=... OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map
   php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
 ```
 
+macOS build shape:
+
+```bash
+brew install php openssl@3 pkg-config
+cd php/src
+phpize
+./configure --enable-opdump --with-php-config="$(brew --prefix php)/bin/php-config"
+make
+cd ../..
+php/tests/run-rung1.sh
+```
+
+`config.m4` checks `pkg-config openssl` first, then Homebrew `openssl@3`, then
+falls back to the Linux-style `-lcrypto` link.
+
 ## Using It On A Large PHP Project
 
 Encode the project into a separate output directory. Do not write encoded

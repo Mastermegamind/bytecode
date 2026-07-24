@@ -1,198 +1,309 @@
-#!/usr/bin/env bash
-# Phase 1 tree dumper: walk PHP source and emit encrypted BYTC1 containers.
-# Uses lint mode (-l) so PHP compiles each file without executing it.
-set -euo pipefail
+#!/usr/bin/env php
+<?php
 
-usage() {
-  cat >&2 <<'USAGE'
+declare(strict_types=1);
+
+/*
+ * Phase 1 tree dumper: walk PHP source and emit encrypted BYTC1 containers.
+ * Uses lint mode (-l) so PHP compiles each file without executing it.
+ *
+ * Rewritten from the original Bash version so this tool runs the same way
+ * on Linux, macOS, and Windows -- it only depends on the PHP CLI itself
+ * (proc_open, realpath(), hash_file()), not on sh/realpath(1)/sha256sum/mktemp.
+ */
+
+function usage(): void
+{
+    fwrite(STDERR, <<<'USAGE'
 Usage: bytecode-dump [--raw] [--exclude <glob>]... <source-file-or-dir> <output-dir>
 
 Environment:
   PHP_BIN      PHP binary to use (default: php8.4)
-  OPDUMP_SO   Path to opdump.so (default: ../src/modules/opdump.so)
+  OPDUMP_SO    Path to opdump.so/opdump.dll (default: ../src/modules/<name>)
   BYTECODE_KEY or OPDUMP_KEY
                64 hex chars / 32 bytes, required unless --raw is used
-USAGE
+
+USAGE);
 }
 
-if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
-  usage
-  exit 0
-fi
-
-RAW=0
-EXCLUDES=()
-while [[ $# -gt 0 ]]; do
-  case "${1:-}" in
-    --raw)
-      RAW=1
-      shift
-      ;;
-    --exclude)
-      if [[ -z "${2:-}" ]]; then
-        echo "--exclude requires a glob pattern" >&2
-        exit 2
-      fi
-      EXCLUDES+=("$2")
-      shift 2
-      ;;
-    --exclude=*)
-      EXCLUDES+=("${1#--exclude=}")
-      shift
-      ;;
-    --)
-      shift
-      break
-      ;;
-    -*)
-      usage
-      exit 2
-      ;;
-    *)
-      break
-      ;;
-  esac
-done
-
-if [[ $# -ne 2 ]]; then
-  usage
-  exit 2
-fi
-
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PHP_BIN="${PHP_BIN:-php8.4}"
-OPDUMP_SO="${OPDUMP_SO:-$SCRIPT_DIR/../src/modules/opdump.so}"
-PACKER="$SCRIPT_DIR/bytecode-pack"
-SRC="$1"
-OUT="$2"
-SRC_ABS="$(realpath "$SRC")"
-
-if [[ ! -f "$OPDUMP_SO" ]]; then
-  echo "opdump.so not found at $OPDUMP_SO; build php/src first" >&2
-  exit 1
-fi
-
-if [[ ! -e "$SRC" ]]; then
-  echo "source path does not exist: $SRC" >&2
-  exit 1
-fi
-
-mkdir -p "$OUT"
-MANIFEST_TMP="$(mktemp)"
-MAP_TMP="$(mktemp)"
-MANIFEST_FIRST=1
-
-json_escape() {
-  php -r 'echo json_encode($argv[1], JSON_UNESCAPED_SLASHES);' "$1"
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
 }
 
-if [[ "$RAW" -eq 0 ]]; then
-  {
-    printf '{\n'
-    printf '  "format": "bytecode-manifest-v1",\n'
-    printf '  "php_version_id": %s,\n' "$("$PHP_BIN" -r 'echo PHP_VERSION_ID;')"
-    printf '  "backend": "php-zend-opdump",\n'
-    printf '  "container": "BYTC1",\n'
-    printf '  "source_root": %s,\n' "$(json_escape "$SRC_ABS")"
-    printf '  "map": "bytecode.map",\n'
-    printf '  "files": [\n'
-  } > "$MANIFEST_TMP"
-fi
-
-manifest_add() {
-  local source="$1"
-  local output="$2"
-  local size="$3"
-  local sha="$4"
-
-  if [[ "$MANIFEST_FIRST" -eq 0 ]]; then
-    printf ',\n' >> "$MANIFEST_TMP"
-  fi
-  MANIFEST_FIRST=0
-  {
-    printf '    {\n'
-    printf '      "source": %s,\n' "$(json_escape "$source")"
-    printf '      "output": %s,\n' "$(json_escape "$output")"
-    printf '      "php_version_id": %s,\n' "$("$PHP_BIN" -r 'echo PHP_VERSION_ID;')"
-    printf '      "backend": "php-zend-opdump",\n'
-    printf '      "container": "BYTC1",\n'
-    printf '      "sha256": "%s",\n' "$sha"
-    printf '      "size": %s\n' "$size"
-    printf '    }'
-  } >> "$MANIFEST_TMP"
+/** Translate a shell-style glob (`*`, `?`) into an anchored regex; no fnmatch() dependency (absent on Windows). */
+function glob_to_regex(string $glob): string
+{
+    $regex = '';
+    for ($i = 0, $n = strlen($glob); $i < $n; $i++) {
+        $c = $glob[$i];
+        if ($c === '*') {
+            $regex .= '.*';
+        } elseif ($c === '?') {
+            $regex .= '.';
+        } else {
+            $regex .= preg_quote($c, '#');
+        }
+    }
+    return '#\A' . $regex . '\z#';
 }
 
-map_add() {
-  local source_abs="$1"
-  local output="$2"
-
-  if [[ "$source_abs" == *$'\t'* || "$output" == *$'\t'* ]]; then
-    echo "paths containing tabs are not supported by bytecode.map: $source_abs" >&2
-    exit 1
-  fi
-  printf '%s\t%s\n' "$source_abs" "$output" >> "$MAP_TMP"
+function is_excluded(string $rel, array $excludes): bool
+{
+    foreach ($excludes as $pattern) {
+        if (preg_match(glob_to_regex($pattern), $rel)) {
+            return true;
+        }
+    }
+    return false;
 }
 
-is_excluded() {
-  local rel="$1"
-  local pattern
-  for pattern in "${EXCLUDES[@]}"; do
-    case "$rel" in
-      $pattern) return 0 ;;
-    esac
-  done
-  return 1
+/** Forward-slash relative path regardless of host path separator, so manifest/map entries are portable. */
+function to_rel(string $base, string $path): string
+{
+    $rel = substr($path, strlen($base));
+    $rel = ltrim($rel, '/\\');
+    return str_replace('\\', '/', $rel);
 }
 
-dump_one() {
-  local file="$1"
-  local rel="$2"
-  local source_abs
-  local raw
-  local dest
+function run_subprocess(array $cmd, array $envOverrides): int
+{
+    $prevValues = [];
+    foreach ($envOverrides as $name => $value) {
+        $prevValues[$name] = getenv($name);
+        putenv($value === null ? $name : "{$name}={$value}");
+    }
 
-  source_abs="$(realpath "$file")"
-  if [[ "$RAW" -eq 1 ]]; then
-    dest="$OUT/$rel.opd2"
-    mkdir -p "$(dirname "$dest")"
-    OPDUMP_MODE=dump OPDUMP_OUT="$dest" "$PHP_BIN" -n -d extension="$OPDUMP_SO" -l "$file" >/dev/null
-  else
-    raw="$(mktemp)"
-    dest="$OUT/$rel.bytc"
-    mkdir -p "$(dirname "$dest")"
-    OPDUMP_MODE=dump OPDUMP_OUT="$raw" "$PHP_BIN" -n -d extension="$OPDUMP_SO" -l "$file" >/dev/null
-    "$PACKER" "$raw" "$dest"
-    unlink "$raw"
-    size="$(wc -c < "$dest" | tr -d ' ')"
-    sha="$(sha256sum "$dest" | awk '{print $1}')"
-    manifest_add "$rel" "$rel.bytc" "$size" "$sha"
-    map_add "$source_abs" "$rel.bytc"
-  fi
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if ($proc === false) {
+        foreach ($prevValues as $name => $value) {
+            putenv($value === false ? $name : "{$name}={$value}");
+        }
+        fail('failed to start subprocess: ' . implode(' ', $cmd));
+    }
+    fclose($pipes[0]);
+    stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($proc);
 
-  printf '%s -> %s\n' "$file" "$dest"
+    foreach ($prevValues as $name => $value) {
+        putenv($value === false ? $name : "{$name}={$value}");
+    }
+
+    if ($exit !== 0 && $stderr !== '') {
+        fwrite(STDERR, $stderr);
+    }
+    return $exit;
 }
 
-if [[ -f "$SRC" ]]; then
-  case "$SRC" in
-    *.php) dump_one "$SRC" "$(basename "$SRC")" ;;
-    *) echo "source file is not a .php file: $SRC" >&2; exit 1 ;;
-  esac
-else
-  while IFS= read -r -d '' file; do
-    rel="${file#"$SRC"/}"
-    if is_excluded "$rel"; then
-      continue
-    fi
-    dump_one "$file" "$rel"
-  done < <(find "$SRC" -type f -name '*.php' -print0 | sort -z)
-fi
+$args = array_slice($argv, 1);
+if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
+    usage();
+    exit(0);
+}
 
-if [[ "$RAW" -eq 0 ]]; then
-  {
-    printf '\n'
-    printf '  ]\n'
-    printf '}\n'
-  } >> "$MANIFEST_TMP"
-  mv "$MANIFEST_TMP" "$OUT/bytecode.manifest.json"
-  mv "$MAP_TMP" "$OUT/bytecode.map"
-fi
+$raw = false;
+$excludes = [];
+while ($args) {
+    $a = $args[0];
+    if ($a === '--raw') {
+        $raw = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--exclude') {
+        array_shift($args);
+        if (!$args) {
+            fail('--exclude requires a glob pattern', 2);
+        }
+        $excludes[] = array_shift($args);
+        continue;
+    }
+    if (str_starts_with($a, '--exclude=')) {
+        $excludes[] = substr($a, strlen('--exclude='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--') {
+        array_shift($args);
+        break;
+    }
+    if ($a !== '' && $a[0] === '-') {
+        usage();
+        exit(2);
+    }
+    break;
+}
+
+if (count($args) !== 2) {
+    usage();
+    exit(2);
+}
+[$src, $out] = $args;
+
+$scriptDir = __DIR__;
+$phpBin = getenv('PHP_BIN') ?: 'php8.4';
+$defaultSoName = PHP_OS_FAMILY === 'Windows' ? 'opdump.dll' : 'opdump.so';
+$opdumpSo = getenv('OPDUMP_SO') ?: $scriptDir . '/../src/modules/' . $defaultSoName;
+$packer = $scriptDir . '/bytecode-pack';
+
+if (!is_file($opdumpSo)) {
+    fail("opdump extension not found at {$opdumpSo}; build php/src first");
+}
+if (!file_exists($src)) {
+    fail("source path does not exist: {$src}");
+}
+
+$srcAbs = realpath($src);
+if ($srcAbs === false) {
+    fail("cannot resolve source path: {$src}");
+}
+
+if (!is_dir($out) && !@mkdir($out, 0777, true) && !is_dir($out)) {
+    fail("cannot create output directory: {$out}");
+}
+$outAbs = realpath($out);
+
+function php_version_id(string $phpBin): int
+{
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open([$phpBin, '-r', 'echo PHP_VERSION_ID;'], $descriptors, $pipes);
+    if ($proc === false) {
+        fail("failed to run {$phpBin} to determine PHP_VERSION_ID");
+    }
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    proc_close($proc);
+    return (int) trim($stdout);
+}
+
+$phpVersionId = php_version_id($phpBin);
+
+$manifestFiles = [];
+$mapLines = [];
+
+function dump_one(
+    string $file,
+    string $rel,
+    string $outAbs,
+    string $phpBin,
+    string $opdumpSo,
+    string $packer,
+    bool $raw,
+    int $phpVersionId,
+    array &$manifestFiles,
+    array &$mapLines
+): void {
+    $sourceAbs = realpath($file);
+    if ($sourceAbs === false) {
+        fail("cannot resolve source file: {$file}");
+    }
+
+    if ($raw) {
+        $dest = $outAbs . DIRECTORY_SEPARATOR . $rel . '.opd2';
+        @mkdir(dirname($dest), 0777, true);
+        $exit = run_subprocess(
+            [$phpBin, '-n', '-d', "extension={$opdumpSo}", '-l', $file],
+            ['OPDUMP_MODE' => 'dump', 'OPDUMP_OUT' => $dest]
+        );
+        if ($exit !== 0) {
+            fail("dump failed for {$file}");
+        }
+    } else {
+        $rawTmp = tempnam(sys_get_temp_dir(), 'opdump');
+        if ($rawTmp === false) {
+            fail('cannot create temporary file');
+        }
+        $dest = $outAbs . DIRECTORY_SEPARATOR . $rel . '.bytc';
+        @mkdir(dirname($dest), 0777, true);
+
+        $exit = run_subprocess(
+            [$phpBin, '-n', '-d', "extension={$opdumpSo}", '-l', $file],
+            ['OPDUMP_MODE' => 'dump', 'OPDUMP_OUT' => $rawTmp]
+        );
+        if ($exit !== 0) {
+            unlink($rawTmp);
+            fail("dump failed for {$file}");
+        }
+
+        $exit = run_subprocess([$phpBin, $packer, $rawTmp, $dest], []);
+        unlink($rawTmp);
+        if ($exit !== 0) {
+            fail("pack failed for {$file}");
+        }
+
+        $size = filesize($dest);
+        $sha = hash_file('sha256', $dest);
+        $relBytc = $rel . '.bytc';
+
+        $manifestFiles[] = [
+            'source' => $rel,
+            'output' => $relBytc,
+            'php_version_id' => $phpVersionId,
+            'backend' => 'php-zend-opdump',
+            'container' => 'BYTC1',
+            'sha256' => $sha,
+            'size' => $size,
+        ];
+
+        if (str_contains($sourceAbs, "\t") || str_contains($relBytc, "\t")) {
+            fail("paths containing tabs are not supported by bytecode.map: {$sourceAbs}");
+        }
+        $mapLines[] = str_replace('\\', '/', $sourceAbs) . "\t" . $relBytc;
+    }
+
+    fwrite(STDOUT, "{$file} -> {$dest}\n");
+}
+
+if (is_file($src)) {
+    if (!str_ends_with($src, '.php')) {
+        fail("source file is not a .php file: {$src}");
+    }
+    dump_one($src, basename($src), $outAbs, $phpBin, $opdumpSo, $packer, $raw, $phpVersionId, $manifestFiles, $mapLines);
+} else {
+    $files = [];
+    $iterator = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($srcAbs, FilesystemIterator::SKIP_DOTS)
+    );
+    foreach ($iterator as $fileInfo) {
+        if ($fileInfo->isFile() && $fileInfo->getExtension() === 'php') {
+            $files[] = $fileInfo->getPathname();
+        }
+    }
+    sort($files);
+
+    foreach ($files as $file) {
+        $rel = to_rel($srcAbs, $file);
+        if (is_excluded($rel, $excludes)) {
+            continue;
+        }
+        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $phpVersionId, $manifestFiles, $mapLines);
+    }
+}
+
+if (!$raw) {
+    $manifest = [
+        'format' => 'bytecode-manifest-v1',
+        'php_version_id' => $phpVersionId,
+        'backend' => 'php-zend-opdump',
+        'container' => 'BYTC1',
+        'source_root' => str_replace('\\', '/', $srcAbs),
+        'map' => 'bytecode.map',
+        'files' => $manifestFiles,
+    ];
+
+    file_put_contents(
+        $outAbs . DIRECTORY_SEPARATOR . 'bytecode.manifest.json',
+        json_encode($manifest, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+    );
+    file_put_contents(
+        $outAbs . DIRECTORY_SEPARATOR . 'bytecode.map',
+        implode("\n", $mapLines) . ($mapLines ? "\n" : '')
+    );
+}

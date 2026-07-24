@@ -1,0 +1,29 @@
+// Windows feasibility build for opdump.
+//
+// Scope: rung 1 only until verified on a real PHP-for-Windows/MSVC build.
+// OpenSSL is expected from vcpkg with a triplet matching the target PHP build,
+// for example:
+//
+//   vcpkg install openssl:x64-windows
+//
+// Then configure PHP with --with-prefix pointing at the matching vcpkg install
+// root, or pass --with-opdump=<path-to-vcpkg-installed-triplet>.
+
+ARG_ENABLE("opdump", "Enable opdump (Phase 0 bytecode dump/reload spike)", "no");
+
+if (PHP_OPDUMP != "no") {
+	var openssl_dir = PHP_OPDUMP == "yes" ? "" : PHP_OPDUMP;
+
+	if (openssl_dir && CHECK_HEADER_ADD_INCLUDE("openssl/evp.h", "CFLAGS_OPDUMP", openssl_dir + "\\include")
+			&& (CHECK_LIB("libcrypto.lib", "opdump", openssl_dir + "\\lib")
+				|| CHECK_LIB("crypto.lib", "opdump", openssl_dir + "\\lib"))) {
+		EXTENSION("opdump", "opdump.c");
+		AC_DEFINE("HAVE_OPDUMP", 1, "opdump support");
+	} else if (CHECK_HEADER_ADD_INCLUDE("openssl/evp.h", "CFLAGS_OPDUMP")
+			&& (CHECK_LIB("libcrypto.lib", "opdump") || CHECK_LIB("crypto.lib", "opdump"))) {
+		EXTENSION("opdump", "opdump.c");
+		AC_DEFINE("HAVE_OPDUMP", 1, "opdump support");
+	} else {
+		WARNING("opdump requires OpenSSL headers and libcrypto; install openssl via vcpkg with the matching PHP triplet");
+	}
+}
