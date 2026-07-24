@@ -21,11 +21,20 @@
 #include "zend_vm.h"
 #include "zend_string.h"
 #include <openssl/evp.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
 static zend_op_array *(*opdump_orig_compile_file)(zend_file_handle *file_handle, int type);
+
+typedef struct _opdump_map_entry {
+    char *source;
+    char *encoded;
+    struct _opdump_map_entry *next;
+} opdump_map_entry;
+
+static opdump_map_entry *opdump_tree_map = NULL;
 
 /* ---- binary format helpers ---- */
 
@@ -262,6 +271,134 @@ static unsigned char *opdump_read_file_bytes(const char *path, size_t *out_len)
     return buf;
 }
 
+static char *opdump_strdup_range(const char *start, size_t len)
+{
+    char *out = (char *) malloc(len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, start, len);
+    out[len] = '\0';
+    return out;
+}
+
+static char *opdump_dirname_dup(const char *path)
+{
+    const char *slash = strrchr(path, '/');
+    if (!slash) {
+        return strdup(".");
+    }
+    if (slash == path) {
+        return strdup("/");
+    }
+    return opdump_strdup_range(path, (size_t)(slash - path));
+}
+
+static char *opdump_join_path(const char *base, const char *path)
+{
+    if (!path || path[0] == '/') {
+        return path ? strdup(path) : NULL;
+    }
+    size_t base_len = strlen(base);
+    size_t path_len = strlen(path);
+    bool need_slash = base_len > 0 && base[base_len - 1] != '/';
+    char *out = (char *) malloc(base_len + (need_slash ? 1 : 0) + path_len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, base, base_len);
+    if (need_slash) {
+        out[base_len++] = '/';
+    }
+    memcpy(out + base_len, path, path_len);
+    out[base_len + path_len] = '\0';
+    return out;
+}
+
+static void opdump_map_add(char *source, char *encoded)
+{
+    opdump_map_entry *entry = (opdump_map_entry *) malloc(sizeof(opdump_map_entry));
+    if (!entry) {
+        free(source);
+        free(encoded);
+        return;
+    }
+    entry->source = source;
+    entry->encoded = encoded;
+    entry->next = opdump_tree_map;
+    opdump_tree_map = entry;
+}
+
+static bool opdump_load_tree_map(const char *path)
+{
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        php_error_docref(NULL, E_WARNING, "opdump: cannot open OPDUMP_MAP %s", path);
+        return false;
+    }
+
+    char *map_dir = opdump_dirname_dup(path);
+    char line[8192];
+    while (fgets(line, sizeof(line), f)) {
+        char *newline = strpbrk(line, "\r\n");
+        if (newline) {
+            *newline = '\0';
+        }
+        if (line[0] == '\0' || line[0] == '#') {
+            continue;
+        }
+        char *tab = strchr(line, '\t');
+        if (!tab) {
+            php_error_docref(NULL, E_WARNING, "opdump: malformed map line in %s", path);
+            continue;
+        }
+        *tab = '\0';
+        char *source = strdup(line);
+        char *encoded = opdump_join_path(map_dir, tab + 1);
+        if (source && encoded) {
+            opdump_map_add(source, encoded);
+        } else {
+            free(source);
+            free(encoded);
+        }
+    }
+    free(map_dir);
+    fclose(f);
+    return true;
+}
+
+static const char *opdump_requested_filename(zend_file_handle *file_handle)
+{
+    if (file_handle->opened_path) {
+        return ZSTR_VAL(file_handle->opened_path);
+    }
+    if (file_handle->filename) {
+        return ZSTR_VAL(file_handle->filename);
+    }
+    return NULL;
+}
+
+static const char *opdump_find_tree_blob(zend_file_handle *file_handle)
+{
+    const char *filename = opdump_requested_filename(file_handle);
+    char resolved[PATH_MAX];
+    const char *real = NULL;
+
+    if (!filename) {
+        return NULL;
+    }
+    if (realpath(filename, resolved)) {
+        real = resolved;
+    }
+
+    for (opdump_map_entry *entry = opdump_tree_map; entry; entry = entry->next) {
+        if (strcmp(entry->source, filename) == 0 || (real && strcmp(entry->source, real) == 0)) {
+            return entry->encoded;
+        }
+    }
+    return NULL;
+}
+
 static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned char **out, size_t *out_len)
 {
     size_t off = 4;
@@ -418,6 +555,7 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
     w_u32(f, op_array->T);
     w_i32(f, op_array->cache_size);
     w_i32(f, op_array->last_var);
+    w_i32(f, op_array->last_try_catch);
 
     w_str(f, op_array->filename ? ZSTR_VAL(op_array->filename) : "", op_array->filename ? ZSTR_LEN(op_array->filename) : 0);
     w_u32(f, op_array->line_start);
@@ -442,8 +580,18 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
     for (int i = 0; i < op_array->last_literal; i++) {
         opdump_write_literal(f, &op_array->literals[i]);
     }
+    for (int i = 0; i < op_array->last_try_catch; i++) {
+        zend_try_catch_element *elem = &op_array->try_catch_array[i];
+        w_u32(f, elem->try_op);
+        w_u32(f, elem->catch_op);
+        w_u32(f, elem->finally_op);
+        w_u32(f, elem->finally_end);
+    }
     for (int i = 0; i < op_array->last_var; i++) {
         w_zstr(f, op_array->vars[i]);
+    }
+    if (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE) {
+        opdump_write_arg_info(f, &op_array->arg_info[-1]);
     }
     for (uint32_t i = 0; i < op_array->num_args; i++) {
         opdump_write_arg_info(f, &op_array->arg_info[i]);
@@ -685,6 +833,7 @@ static zend_op_array *opdump_read_op_array(FILE *f)
     uint32_t saved_T = r_u32(f);
     int32_t saved_cache_size = r_i32(f);
     int32_t saved_last_var = r_i32(f);
+    int32_t saved_last_try_catch = r_i32(f);
 
     uint32_t fname_len;
     char *fname = r_str(f, &fname_len);
@@ -717,6 +866,7 @@ static zend_op_array *opdump_read_op_array(FILE *f)
     op_array->T        = saved_T;
     op_array->cache_size = saved_cache_size;
     op_array->last_var = saved_last_var;
+    op_array->last_try_catch = saved_last_try_catch;
     op_array->line_start = r_u32(f);
     op_array->line_end   = r_u32(f);
 
@@ -763,6 +913,17 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         opdump_read_literal(f, &op_array->literals[i]);
     }
 
+    if (op_array->last_try_catch > 0) {
+        op_array->try_catch_array = (zend_try_catch_element *) ecalloc(op_array->last_try_catch, sizeof(zend_try_catch_element));
+        for (int i = 0; i < op_array->last_try_catch; i++) {
+            zend_try_catch_element *elem = &op_array->try_catch_array[i];
+            elem->try_op = r_u32(f);
+            elem->catch_op = r_u32(f);
+            elem->finally_op = r_u32(f);
+            elem->finally_end = r_u32(f);
+        }
+    }
+
     if (op_array->last_var > 0) {
         op_array->vars = (zend_string **) ecalloc(op_array->last_var, sizeof(zend_string *));
         for (int i = 0; i < op_array->last_var; i++) {
@@ -770,8 +931,13 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         }
     }
 
-    if (op_array->num_args > 0) {
-        op_array->arg_info = (zend_arg_info *) ecalloc(op_array->num_args, sizeof(zend_arg_info));
+    if (op_array->num_args > 0 || (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE)) {
+        uint32_t return_slots = (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE) ? 1 : 0;
+        zend_arg_info *arg_info_base = (zend_arg_info *) ecalloc(op_array->num_args + return_slots, sizeof(zend_arg_info));
+        op_array->arg_info = arg_info_base + return_slots;
+        if (return_slots) {
+            opdump_read_arg_info(f, &op_array->arg_info[-1]);
+        }
         for (uint32_t i = 0; i < op_array->num_args; i++) {
             opdump_read_arg_info(f, &op_array->arg_info[i]);
         }
@@ -908,6 +1074,19 @@ static zend_op_array *opdump_load_compile_file(zend_file_handle *file_handle, in
     return opdump_read(in);
 }
 
+static zend_op_array *opdump_load_tree_compile_file(zend_file_handle *file_handle, int type)
+{
+    const char *encoded = opdump_find_tree_blob(file_handle);
+    if (encoded) {
+        if (getenv("OPDUMP_DEBUG")) {
+            const char *filename = opdump_requested_filename(file_handle);
+            fprintf(stderr, "[opdump debug] load-tree %s -> %s\n", filename ? filename : "(unknown)", encoded);
+        }
+        return opdump_read(encoded);
+    }
+    return opdump_orig_compile_file(file_handle, type);
+}
+
 /* ---- module lifecycle ---- */
 
 PHP_MINIT_FUNCTION(opdump)
@@ -918,6 +1097,16 @@ PHP_MINIT_FUNCTION(opdump)
         zend_compile_file = opdump_dump_compile_file;
     } else if (mode && strcmp(mode, "load") == 0) {
         zend_compile_file = opdump_load_compile_file;
+    } else if (mode && strcmp(mode, "load-tree") == 0) {
+        const char *map = getenv("OPDUMP_MAP");
+        if (!map || !map[0]) {
+            map = getenv("BYTECODE_MAP");
+        }
+        if (!map || !map[0]) {
+            php_error_docref(NULL, E_WARNING, "opdump: OPDUMP_MAP/BYTECODE_MAP not set in load-tree mode");
+        } else if (opdump_load_tree_map(map)) {
+            zend_compile_file = opdump_load_tree_compile_file;
+        }
     }
     return SUCCESS;
 }

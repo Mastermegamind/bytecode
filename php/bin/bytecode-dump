@@ -5,7 +5,7 @@ set -euo pipefail
 
 usage() {
   cat >&2 <<'USAGE'
-Usage: bytecode-dump [--raw] <source-file-or-dir> <output-dir>
+Usage: bytecode-dump [--raw] [--exclude <glob>]... <source-file-or-dir> <output-dir>
 
 Environment:
   PHP_BIN      PHP binary to use (default: php8.4)
@@ -21,10 +21,38 @@ if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
 fi
 
 RAW=0
-if [[ "${1:-}" == "--raw" ]]; then
-  RAW=1
-  shift
-fi
+EXCLUDES=()
+while [[ $# -gt 0 ]]; do
+  case "${1:-}" in
+    --raw)
+      RAW=1
+      shift
+      ;;
+    --exclude)
+      if [[ -z "${2:-}" ]]; then
+        echo "--exclude requires a glob pattern" >&2
+        exit 2
+      fi
+      EXCLUDES+=("$2")
+      shift 2
+      ;;
+    --exclude=*)
+      EXCLUDES+=("${1#--exclude=}")
+      shift
+      ;;
+    --)
+      shift
+      break
+      ;;
+    -*)
+      usage
+      exit 2
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
 
 if [[ $# -ne 2 ]]; then
   usage
@@ -37,6 +65,7 @@ OPDUMP_SO="${OPDUMP_SO:-$SCRIPT_DIR/../src/modules/opdump.so}"
 PACKER="$SCRIPT_DIR/bytecode-pack"
 SRC="$1"
 OUT="$2"
+SRC_ABS="$(realpath "$SRC")"
 
 if [[ ! -f "$OPDUMP_SO" ]]; then
   echo "opdump.so not found at $OPDUMP_SO; build php/src first" >&2
@@ -50,7 +79,12 @@ fi
 
 mkdir -p "$OUT"
 MANIFEST_TMP="$(mktemp)"
+MAP_TMP="$(mktemp)"
 MANIFEST_FIRST=1
+
+json_escape() {
+  php -r 'echo json_encode($argv[1], JSON_UNESCAPED_SLASHES);' "$1"
+}
 
 if [[ "$RAW" -eq 0 ]]; then
   {
@@ -59,13 +93,11 @@ if [[ "$RAW" -eq 0 ]]; then
     printf '  "php_version_id": %s,\n' "$("$PHP_BIN" -r 'echo PHP_VERSION_ID;')"
     printf '  "backend": "php-zend-opdump",\n'
     printf '  "container": "BYTC1",\n'
+    printf '  "source_root": %s,\n' "$(json_escape "$SRC_ABS")"
+    printf '  "map": "bytecode.map",\n'
     printf '  "files": [\n'
   } > "$MANIFEST_TMP"
 fi
-
-json_escape() {
-  php -r 'echo json_encode($argv[1], JSON_UNESCAPED_SLASHES);' "$1"
-}
 
 manifest_add() {
   local source="$1"
@@ -90,12 +122,36 @@ manifest_add() {
   } >> "$MANIFEST_TMP"
 }
 
+map_add() {
+  local source_abs="$1"
+  local output="$2"
+
+  if [[ "$source_abs" == *$'\t'* || "$output" == *$'\t'* ]]; then
+    echo "paths containing tabs are not supported by bytecode.map: $source_abs" >&2
+    exit 1
+  fi
+  printf '%s\t%s\n' "$source_abs" "$output" >> "$MAP_TMP"
+}
+
+is_excluded() {
+  local rel="$1"
+  local pattern
+  for pattern in "${EXCLUDES[@]}"; do
+    case "$rel" in
+      $pattern) return 0 ;;
+    esac
+  done
+  return 1
+}
+
 dump_one() {
   local file="$1"
   local rel="$2"
+  local source_abs
   local raw
   local dest
 
+  source_abs="$(realpath "$file")"
   if [[ "$RAW" -eq 1 ]]; then
     dest="$OUT/$rel.opd2"
     mkdir -p "$(dirname "$dest")"
@@ -110,6 +166,7 @@ dump_one() {
     size="$(wc -c < "$dest" | tr -d ' ')"
     sha="$(sha256sum "$dest" | awk '{print $1}')"
     manifest_add "$rel" "$rel.bytc" "$size" "$sha"
+    map_add "$source_abs" "$rel.bytc"
   fi
 
   printf '%s -> %s\n' "$file" "$dest"
@@ -123,6 +180,9 @@ if [[ -f "$SRC" ]]; then
 else
   while IFS= read -r -d '' file; do
     rel="${file#"$SRC"/}"
+    if is_excluded "$rel"; then
+      continue
+    fi
     dump_one "$file" "$rel"
   done < <(find "$SRC" -type f -name '*.php' -print0 | sort -z)
 fi
@@ -134,4 +194,5 @@ if [[ "$RAW" -eq 0 ]]; then
     printf '}\n'
   } >> "$MANIFEST_TMP"
   mv "$MANIFEST_TMP" "$OUT/bytecode.manifest.json"
+  mv "$MAP_TMP" "$OUT/bytecode.map"
 fi

@@ -40,6 +40,9 @@ directly, which is what this project builds toward, version by version.
 php/tests/run-rung1.sh
 php/tests/run-rung2.sh
 php/tests/run-rung3.sh
+php/tests/run-rung4.sh
+php/tests/run-rung5-reflection.sh
+php/tests/run-load-tree.sh
 php/tests/run-phase1-container.sh
 
 php/bin/bytecode-keygen
@@ -48,6 +51,9 @@ php/bin/bytecode-verify /tmp/bytecode-out/bytecode.manifest.json
 
 BYTECODE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   php/bin/bytecode-dump php/tests /tmp/bytecode-out
+
+BYTECODE_KEY=... OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
+  php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
 ```
 
 ## License

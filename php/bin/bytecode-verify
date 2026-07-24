@@ -133,8 +133,32 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
         fail("invalid manifest: {$manifestPath}");
     }
     $baseDir = dirname($manifestPath);
+    $mapName = $manifest['map'] ?? 'bytecode.map';
+    $mapPath = $baseDir . DIRECTORY_SEPARATOR . $mapName;
+    $mapOutputs = [];
+    if (is_file($mapPath)) {
+        foreach (file($mapPath, FILE_IGNORE_NEW_LINES | FILE_SKIP_EMPTY_LINES) ?: [] as $line) {
+            if ($line[0] === '#') {
+                continue;
+            }
+            $parts = explode("\t", $line, 2);
+            if (count($parts) !== 2 || $parts[0] === '' || $parts[1] === '') {
+                fail("invalid map line in {$mapPath}");
+            }
+            $mapOutputs[$parts[1]] = $parts[0];
+            $mappedPath = $baseDir . DIRECTORY_SEPARATOR . $parts[1];
+            if (!is_file($mappedPath)) {
+                fail("{$mapPath}: mapped container missing: {$parts[1]}");
+            }
+        }
+    } else {
+        fail("manifest map missing: {$mapPath}");
+    }
     foreach ($manifest['files'] ?? [] as $entry) {
         $output = $entry['output'] ?? '';
+        if (!isset($mapOutputs[$output])) {
+            fail("{$mapPath}: missing output for manifest entry {$output}");
+        }
         $path = $baseDir . DIRECTORY_SEPARATOR . $output;
         $result = verify_container($path, $hexKey);
         if (($entry['sha256'] ?? '') !== $result['sha256']) {

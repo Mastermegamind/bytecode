@@ -24,11 +24,18 @@ carries user classes compiled from the same filename, class method op_arrays,
 default property slots, and typed property metadata. The first implementation
 bug here was instructive: opcode handlers must be assigned after the entire
 opcode array is read, because handlers such as `ZEND_ASSIGN_OBJ` inspect the
-following `OP_DATA` opcode. The rung intentionally avoids method return types;
-return metadata lives in `arg_info[-1]` and is deferred to the Reflection
-parity work.
+following `OP_DATA` opcode.
 
-Rungs 4–5 (try/catch, Reflection parity) are not started yet.
+Rung 4 (try/catch/finally) — **PASS**, verified with
+`php/tests/run-rung4.sh` on PHP 8.4. The blob now carries
+`try_catch_array` entries so exception jumps behave the same after reload.
+
+Rung 5 (Reflection parity) — **PASS**, verified with
+`php/tests/run-rung5-reflection.sh` on PHP 8.4. The test snapshots
+`ReflectionClass`, constructor `ReflectionParameter` metadata, named and
+nullable types, optional defaults, promoted readonly properties, method return
+types, and a real method call. Return metadata is persisted through
+`arg_info[-1]`, matching Zend's own layout.
 
 ## Real bugs hit and fixed getting rung 1 working
 
@@ -90,6 +97,12 @@ for whoever tackles rungs 2–5 or the 8.1/8.2/8.3/8.5 matrix later.
    opcode handlers while reading opcodes one by one produced
    `Invalid opcode 24/0/1`; setting handlers only after all opcodes are present
    fixed constructor property assignment.
+
+8. **Return types live before the first parameter.** User functions with
+   return types allocate one extra `zend_arg_info` slot and then point
+   `op_array->arg_info` after it. The return metadata is therefore
+   `arg_info[-1]`. Losing that slot makes return type checks and
+   `ReflectionMethod::getReturnType()` wrong.
 
 None of this was discoverable from the public header comments alone —
 these were found by pulling the real PHP 8.4 engine source
