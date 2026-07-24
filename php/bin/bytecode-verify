@@ -52,7 +52,7 @@ function parse_bytc(string $path): array
     $phpVersionId = u32le($bytes, $offset);
     $backendId = take($bytes, $offset, u32le($bytes, $offset));
     $backendFormat = take($bytes, $offset, u32le($bytes, $offset));
-    $aad = substr($bytes, 0, $offset);
+    $headerSize = $offset;
     $nonce = take($bytes, $offset, u32le($bytes, $offset));
     $tag = take($bytes, $offset, u32le($bytes, $offset));
     $ciphertext = take($bytes, $offset, u64le($bytes, $offset));
@@ -60,10 +60,10 @@ function parse_bytc(string $path): array
         fail("{$path}: trailing bytes after ciphertext");
     }
 
-    return compact('bytes', 'version', 'phpVersionId', 'backendId', 'backendFormat', 'aad', 'nonce', 'tag', 'ciphertext');
+    return compact('bytes', 'version', 'phpVersionId', 'backendId', 'backendFormat', 'headerSize', 'nonce', 'tag', 'ciphertext');
 }
 
-function verify_container(string $path, ?string $hexKey): array
+function verify_container(string $path): array
 {
     $container = parse_bytc($path);
     if ($container['version'] !== 1) {
@@ -78,46 +78,20 @@ function verify_container(string $path, ?string $hexKey): array
     if (strlen($container['nonce']) !== 12 || strlen($container['tag']) !== 16) {
         fail("{$path}: unsupported nonce/tag length");
     }
-
-    $payloadOk = null;
-    if ($hexKey !== null) {
-        if (!preg_match('/\\A[0-9a-fA-F]{64}\\z/', $hexKey)) {
-            fail('BYTECODE_KEY/OPDUMP_KEY must be exactly 64 hex characters');
-        }
-        $plain = openssl_decrypt(
-            $container['ciphertext'],
-            'aes-256-gcm',
-            hex2bin($hexKey),
-            OPENSSL_RAW_DATA,
-            $container['nonce'],
-            $container['tag'],
-            $container['aad']
-        );
-        if ($plain === false) {
-            fail("{$path}: AES-GCM authentication/decryption failed");
-        }
-        $payloadOk = substr($plain, 0, 4) === 'OPD2';
-        if (!$payloadOk) {
-            fail("{$path}: decrypted payload is not OPD2");
-        }
-    }
-
     return [
         'path' => $path,
         'sha256' => hash('sha256', $container['bytes']),
         'size' => strlen($container['bytes']),
-        'payload_checked' => $payloadOk === true,
     ];
 }
 
 if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
     fwrite(STDERR, "Usage: bytecode-verify <manifest.json|file.bytc>\n");
-    fwrite(STDERR, "\nSet BYTECODE_KEY or OPDUMP_KEY to also authenticate/decrypt payloads.\n");
+    fwrite(STDERR, "\nValidates BYTC headers, manifest hashes, sizes, and bytecode.map consistency.\n");
     exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
 }
 
 $target = $argv[1];
-$hexKey = getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: null;
 $baseDir = is_dir($target) ? $target : dirname($target);
 $files = [];
 
@@ -160,7 +134,7 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
             fail("{$mapPath}: missing output for manifest entry {$output}");
         }
         $path = $baseDir . DIRECTORY_SEPARATOR . $output;
-        $result = verify_container($path, $hexKey);
+        $result = verify_container($path);
         if (($entry['sha256'] ?? '') !== $result['sha256']) {
             fail("{$path}: manifest sha256 mismatch");
         }
@@ -170,8 +144,8 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
         $files[] = $path;
     }
 } else {
-    verify_container($target, $hexKey);
+    verify_container($target);
     $files[] = $target;
 }
 
-echo 'verified ', count($files), ' file(s)', $hexKey ? ' with payload authentication' : ' (metadata only)', PHP_EOL;
+echo 'verified ', count($files), ' file(s) metadata/hash/map consistency', PHP_EOL;

@@ -39,6 +39,17 @@ static opdump_map_entry *opdump_tree_map = NULL;
 /* ---- binary format helpers ---- */
 
 #define OPDUMP_MAGIC "OPD2"
+#define OPDUMP_MAX_STRING_LEN (16u * 1024u * 1024u)
+#define OPDUMP_MAX_OPCODES 1000000u
+#define OPDUMP_MAX_LITERALS 1000000u
+#define OPDUMP_MAX_VARS 200000u
+#define OPDUMP_MAX_ARGS 10000u
+#define OPDUMP_MAX_DYNAMIC_FUNCS 100000u
+#define OPDUMP_MAX_FILE_FUNCTIONS 100000u
+#define OPDUMP_MAX_FILE_CLASSES 100000u
+#define OPDUMP_MAX_CLASS_METHODS 10000u
+#define OPDUMP_MAX_CLASS_PROPERTIES 10000u
+#define OPDUMP_MAX_TRY_CATCH 100000u
 
 typedef enum {
     OPDUMP_LIT_NULL  = 0,
@@ -68,16 +79,47 @@ static void w_zstr(FILE *f, zend_string *s) {
     }
 }
 
-static uint8_t  r_u8(FILE *f)  { uint8_t v = 0; size_t n = fread(&v, 1, 1, f); (void)n; return v; }
-static uint32_t r_u32(FILE *f) { uint32_t v = 0; size_t n = fread(&v, sizeof(v), 1, f); (void)n; return v; }
-static uint64_t r_u64(FILE *f) { uint64_t v = 0; size_t n = fread(&v, sizeof(v), 1, f); (void)n; return v; }
-static int32_t  r_i32(FILE *f) { int32_t v = 0; size_t n = fread(&v, sizeof(v), 1, f); (void)n; return v; }
-static double   r_dbl(FILE *f) { double v = 0; size_t n = fread(&v, sizeof(v), 1, f); (void)n; return v; }
+static void r_exact(FILE *f, void *buf, size_t len, const char *field)
+{
+    if (len == 0) {
+        return;
+    }
+    if (fread(buf, 1, len, f) != len) {
+        php_error_docref(NULL, E_ERROR, "opdump: truncated or malformed blob while reading %s", field);
+    }
+}
+
+static uint8_t  r_u8(FILE *f)  { uint8_t v = 0; r_exact(f, &v, sizeof(v), "u8"); return v; }
+static uint32_t r_u32(FILE *f) { uint32_t v = 0; r_exact(f, &v, sizeof(v), "u32"); return v; }
+static uint64_t r_u64(FILE *f) { uint64_t v = 0; r_exact(f, &v, sizeof(v), "u64"); return v; }
+static int32_t  r_i32(FILE *f) { int32_t v = 0; r_exact(f, &v, sizeof(v), "i32"); return v; }
+static double   r_dbl(FILE *f) { double v = 0; r_exact(f, &v, sizeof(v), "double"); return v; }
+
+static void opdump_guard_u32(uint32_t value, uint32_t max, const char *field)
+{
+    if (value > max) {
+        php_error_docref(NULL, E_ERROR, "opdump: %s count %u exceeds limit %u", field, value, max);
+    }
+}
+
+static void opdump_guard_i32_nonnegative(int32_t value, uint32_t max, const char *field)
+{
+    if (value < 0 || (uint32_t)value > max) {
+        php_error_docref(NULL, E_ERROR, "opdump: %s count %d is outside supported range 0..%u", field, value, max);
+    }
+}
+
 /* caller frees */
 static char *r_str(FILE *f, uint32_t *out_len) {
     uint32_t len = r_u32(f);
+    if (len > OPDUMP_MAX_STRING_LEN) {
+        php_error_docref(NULL, E_ERROR, "opdump: string length %u exceeds limit %u", len, OPDUMP_MAX_STRING_LEN);
+    }
     char *buf = malloc(len + 1);
-    if (len) { size_t n = fread(buf, 1, len, f); (void)n; }
+    if (!buf) {
+        php_error_docref(NULL, E_ERROR, "opdump: failed to allocate %u byte string", len);
+    }
+    r_exact(f, buf, len, "string payload");
     buf[len] = '\0';
     if (out_len) *out_len = len;
     return buf;
@@ -733,6 +775,8 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     ce->ce_flags = r_u32(f);
     ce->default_properties_count = r_i32(f);
     ce->default_static_members_count = r_i32(f);
+    opdump_guard_i32_nonnegative(ce->default_properties_count, OPDUMP_MAX_CLASS_PROPERTIES, "default properties");
+    opdump_guard_i32_nonnegative(ce->default_static_members_count, OPDUMP_MAX_CLASS_PROPERTIES, "default static members");
     ce->default_object_handlers = &std_object_handlers;
     ce->info.user.filename = r_zstr(f, true);
     ce->info.user.line_start = r_u32(f);
@@ -750,12 +794,14 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     }
 
     uint32_t prop_count = r_u32(f);
+    opdump_guard_u32(prop_count, OPDUMP_MAX_CLASS_PROPERTIES, "class property");
     for (uint32_t i = 0; i < prop_count; i++) {
         zend_property_info *prop = opdump_read_property_info(f, ce);
         zend_hash_add_ptr(&ce->properties_info, prop->name, prop);
     }
 
     uint32_t method_count = r_u32(f);
+    opdump_guard_u32(method_count, OPDUMP_MAX_CLASS_METHODS, "class method");
     for (uint32_t i = 0; i < method_count; i++) {
         zend_string *key = r_zstr(f, true);
         zend_op_array *method = opdump_read_op_array(f);
@@ -834,6 +880,14 @@ static zend_op_array *opdump_read_op_array(FILE *f)
     int32_t saved_cache_size = r_i32(f);
     int32_t saved_last_var = r_i32(f);
     int32_t saved_last_try_catch = r_i32(f);
+    opdump_guard_u32(saved_num_args, OPDUMP_MAX_ARGS, "argument");
+    if (saved_required_num_args > saved_num_args) {
+        php_error_docref(NULL, E_ERROR, "opdump: required_num_args %u exceeds num_args %u", saved_required_num_args, saved_num_args);
+    }
+    opdump_guard_u32(saved_T, OPDUMP_MAX_VARS, "temporary variable");
+    opdump_guard_i32_nonnegative(saved_cache_size, UINT32_MAX, "runtime cache size");
+    opdump_guard_i32_nonnegative(saved_last_var, OPDUMP_MAX_VARS, "compiled variable");
+    opdump_guard_i32_nonnegative(saved_last_try_catch, OPDUMP_MAX_TRY_CATCH, "try/catch");
 
     uint32_t fname_len;
     char *fname = r_str(f, &fname_len);
@@ -871,8 +925,12 @@ static zend_op_array *opdump_read_op_array(FILE *f)
     op_array->line_end   = r_u32(f);
 
     uint32_t last = r_u32(f);
-    int last_literal = (int) r_u32(f);
+    uint32_t last_literal_u32 = r_u32(f);
     uint32_t num_dynamic_func_defs = r_u32(f);
+    opdump_guard_u32(last, OPDUMP_MAX_OPCODES, "opcode");
+    opdump_guard_u32(last_literal_u32, OPDUMP_MAX_LITERALS, "literal");
+    opdump_guard_u32(num_dynamic_func_defs, OPDUMP_MAX_DYNAMIC_FUNCS, "dynamic function");
+    int last_literal = (int) last_literal_u32;
 
     /* Constant operands are NOT stored as offsets into op_array->literals.
      * On 64-bit builds (ZEND_USE_ABS_CONST_ADDR == 0), RT_CONSTANT() computes
@@ -884,8 +942,15 @@ static zend_op_array *opdump_read_op_array(FILE *f)
      * ecalloc() calls -- what an earlier version of this function did --
      * silently produces garbage constant reads, since the offsets baked in
      * at dump time were computed against the original compiler's layout. */
-    size_t ops_size = ZEND_MM_ALIGNED_SIZE_EX(sizeof(zend_op) * last, 16);
-    size_t total_size = ops_size + sizeof(zval) * (size_t)last_literal;
+    if (last > SIZE_MAX / sizeof(zend_op) || (uint32_t)last_literal > SIZE_MAX / sizeof(zval)) {
+        php_error_docref(NULL, E_ERROR, "opdump: opcode/literal allocation size overflow");
+    }
+    size_t ops_size = ZEND_MM_ALIGNED_SIZE_EX(sizeof(zend_op) * (size_t)last, 16);
+    size_t literal_size = sizeof(zval) * (size_t)last_literal;
+    if (ops_size > SIZE_MAX - literal_size) {
+        php_error_docref(NULL, E_ERROR, "opdump: opcode/literal allocation size overflow");
+    }
+    size_t total_size = ops_size + literal_size;
     efree(op_array->opcodes);
     char *block = (char *) ecalloc(1, total_size ? total_size : 1);
     op_array->opcodes = (zend_op *) block;
@@ -972,7 +1037,7 @@ static zend_op_array *opdump_read_op_array(FILE *f)
 static zend_op_array *opdump_read_raw_stream(FILE *f, const char *path)
 {
     char magic[4];
-    size_t n = fread(magic, 1, 4, f); (void)n;
+    r_exact(f, magic, sizeof(magic), "backend magic");
     if (memcmp(magic, OPDUMP_MAGIC, 4) != 0) {
         php_error_docref(NULL, E_ERROR, "opdump: bad backend magic in %s", path);
         return NULL;
@@ -986,6 +1051,7 @@ static zend_op_array *opdump_read_raw_stream(FILE *f, const char *path)
 
     zend_op_array *op_array = opdump_read_op_array(f);
     uint32_t function_count = r_u32(f);
+    opdump_guard_u32(function_count, OPDUMP_MAX_FILE_FUNCTIONS, "file function");
     for (uint32_t i = 0; i < function_count; i++) {
         zend_string *key = r_zstr(f, true);
         zend_op_array *func_op_array = opdump_read_op_array(f);
@@ -993,6 +1059,7 @@ static zend_op_array *opdump_read_raw_stream(FILE *f, const char *path)
         zend_string_release(key);
     }
     uint32_t class_count = r_u32(f);
+    opdump_guard_u32(class_count, OPDUMP_MAX_FILE_CLASSES, "file class");
     for (uint32_t i = 0; i < class_count; i++) {
         zend_string *key = r_zstr(f, true);
         zend_class_entry *ce = opdump_read_class_entry(f);

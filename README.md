@@ -56,6 +56,53 @@ BYTECODE_KEY=... OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map
   php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
 ```
 
+## Using It On A Large PHP Project
+
+Encode the project into a separate output directory. Do not write encoded
+artifacts back into the application tree.
+
+```bash
+cd /var/www/bytecode
+
+KEY="$(php/bin/bytecode-keygen)"
+OUT="/tmp/exam-bytecode"
+
+BYTECODE_KEY="$KEY" php/bin/bytecode-dump \
+  --exclude '.history/*' \
+  --exclude 'vendor/*' \
+  --exclude 'storage/*' \
+  --exclude 'node_modules/*' \
+  /var/www/exam.test \
+  "$OUT"
+```
+
+Verify the manifest, container headers, hashes, sizes, and map file:
+
+```bash
+php/bin/bytecode-verify "$OUT/bytecode.manifest.json"
+```
+
+Run an entrypoint through the encoded tree:
+
+```bash
+BYTECODE_KEY="$KEY" \
+OPDUMP_MODE=load-tree \
+OPDUMP_MAP="$OUT/bytecode.map" \
+php8.4 \
+  -d extension=/var/www/bytecode/php/src/modules/opdump.so \
+  -f /var/www/exam.test/public/index.php
+```
+
+For Composer/PHP-DI/Slim/RoadRunner apps, start by encoding first-party PHP
+files and leaving `vendor/`, `.env`, `storage/`, public assets, caches, and
+editor history out of the encoded set. Composer, PHP-DI, and framework code can
+then keep running normally while matching application files are loaded from
+`.bytc` containers through `bytecode.map`.
+
+Keep the key safe and stable for the deployment. The same `BYTECODE_KEY` used
+to pack the files is required at runtime; the C loader rejects wrong keys
+during AES-GCM authentication before executing the payload.
+
 ## License
 
 MIT — see [`LICENSE`](LICENSE).
