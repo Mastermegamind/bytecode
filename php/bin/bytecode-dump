@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Phase 1 tree dumper: walk PHP source and emit encrypted BYTC1 containers.
+# Uses lint mode (-l) so PHP compiles each file without executing it.
+set -euo pipefail
+
+usage() {
+  cat >&2 <<'USAGE'
+Usage: bytecode-dump [--raw] <source-file-or-dir> <output-dir>
+
+Environment:
+  PHP_BIN      PHP binary to use (default: php8.4)
+  OPDUMP_SO   Path to opdump.so (default: ../src/modules/opdump.so)
+  BYTECODE_KEY or OPDUMP_KEY
+               64 hex chars / 32 bytes, required unless --raw is used
+USAGE
+}
+
+if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then
+  usage
+  exit 0
+fi
+
+RAW=0
+if [[ "${1:-}" == "--raw" ]]; then
+  RAW=1
+  shift
+fi
+
+if [[ $# -ne 2 ]]; then
+  usage
+  exit 2
+fi
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PHP_BIN="${PHP_BIN:-php8.4}"
+OPDUMP_SO="${OPDUMP_SO:-$SCRIPT_DIR/../src/modules/opdump.so}"
+PACKER="$SCRIPT_DIR/bytecode-pack"
+SRC="$1"
+OUT="$2"
+
+if [[ ! -f "$OPDUMP_SO" ]]; then
+  echo "opdump.so not found at $OPDUMP_SO; build php/src first" >&2
+  exit 1
+fi
+
+if [[ ! -e "$SRC" ]]; then
+  echo "source path does not exist: $SRC" >&2
+  exit 1
+fi
+
+mkdir -p "$OUT"
+MANIFEST_TMP="$(mktemp)"
+MANIFEST_FIRST=1
+
+if [[ "$RAW" -eq 0 ]]; then
+  {
+    printf '{\n'
+    printf '  "format": "bytecode-manifest-v1",\n'
+    printf '  "php_version_id": %s,\n' "$("$PHP_BIN" -r 'echo PHP_VERSION_ID;')"
+    printf '  "backend": "php-zend-opdump",\n'
+    printf '  "container": "BYTC1",\n'
+    printf '  "files": [\n'
+  } > "$MANIFEST_TMP"
+fi
+
+json_escape() {
+  php -r 'echo json_encode($argv[1], JSON_UNESCAPED_SLASHES);' "$1"
+}
+
+manifest_add() {
+  local source="$1"
+  local output="$2"
+  local size="$3"
+  local sha="$4"
+
+  if [[ "$MANIFEST_FIRST" -eq 0 ]]; then
+    printf ',\n' >> "$MANIFEST_TMP"
+  fi
+  MANIFEST_FIRST=0
+  {
+    printf '    {\n'
+    printf '      "source": %s,\n' "$(json_escape "$source")"
+    printf '      "output": %s,\n' "$(json_escape "$output")"
+    printf '      "php_version_id": %s,\n' "$("$PHP_BIN" -r 'echo PHP_VERSION_ID;')"
+    printf '      "backend": "php-zend-opdump",\n'
+    printf '      "container": "BYTC1",\n'
+    printf '      "sha256": "%s",\n' "$sha"
+    printf '      "size": %s\n' "$size"
+    printf '    }'
+  } >> "$MANIFEST_TMP"
+}
+
+dump_one() {
+  local file="$1"
+  local rel="$2"
+  local raw
+  local dest
+
+  if [[ "$RAW" -eq 1 ]]; then
+    dest="$OUT/$rel.opd2"
+    mkdir -p "$(dirname "$dest")"
+    OPDUMP_MODE=dump OPDUMP_OUT="$dest" "$PHP_BIN" -n -d extension="$OPDUMP_SO" -l "$file" >/dev/null
+  else
+    raw="$(mktemp)"
+    dest="$OUT/$rel.bytc"
+    mkdir -p "$(dirname "$dest")"
+    OPDUMP_MODE=dump OPDUMP_OUT="$raw" "$PHP_BIN" -n -d extension="$OPDUMP_SO" -l "$file" >/dev/null
+    "$PACKER" "$raw" "$dest"
+    unlink "$raw"
+    size="$(wc -c < "$dest" | tr -d ' ')"
+    sha="$(sha256sum "$dest" | awk '{print $1}')"
+    manifest_add "$rel" "$rel.bytc" "$size" "$sha"
+  fi
+
+  printf '%s -> %s\n' "$file" "$dest"
+}
+
+if [[ -f "$SRC" ]]; then
+  case "$SRC" in
+    *.php) dump_one "$SRC" "$(basename "$SRC")" ;;
+    *) echo "source file is not a .php file: $SRC" >&2; exit 1 ;;
+  esac
+else
+  while IFS= read -r -d '' file; do
+    rel="${file#"$SRC"/}"
+    dump_one "$file" "$rel"
+  done < <(find "$SRC" -type f -name '*.php' -print0 | sort -z)
+fi
+
+if [[ "$RAW" -eq 0 ]]; then
+  {
+    printf '\n'
+    printf '  ]\n'
+    printf '}\n'
+  } >> "$MANIFEST_TMP"
+  mv "$MANIFEST_TMP" "$OUT/bytecode.manifest.json"
+fi

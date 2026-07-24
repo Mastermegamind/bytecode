@@ -1,0 +1,87 @@
+#!/usr/bin/env php
+<?php
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+function u32le(string $bytes, int &$offset): int
+{
+    if (strlen($bytes) < $offset + 4) {
+        fail('truncated container');
+    }
+    $value = unpack('V', substr($bytes, $offset, 4))[1];
+    $offset += 4;
+    return $value;
+}
+
+function u64le(string $bytes, int &$offset): int
+{
+    if (strlen($bytes) < $offset + 8) {
+        fail('truncated container');
+    }
+    $parts = unpack('Vlo/Vhi', substr($bytes, $offset, 8));
+    $offset += 8;
+    return $parts['lo'] + ($parts['hi'] << 32);
+}
+
+function take(string $bytes, int &$offset, int $length): string
+{
+    if ($length < 0 || strlen($bytes) < $offset + $length) {
+        fail('truncated container');
+    }
+    $value = substr($bytes, $offset, $length);
+    $offset += $length;
+    return $value;
+}
+
+function bytc_info(string $path): array
+{
+    $bytes = file_get_contents($path);
+    if ($bytes === false) {
+        fail("cannot read {$path}");
+    }
+    if (substr($bytes, 0, 4) !== 'BYTC') {
+        fail("not a BYTC container: {$path}");
+    }
+
+    $offset = 4;
+    $version = u32le($bytes, $offset);
+    $phpVersionId = u32le($bytes, $offset);
+    $backendId = take($bytes, $offset, u32le($bytes, $offset));
+    $backendFormat = take($bytes, $offset, u32le($bytes, $offset));
+    $headerLength = $offset;
+    $nonce = take($bytes, $offset, u32le($bytes, $offset));
+    $tag = take($bytes, $offset, u32le($bytes, $offset));
+    $ciphertextLength = u64le($bytes, $offset);
+    $ciphertext = take($bytes, $offset, $ciphertextLength);
+    if ($offset !== strlen($bytes)) {
+        fail('container has trailing bytes');
+    }
+
+    return [
+        'path' => $path,
+        'container' => 'BYTC1',
+        'container_version' => $version,
+        'php_version_id' => $phpVersionId,
+        'backend' => $backendId,
+        'backend_format' => $backendFormat,
+        'header_size' => $headerLength,
+        'nonce_size' => strlen($nonce),
+        'tag_size' => strlen($tag),
+        'ciphertext_size' => strlen($ciphertext),
+        'size' => strlen($bytes),
+        'sha256' => hash('sha256', $bytes),
+    ];
+}
+
+if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-info <file.bytc>\n");
+    exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
+}
+
+foreach (bytc_info($argv[1]) as $key => $value) {
+    echo $key, ': ', $value, PHP_EOL;
+}

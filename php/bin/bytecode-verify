@@ -1,0 +1,153 @@
+#!/usr/bin/env php
+<?php
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+function u32le(string $bytes, int &$offset): int
+{
+    if (strlen($bytes) < $offset + 4) {
+        fail('truncated container');
+    }
+    $value = unpack('V', substr($bytes, $offset, 4))[1];
+    $offset += 4;
+    return $value;
+}
+
+function u64le(string $bytes, int &$offset): int
+{
+    if (strlen($bytes) < $offset + 8) {
+        fail('truncated container');
+    }
+    $parts = unpack('Vlo/Vhi', substr($bytes, $offset, 8));
+    $offset += 8;
+    return $parts['lo'] + ($parts['hi'] << 32);
+}
+
+function take(string $bytes, int &$offset, int $length): string
+{
+    if ($length < 0 || strlen($bytes) < $offset + $length) {
+        fail('truncated container');
+    }
+    $value = substr($bytes, $offset, $length);
+    $offset += $length;
+    return $value;
+}
+
+function parse_bytc(string $path): array
+{
+    $bytes = file_get_contents($path);
+    if ($bytes === false) {
+        fail("cannot read {$path}");
+    }
+    if (substr($bytes, 0, 4) !== 'BYTC') {
+        fail("not a BYTC container: {$path}");
+    }
+
+    $offset = 4;
+    $version = u32le($bytes, $offset);
+    $phpVersionId = u32le($bytes, $offset);
+    $backendId = take($bytes, $offset, u32le($bytes, $offset));
+    $backendFormat = take($bytes, $offset, u32le($bytes, $offset));
+    $aad = substr($bytes, 0, $offset);
+    $nonce = take($bytes, $offset, u32le($bytes, $offset));
+    $tag = take($bytes, $offset, u32le($bytes, $offset));
+    $ciphertext = take($bytes, $offset, u64le($bytes, $offset));
+    if ($offset !== strlen($bytes)) {
+        fail("{$path}: trailing bytes after ciphertext");
+    }
+
+    return compact('bytes', 'version', 'phpVersionId', 'backendId', 'backendFormat', 'aad', 'nonce', 'tag', 'ciphertext');
+}
+
+function verify_container(string $path, ?string $hexKey): array
+{
+    $container = parse_bytc($path);
+    if ($container['version'] !== 1) {
+        fail("{$path}: unsupported container version {$container['version']}");
+    }
+    if ($container['phpVersionId'] !== PHP_VERSION_ID) {
+        fail("{$path}: PHP_VERSION_ID {$container['phpVersionId']} does not match " . PHP_VERSION_ID);
+    }
+    if ($container['backendId'] !== 'php-zend-opdump' || $container['backendFormat'] !== 'OPD2') {
+        fail("{$path}: unsupported backend {$container['backendId']}/{$container['backendFormat']}");
+    }
+    if (strlen($container['nonce']) !== 12 || strlen($container['tag']) !== 16) {
+        fail("{$path}: unsupported nonce/tag length");
+    }
+
+    $payloadOk = null;
+    if ($hexKey !== null) {
+        if (!preg_match('/\\A[0-9a-fA-F]{64}\\z/', $hexKey)) {
+            fail('BYTECODE_KEY/OPDUMP_KEY must be exactly 64 hex characters');
+        }
+        $plain = openssl_decrypt(
+            $container['ciphertext'],
+            'aes-256-gcm',
+            hex2bin($hexKey),
+            OPENSSL_RAW_DATA,
+            $container['nonce'],
+            $container['tag'],
+            $container['aad']
+        );
+        if ($plain === false) {
+            fail("{$path}: AES-GCM authentication/decryption failed");
+        }
+        $payloadOk = substr($plain, 0, 4) === 'OPD2';
+        if (!$payloadOk) {
+            fail("{$path}: decrypted payload is not OPD2");
+        }
+    }
+
+    return [
+        'path' => $path,
+        'sha256' => hash('sha256', $container['bytes']),
+        'size' => strlen($container['bytes']),
+        'payload_checked' => $payloadOk === true,
+    ];
+}
+
+if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-verify <manifest.json|file.bytc>\n");
+    fwrite(STDERR, "\nSet BYTECODE_KEY or OPDUMP_KEY to also authenticate/decrypt payloads.\n");
+    exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
+}
+
+$target = $argv[1];
+$hexKey = getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: null;
+$baseDir = is_dir($target) ? $target : dirname($target);
+$files = [];
+
+if (is_dir($target)) {
+    $manifestPath = rtrim($target, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . 'bytecode.manifest.json';
+} else {
+    $manifestPath = $target;
+}
+
+if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
+    $manifest = json_decode(file_get_contents($manifestPath), true);
+    if (!is_array($manifest) || ($manifest['format'] ?? '') !== 'bytecode-manifest-v1') {
+        fail("invalid manifest: {$manifestPath}");
+    }
+    $baseDir = dirname($manifestPath);
+    foreach ($manifest['files'] ?? [] as $entry) {
+        $output = $entry['output'] ?? '';
+        $path = $baseDir . DIRECTORY_SEPARATOR . $output;
+        $result = verify_container($path, $hexKey);
+        if (($entry['sha256'] ?? '') !== $result['sha256']) {
+            fail("{$path}: manifest sha256 mismatch");
+        }
+        if (($entry['size'] ?? 0) !== $result['size']) {
+            fail("{$path}: manifest size mismatch");
+        }
+        $files[] = $path;
+    }
+} else {
+    verify_container($target, $hexKey);
+    $files[] = $target;
+}
+
+echo 'verified ', count($files), ' file(s)', $hexKey ? ' with payload authentication' : ' (metadata only)', PHP_EOL;

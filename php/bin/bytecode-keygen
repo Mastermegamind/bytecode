@@ -1,0 +1,9 @@
+#!/usr/bin/env php
+<?php
+
+if ($argc > 1 && in_array($argv[1], ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-keygen\n\nPrints a 32-byte key as 64 hex characters.\n");
+    exit(0);
+}
+
+echo bin2hex(random_bytes(32)), PHP_EOL;

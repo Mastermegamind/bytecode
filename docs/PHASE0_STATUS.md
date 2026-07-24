@@ -7,8 +7,28 @@ containing deliberately invalid PHP syntax. Output still matches, proving
 the loader path never parses or even reads real source text — only the
 binary blob drives execution.
 
-Rungs 2–5 (function w/ default arg, class + method, try/catch, Reflection
-parity) are not started yet.
+Rung 2 (function definition + call with typed parameter default) — **PASS**,
+verified with `php/tests/run-rung2.sh` on PHP 8.4. The blob now carries
+top-level user functions compiled from the same filename, registers them into
+the fresh process's executor function table before execution, and round-trips
+the function op_array, CV variable names, parameter names, simple scalar
+parameter types, opcodes, and literals. The default value itself is preserved
+through the function body's `ZEND_RECV_INIT` opcode/literal pair; the
+`arg_info.default_value` pointer is intentionally not persisted yet because it
+was not a valid standalone `zend_string*` in the compiled user function on this
+PHP 8.4 build.
+
+Rung 3 (class with constructor, typed property, and method call on `$this`) —
+**PASS**, verified with `php/tests/run-rung3.sh` on PHP 8.4. The blob now
+carries user classes compiled from the same filename, class method op_arrays,
+default property slots, and typed property metadata. The first implementation
+bug here was instructive: opcode handlers must be assigned after the entire
+opcode array is read, because handlers such as `ZEND_ASSIGN_OBJ` inspect the
+following `OP_DATA` opcode. The rung intentionally avoids method return types;
+return metadata lives in `arg_info[-1]` and is deferred to the Reflection
+parity work.
+
+Rungs 4–5 (try/catch, Reflection parity) are not started yet.
 
 ## Real bugs hit and fixed getting rung 1 working
 
@@ -45,8 +65,34 @@ for whoever tackles rungs 2–5 or the 8.1/8.2/8.3/8.5 matrix later.
    reads — no crash, just wrong/empty output, which is a much nastier
    failure mode to debug than a segfault.
 
+4. **Top-level function declarations are not `dynamic_func_defs`.** For rung 2,
+   the main op_array had no dynamic function definitions; the compiled user
+   function was already present in `CG(function_table)` after
+   `zend_compile_file()` returned. The loader must therefore serialize matching
+   user functions from the compiler function table and add them back to
+   `EG(function_table)` in the fresh process before execution, or the first
+   userland function call crashes/looks up nothing useful.
+
+5. **`arg_info.default_value` is not a portable blob field here.** The typed
+   default value executed correctly only after preserving the function opcodes
+   and literals; directly treating `zend_arg_info.default_value` as a
+   `zend_string*` crashed during dump. Reflection parity may still require a
+   more precise reconstruction later, but rung 2 execution does not.
+
+6. **Linked user classes must remain linked.** For simple top-level classes,
+   PHP 8.4 may early-link the class during compilation and omit a
+   `ZEND_DECLARE_CLASS` opcode. Reconstructing the class entry but clearing
+   `ZEND_ACC_LINKED` leaves it present in `EG(class_table)` while
+   `zend_fetch_class_by_name()` still rejects it as not found.
+
+7. **Some VM handlers depend on neighboring opcodes.** `ZEND_ASSIGN_OBJ`
+   chooses a specialized handler using the following `OP_DATA` opcode. Setting
+   opcode handlers while reading opcodes one by one produced
+   `Invalid opcode 24/0/1`; setting handlers only after all opcodes are present
+   fixed constructor property assignment.
+
 None of this was discoverable from the public header comments alone —
-all three were found by pulling the real PHP 8.4 engine source
+these were found by pulling the real PHP 8.4 engine source
 (`Zend/zend_opcode.c`, `Zend/zend_compile.c`, `Zend/zend.c` from the
 `PHP-8.4` branch of php/php-src) and reading what the real compiler does at
 each step, then matching it exactly. Expect the same kind of archaeology

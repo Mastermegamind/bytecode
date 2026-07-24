@@ -1,0 +1,66 @@
+#!/usr/bin/env php
+<?php
+
+if ($argc !== 3 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-pack <raw-opd2-blob> <container-output>\n");
+    fwrite(STDERR, "\nEnvironment:\n  BYTECODE_KEY or OPDUMP_KEY  64 hex chars / 32 bytes\n");
+    exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
+}
+
+$rawPath = $argv[1];
+$outPath = $argv[2];
+$hexKey = getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '';
+
+if (!preg_match('/\\A[0-9a-fA-F]{64}\\z/', $hexKey)) {
+    fwrite(STDERR, "BYTECODE_KEY/OPDUMP_KEY must be exactly 64 hex characters\n");
+    exit(1);
+}
+
+$raw = file_get_contents($rawPath);
+if ($raw === false) {
+    fwrite(STDERR, "cannot read raw blob: {$rawPath}\n");
+    exit(1);
+}
+if (substr($raw, 0, 4) !== 'OPD2') {
+    fwrite(STDERR, "raw blob is not OPD2: {$rawPath}\n");
+    exit(1);
+}
+
+$key = hex2bin($hexKey);
+$nonce = random_bytes(12);
+$backendId = 'php-zend-opdump';
+$backendFormat = 'OPD2';
+$phpVersionId = PHP_VERSION_ID;
+
+$header = 'BYTC'
+    . pack('V', 1)
+    . pack('V', $phpVersionId)
+    . pack('V', strlen($backendId)) . $backendId
+    . pack('V', strlen($backendFormat)) . $backendFormat;
+
+$tag = '';
+$ciphertext = openssl_encrypt(
+    $raw,
+    'aes-256-gcm',
+    $key,
+    OPENSSL_RAW_DATA,
+    $nonce,
+    $tag,
+    $header,
+    16
+);
+
+if ($ciphertext === false) {
+    fwrite(STDERR, "AES-256-GCM encryption failed\n");
+    exit(1);
+}
+
+$container = $header
+    . pack('V', strlen($nonce)) . $nonce
+    . pack('V', strlen($tag)) . $tag
+    . pack('P', strlen($ciphertext)) . $ciphertext;
+
+if (file_put_contents($outPath, $container) === false) {
+    fwrite(STDERR, "cannot write container: {$outPath}\n");
+    exit(1);
+}

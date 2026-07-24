@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
-# Rung 1 of the Phase 0 test ladder (docs/PHASE0.md): dump a trivial
-# top-level script, then reload+execute it from the blob while pointing at
-# a file containing deliberately invalid PHP syntax -- if output still
-# matches, the loader never touched source text at all.
+# Rung 2 of the Phase 0 test ladder: a function definition + call with a
+# typed parameter and a default value.
 set -euo pipefail
 cd "$(dirname "$0")/../src"
 
@@ -20,10 +18,10 @@ trap 'rm -f "$BLOB" "$DECOY"' EXIT
 printf '<?php this is not valid php syntax !!! %%%%%%\n' > "$DECOY"
 
 echo "--- dump ---"
-OPDUMP_MODE=dump OPDUMP_OUT="$BLOB" "$PHP_BIN" -n -d extension="$SO" -f ../tests/rung1.php
+OPDUMP_MODE=dump OPDUMP_OUT="$BLOB" "$PHP_BIN" -n -d extension="$SO" -f ../tests/rung2.php
 
 echo
 echo "--- load (pointed at invalid-syntax decoy file, to prove source text is never read) ---"
 OPDUMP_MODE=load OPDUMP_IN="$BLOB" "$PHP_BIN" -n -d extension="$SO" -f "$DECOY"
 echo
-echo "rung 1: PASS"
+echo "rung 2: PASS"

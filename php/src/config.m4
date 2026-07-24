@@ -4,5 +4,7 @@ PHP_ARG_ENABLE([opdump],
   [yes])
 
 if test "$PHP_OPDUMP" != "no"; then
+  PHP_ADD_LIBRARY([crypto], 1, [OPDUMP_SHARED_LIBADD])
   PHP_NEW_EXTENSION(opdump, opdump.c, $ext_shared)
+  PHP_SUBST([OPDUMP_SHARED_LIBADD])
 fi
