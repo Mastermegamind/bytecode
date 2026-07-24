@@ -60,7 +60,6 @@ class EncoderPage extends StatefulWidget {
 
 class _EncoderPageState extends State<EncoderPage> {
   late final TextEditingController _rootController;
-  final _sourceController = TextEditingController();
   final _outputController = TextEditingController();
   final _keyController = TextEditingController();
   final _excludeController = TextEditingController(
@@ -69,6 +68,7 @@ class _EncoderPageState extends State<EncoderPage> {
 
   final _log = StringBuffer();
   final _manifestRows = <ManifestEntry>[];
+  final _sources = <String>[];
 
   bool _busy = false;
   String? _status;
@@ -82,7 +82,6 @@ class _EncoderPageState extends State<EncoderPage> {
   @override
   void dispose() {
     _rootController.dispose();
-    _sourceController.dispose();
     _outputController.dispose();
     _keyController.dispose();
     _excludeController.dispose();
@@ -113,6 +112,40 @@ class _EncoderPageState extends State<EncoderPage> {
     }
   }
 
+  Future<void> _addFiles() async {
+    final files = await openFiles();
+    if (files.isEmpty) {
+      return;
+    }
+    setState(() {
+      for (final file in files) {
+        if (!_sources.contains(file.path)) {
+          _sources.add(file.path);
+        }
+      }
+    });
+  }
+
+  Future<void> _addFolder() async {
+    final path = await getDirectoryPath();
+    if (path == null) {
+      return;
+    }
+    setState(() {
+      if (!_sources.contains(path)) {
+        _sources.add(path);
+      }
+    });
+  }
+
+  void _removeSource(String source) {
+    setState(() => _sources.remove(source));
+  }
+
+  void _clearSources() {
+    setState(() => _sources.clear());
+  }
+
   Future<void> _generateKey() async {
     await _runLocked(() async {
       final result = await Process.run('php', [
@@ -138,11 +171,12 @@ class _EncoderPageState extends State<EncoderPage> {
   }
 
   Future<void> _dump() async {
-    final source = _sourceController.text.trim();
     final output = _outputController.text.trim();
     final key = _keyController.text.trim();
-    if (source.isEmpty || output.isEmpty || key.isEmpty) {
-      setState(() => _status = 'Source, output, and key are required');
+    if (_sources.isEmpty || output.isEmpty || key.isEmpty) {
+      setState(
+        () => _status = 'At least one source, output, and key are required',
+      );
       return;
     }
     if (!RegExp(r'\A[0-9a-fA-F]{64}\z').hasMatch(key)) {
@@ -161,7 +195,7 @@ class _EncoderPageState extends State<EncoderPage> {
         [
           _join(_root, 'php/bin/bytecode-dump'),
           ..._excludeArgs(),
-          source,
+          ..._sources,
           output,
         ],
         workingDirectory: _root,
@@ -255,14 +289,17 @@ class _EncoderPageState extends State<EncoderPage> {
           children: [
             _Controls(
               rootController: _rootController,
-              sourceController: _sourceController,
               outputController: _outputController,
               keyController: _keyController,
               excludeController: _excludeController,
+              sources: _sources,
               busy: _busy,
               onPickRoot: () => _pickFolder(_rootController),
-              onPickSource: () => _pickFolder(_sourceController),
               onPickOutput: () => _pickFolder(_outputController),
+              onAddFiles: _addFiles,
+              onAddFolder: _addFolder,
+              onRemoveSource: _removeSource,
+              onClearSources: _clearSources,
               onGenerateKey: _generateKey,
               onDump: _dump,
               onVerify: _verify,
@@ -297,28 +334,34 @@ class _EncoderPageState extends State<EncoderPage> {
 class _Controls extends StatelessWidget {
   const _Controls({
     required this.rootController,
-    required this.sourceController,
     required this.outputController,
     required this.keyController,
     required this.excludeController,
+    required this.sources,
     required this.busy,
     required this.onPickRoot,
-    required this.onPickSource,
     required this.onPickOutput,
+    required this.onAddFiles,
+    required this.onAddFolder,
+    required this.onRemoveSource,
+    required this.onClearSources,
     required this.onGenerateKey,
     required this.onDump,
     required this.onVerify,
   });
 
   final TextEditingController rootController;
-  final TextEditingController sourceController;
   final TextEditingController outputController;
   final TextEditingController keyController;
   final TextEditingController excludeController;
+  final List<String> sources;
   final bool busy;
   final VoidCallback onPickRoot;
-  final VoidCallback onPickSource;
   final VoidCallback onPickOutput;
+  final VoidCallback onAddFiles;
+  final VoidCallback onAddFolder;
+  final ValueChanged<String> onRemoveSource;
+  final VoidCallback onClearSources;
   final VoidCallback onGenerateKey;
   final VoidCallback onDump;
   final VoidCallback onVerify;
@@ -346,17 +389,16 @@ class _Controls extends StatelessWidget {
         const SizedBox(height: 8),
         Row(
           children: [
-            Expanded(
-              child: _PathField(
-                label: 'Source folder',
-                controller: sourceController,
-              ),
+            FilledButton.icon(
+              onPressed: busy ? null : onAddFiles,
+              icon: const Icon(Icons.note_add),
+              label: const Text('Add Files'),
             ),
             const SizedBox(width: 8),
-            IconButton(
-              tooltip: 'Choose source folder',
-              onPressed: busy ? null : onPickSource,
-              icon: const Icon(Icons.folder_open),
+            FilledButton.tonalIcon(
+              onPressed: busy ? null : onAddFolder,
+              icon: const Icon(Icons.create_new_folder),
+              label: const Text('Add Folder'),
             ),
             const SizedBox(width: 12),
             Expanded(
@@ -372,6 +414,13 @@ class _Controls extends StatelessWidget {
               icon: const Icon(Icons.create_new_folder),
             ),
           ],
+        ),
+        const SizedBox(height: 8),
+        _SourceList(
+          sources: sources,
+          busy: busy,
+          onRemove: onRemoveSource,
+          onClear: onClearSources,
         ),
         const SizedBox(height: 8),
         Row(
@@ -441,6 +490,74 @@ class _PathField extends StatelessWidget {
       decoration: InputDecoration(
         labelText: label,
         border: const OutlineInputBorder(),
+      ),
+    );
+  }
+}
+
+class _SourceList extends StatelessWidget {
+  const _SourceList({
+    required this.sources,
+    required this.busy,
+    required this.onRemove,
+    required this.onClear,
+  });
+
+  final List<String> sources;
+  final bool busy;
+  final ValueChanged<String> onRemove;
+  final VoidCallback onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    return DecoratedBox(
+      decoration: BoxDecoration(
+        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: SizedBox(
+        height: 108,
+        child: sources.isEmpty
+            ? const Center(child: Text('No files or folders selected'))
+            : Column(
+                children: [
+                  Expanded(
+                    child: ListView.separated(
+                      itemCount: sources.length,
+                      separatorBuilder: (_, _) => const Divider(height: 1),
+                      itemBuilder: (context, index) {
+                        final source = sources[index];
+                        return ListTile(
+                          dense: true,
+                          leading: Icon(
+                            FileSystemEntity.isDirectorySync(source)
+                                ? Icons.folder
+                                : Icons.description,
+                          ),
+                          title: Text(
+                            source,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                          trailing: IconButton(
+                            tooltip: 'Remove source',
+                            onPressed: busy ? null : () => onRemove(source),
+                            icon: const Icon(Icons.close),
+                          ),
+                        );
+                      },
+                    ),
+                  ),
+                  Align(
+                    alignment: Alignment.centerRight,
+                    child: TextButton.icon(
+                      onPressed: busy ? null : onClear,
+                      icon: const Icon(Icons.clear_all),
+                      label: const Text('Clear'),
+                    ),
+                  ),
+                ],
+              ),
       ),
     );
   }

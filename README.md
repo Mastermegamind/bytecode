@@ -52,6 +52,8 @@ php/bin/bytecode-verify /tmp/bytecode-out/bytecode.manifest.json
 BYTECODE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
   php/bin/bytecode-dump php/tests /tmp/bytecode-out
 
+BYTECODE_KEY=... php/bin/bytecode-dump app routes/config.php /tmp/bytecode-out
+
 BYTECODE_KEY=... OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
   php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
 ```
@@ -74,7 +76,9 @@ falls back to the Linux-style `-lcrypto` link.
 ## Using It On A Large PHP Project
 
 Encode the project into a separate output directory. Do not write encoded
-artifacts back into the application tree.
+artifacts back into the application tree. You can pass one file/folder or many
+files/folders; when more than one input is passed, the output keeps the selected
+paths under their common parent directory.
 
 ```bash
 cd /var/www/bytecode

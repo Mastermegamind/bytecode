@@ -15,7 +15,7 @@ declare(strict_types=1);
 function usage(): void
 {
     fwrite(STDERR, <<<'USAGE'
-Usage: bytecode-dump [--raw] [--exclude <glob>]... <source-file-or-dir> <output-dir>
+Usage: bytecode-dump [--raw] [--exclude <glob>]... <source-file-or-dir>... <output-dir>
 
 Environment:
   PHP_BIN      PHP binary to use (default: php8.4)
@@ -139,11 +139,12 @@ while ($args) {
     break;
 }
 
-if (count($args) !== 2) {
+if (count($args) < 2) {
     usage();
     exit(2);
 }
-[$src, $out] = $args;
+$out = array_pop($args);
+$sources = $args;
 
 $scriptDir = __DIR__;
 $phpBin = getenv('PHP_BIN') ?: 'php8.4';
@@ -154,19 +155,13 @@ $packer = $scriptDir . '/bytecode-pack';
 if (!is_file($opdumpSo)) {
     fail("opdump extension not found at {$opdumpSo}; build php/src first");
 }
-if (!file_exists($src)) {
-    fail("source path does not exist: {$src}");
-}
-
-$srcAbs = realpath($src);
-if ($srcAbs === false) {
-    fail("cannot resolve source path: {$src}");
-}
-
 if (!is_dir($out) && !@mkdir($out, 0777, true) && !is_dir($out)) {
     fail("cannot create output directory: {$out}");
 }
 $outAbs = realpath($out);
+if ($outAbs === false) {
+    fail("cannot resolve output directory: {$out}");
+}
 
 function php_version_id(string $phpBin): int
 {
@@ -188,6 +183,72 @@ $phpVersionId = php_version_id($phpBin);
 $manifestFiles = [];
 $mapLines = [];
 
+function path_parts(string $path): array
+{
+    $path = str_replace('\\', '/', $path);
+    $prefix = '';
+    if (preg_match('#\A[A-Za-z]:/#', $path) === 1) {
+        $prefix = substr($path, 0, 2);
+        $path = substr($path, 2);
+    }
+    $parts = array_values(array_filter(explode('/', trim($path, '/')), static fn (string $part): bool => $part !== ''));
+    if ($prefix !== '') {
+        array_unshift($parts, $prefix);
+    }
+    return $parts;
+}
+
+function path_from_parts(array $parts): string
+{
+    if (!$parts) {
+        return DIRECTORY_SEPARATOR;
+    }
+    if (preg_match('#\A[A-Za-z]:\z#', $parts[0]) === 1) {
+        $drive = array_shift($parts);
+        return $drive . DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $parts);
+    }
+    return DIRECTORY_SEPARATOR . implode(DIRECTORY_SEPARATOR, $parts);
+}
+
+function common_base(array $paths): string
+{
+    $common = path_parts(array_shift($paths));
+    foreach ($paths as $path) {
+        $parts = path_parts($path);
+        $limit = min(count($common), count($parts));
+        $next = [];
+        for ($i = 0; $i < $limit; $i++) {
+            if ($common[$i] !== $parts[$i]) {
+                break;
+            }
+            $next[] = $common[$i];
+        }
+        $common = $next;
+    }
+    return path_from_parts($common);
+}
+
+$sourceAbsList = [];
+foreach ($sources as $source) {
+    if (!file_exists($source)) {
+        fail("source path does not exist: {$source}");
+    }
+    $sourceAbs = realpath($source);
+    if ($sourceAbs === false) {
+        fail("cannot resolve source path: {$source}");
+    }
+    $sourceAbsList[] = $sourceAbs;
+}
+
+$multiSource = count($sourceAbsList) > 1;
+$commonInputs = [];
+foreach ($sourceAbsList as $sourceAbs) {
+    $commonInputs[] = $multiSource
+        ? (is_dir($sourceAbs) ? dirname($sourceAbs) : dirname($sourceAbs))
+        : (is_dir($sourceAbs) ? $sourceAbs : dirname($sourceAbs));
+}
+$relativeBase = common_base($commonInputs);
+
 function dump_one(
     string $file,
     string $rel,
@@ -200,13 +261,21 @@ function dump_one(
     array &$manifestFiles,
     array &$mapLines
 ): void {
+    static $seenOutputs = [];
+
     $sourceAbs = realpath($file);
     if ($sourceAbs === false) {
         fail("cannot resolve source file: {$file}");
     }
 
+    $relativeOutput = $rel . ($raw ? '.opd2' : '.bytc');
+    if (isset($seenOutputs[$relativeOutput])) {
+        fail("duplicate output path {$relativeOutput} from {$file} and {$seenOutputs[$relativeOutput]}");
+    }
+    $seenOutputs[$relativeOutput] = $file;
+
     if ($raw) {
-        $dest = $outAbs . DIRECTORY_SEPARATOR . $rel . '.opd2';
+        $dest = $outAbs . DIRECTORY_SEPARATOR . $relativeOutput;
         @mkdir(dirname($dest), 0777, true);
         $exit = run_subprocess(
             [$phpBin, '-n', '-d', "extension={$opdumpSo}", '-l', $file],
@@ -220,7 +289,7 @@ function dump_one(
         if ($rawTmp === false) {
             fail('cannot create temporary file');
         }
-        $dest = $outAbs . DIRECTORY_SEPARATOR . $rel . '.bytc';
+        $dest = $outAbs . DIRECTORY_SEPARATOR . $relativeOutput;
         @mkdir(dirname($dest), 0777, true);
 
         $exit = run_subprocess(
@@ -240,7 +309,7 @@ function dump_one(
 
         $size = filesize($dest);
         $sha = hash_file('sha256', $dest);
-        $relBytc = $rel . '.bytc';
+        $relBytc = $relativeOutput;
 
         $manifestFiles[] = [
             'source' => $rel,
@@ -261,12 +330,19 @@ function dump_one(
     fwrite(STDOUT, "{$file} -> {$dest}\n");
 }
 
-if (is_file($src)) {
-    if (!str_ends_with($src, '.php')) {
-        fail("source file is not a .php file: {$src}");
+foreach ($sourceAbsList as $srcAbs) {
+    if (is_file($srcAbs)) {
+        if (!str_ends_with($srcAbs, '.php')) {
+            fail("source file is not a .php file: {$srcAbs}");
+        }
+        $rel = $multiSource ? to_rel($relativeBase, $srcAbs) : basename($srcAbs);
+        if (is_excluded($rel, $excludes)) {
+            continue;
+        }
+        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $phpVersionId, $manifestFiles, $mapLines);
+        continue;
     }
-    dump_one($src, basename($src), $outAbs, $phpBin, $opdumpSo, $packer, $raw, $phpVersionId, $manifestFiles, $mapLines);
-} else {
+
     $files = [];
     $iterator = new RecursiveIteratorIterator(
         new RecursiveDirectoryIterator($srcAbs, FilesystemIterator::SKIP_DOTS)
@@ -279,7 +355,7 @@ if (is_file($src)) {
     sort($files);
 
     foreach ($files as $file) {
-        $rel = to_rel($srcAbs, $file);
+        $rel = to_rel($multiSource ? $relativeBase : $srcAbs, $file);
         if (is_excluded($rel, $excludes)) {
             continue;
         }
@@ -293,7 +369,8 @@ if (!$raw) {
         'php_version_id' => $phpVersionId,
         'backend' => 'php-zend-opdump',
         'container' => 'BYTC1',
-        'source_root' => str_replace('\\', '/', $srcAbs),
+        'source_root' => str_replace('\\', '/', $relativeBase),
+        'source_roots' => array_map(static fn (string $source): string => str_replace('\\', '/', $source), $sourceAbsList),
         'map' => 'bytecode.map',
         'files' => $manifestFiles,
     ];
