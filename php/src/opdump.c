@@ -18,6 +18,10 @@
 
 #include "php.h"
 #include "zend_compile.h"
+#ifndef ZEND_EXT_API
+# define ZEND_EXT_API ZEND_DLEXPORT
+#endif
+#include "zend_extensions.h"
 #include "zend_vm.h"
 #include "zend_string.h"
 #include <openssl/evp.h>
@@ -90,6 +94,7 @@ static void opdump_unlock_mem(void *p, size_t len)
 }
 
 static zend_op_array *(*opdump_orig_compile_file)(zend_file_handle *file_handle, int type);
+static bool opdump_hooks_started = false;
 
 static void opdump_init_run_time_cache(zend_op_array *op_array)
 {
@@ -1887,10 +1892,11 @@ static zend_op_array *opdump_load_tree_compile_file(zend_file_handle *file_handl
     return opdump_orig_compile_file(file_handle, type);
 }
 
-/* ---- module lifecycle ---- */
-
-PHP_MINIT_FUNCTION(opdump)
+static int opdump_startup_hooks(void)
 {
+    if (opdump_hooks_started) {
+        return SUCCESS;
+    }
     opdump_disable_core_dumps();
     opdump_orig_compile_file = zend_compile_file;
     const char *mode = getenv("OPDUMP_MODE");
@@ -1909,20 +1915,43 @@ PHP_MINIT_FUNCTION(opdump)
             zend_compile_file = opdump_load_tree_compile_file;
         }
     }
+    opdump_hooks_started = true;
     return SUCCESS;
+}
+
+static void opdump_shutdown_hooks(void)
+{
+    if (opdump_hooks_started && opdump_orig_compile_file) {
+        zend_compile_file = opdump_orig_compile_file;
+        opdump_orig_compile_file = NULL;
+        opdump_hooks_started = false;
+    }
 }
 
 /* Cleanses the cached license DEK (if license mode ever unwrapped one) once
  * per process, rather than immediately after each derivation -- it has to
  * survive for the whole request/process to avoid re-doing an RSA-OAEP
  * unwrap per file in load-tree mode (see opdump_license_resolve_ikm). */
-PHP_MSHUTDOWN_FUNCTION(opdump)
+static void opdump_clean_license_cache(void)
 {
     if (opdump_license_ikm_ready) {
         opdump_unlock_mem(opdump_license_ikm_cache, sizeof(opdump_license_ikm_cache));
         OPENSSL_cleanse(opdump_license_ikm_cache, sizeof(opdump_license_ikm_cache));
         opdump_license_ikm_ready = false;
     }
+}
+
+/* ---- module lifecycle ---- */
+
+PHP_MINIT_FUNCTION(opdump)
+{
+    return opdump_startup_hooks();
+}
+
+PHP_MSHUTDOWN_FUNCTION(opdump)
+{
+    opdump_shutdown_hooks();
+    opdump_clean_license_cache();
     return SUCCESS;
 }
 
@@ -1940,3 +1969,32 @@ zend_module_entry opdump_module_entry = {
 #ifdef COMPILE_DL_OPDUMP
 ZEND_GET_MODULE(opdump)
 #endif
+
+/* Zend-extension entry point. Loading the same .so with
+ * `zend_extension=opdump.so` makes PHP list it beside OPcache/ionCube in
+ * `php -v`, while reusing the same compile-file hook implementation above. */
+static int opdump_zend_startup(zend_extension *extension)
+{
+    (void) extension;
+    return opdump_startup_hooks();
+}
+
+static void opdump_zend_shutdown(zend_extension *extension)
+{
+    (void) extension;
+    opdump_shutdown_hooks();
+    opdump_clean_license_cache();
+}
+
+ZEND_EXTENSION();
+
+ZEND_EXT_API zend_extension zend_extension_entry = {
+    .name = "Bytecode PHP Loader",
+    .version = "0.0.1-phase0",
+    .author = "MegaMind Technologies LTD",
+    .URL = "https://github.com/Mastermegamind/bytecode",
+    .copyright = "Copyright (c) 2026 MegaMind Technologies LTD",
+    .startup = opdump_zend_startup,
+    .shutdown = opdump_zend_shutdown,
+    .resource_number = -1
+};

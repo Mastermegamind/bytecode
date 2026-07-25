@@ -174,6 +174,31 @@ Then run a smoke test:
 PHP_BIN=php8.4 php/tests/run-rung1.sh
 ```
 
+For ionCube-style loading and a `php -v` banner entry, load the same shared
+object as a Zend extension:
+
+```bash
+php8.4 -n -d zend_extension=/var/www/bytecode/php/src/modules/opdump.so -v
+```
+
+Expected shape:
+
+```text
+Zend Engine v4.4.23, Copyright (c) Zend Technologies
+    with Bytecode PHP Loader v0.0.1-phase0, Copyright (c) 2026 MegaMind Technologies LTD, by MegaMind Technologies LTD
+```
+
+Runtime bytecode loading works through the Zend-extension path too:
+
+```bash
+BYTECODE_KEY="$KEY" \
+OPDUMP_MODE=load-tree \
+OPDUMP_MAP="$OUT/bytecode.map" \
+php8.4 \
+  -d zend_extension=/var/www/bytecode/php/src/modules/opdump.so \
+  -f /path/to/app/public/index.php
+```
+
 On macOS:
 
 ```bash
