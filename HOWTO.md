@@ -1,7 +1,7 @@
 # How To Use Bytecode Encoder
 
 A practical, example-driven guide to encoding PHP source into encrypted
-`.bytc` containers and running it, using either the command-line tools or
+`BYTC2` containers and running it, using either the command-line tools or
 the desktop GUI. For the architecture and roadmap, see
 [`README.md`](README.md) and [`docs/PLAN.md`](docs/PLAN.md). For the
 container/key-model internals, see
@@ -34,9 +34,9 @@ it — none of it is hypothetical.
 | Term | Meaning |
 |---|---|
 | **`opdump`** | The Zend extension (`php/src/opdump.c`) that hooks PHP's compile step. In `dump` mode it serializes a compiled `zend_op_array` to disk instead of executing it; in `load`/`load-tree` mode it reconstructs one from disk *without ever parsing PHP source text*. |
-| **`.bytc`** | One encoded file: an AES-256-GCM-encrypted container (`BYTC2` format) holding one source file's compiled bytecode. |
+| **Container** (`BYTC2`) | One encoded file: an AES-256-GCM-encrypted blob holding one source file's compiled bytecode. **The output file keeps the source's own extension** (`index.php` in → `index.php` out, encrypted) — it's identified by content (the `BYTC` magic bytes), not by a special file extension, so it can be a drop-in replacement for the original file. (`--raw` debug output is the one exception: it's written as `<name>.opd2`, since it's never meant to be deployed.) |
 | **`bytecode.manifest.json`** | Written once per `bytecode-dump` run. Lists every encoded file, its hash, size, and (if `--scan` was used) scan warnings. |
-| **`bytecode.map`** | Tab-separated `absolute-source-path → relative-container-path` file. This is what the loader reads at runtime to know which `.bytc` to load instead of a given `.php` request. |
+| **`bytecode.map`** | Tab-separated `absolute-source-path → relative-container-path` file. This is what the loader reads at runtime to know which container to load instead of a given source request. |
 | **`bytecode.manifest.sig`** | HMAC-SHA256 over the manifest + map together, so editing the map to repoint a source path at a different container is detected and refused. |
 | **`bytecode.license.json`** | Only written in license mode: an RSA-OAEP-SHA256-wrapped copy of the build's data-encryption key (DEK). |
 | **Shared-secret mode** | You generate one `BYTECODE_KEY` and use it both to encode and to run. Simplest option, good for self-hosted single-operator use. |
@@ -170,22 +170,33 @@ Warning codes you can see: `variable-variable`, `dynamic-class`,
 
 ### 3.3 Encode a project
 
-`bytecode-dump` walks a file or directory tree and writes one `.bytc` per
-`.php` file, plus `bytecode.manifest.json`, `bytecode.map`, and
-`bytecode.manifest.sig`.
+`bytecode-dump` walks a file or directory tree and writes one encoded
+container per `.php` file — keeping the source's own filename and extension,
+so it's a drop-in replacement — plus `bytecode.manifest.json`, `bytecode.map`,
+and `bytecode.manifest.sig`.
 
 ```bash
 $ BYTECODE_KEY="$KEY" PHP_BIN=php8.4 php8.4 php/bin/bytecode-dump /tmp/demo/app /tmp/demo/out
-/tmp/demo/app/index.php -> /tmp/demo/out/index.php.bytc
-/tmp/demo/app/risky.php -> /tmp/demo/out/risky.php.bytc
+/tmp/demo/app/index.php -> /tmp/demo/out/index.php
+/tmp/demo/app/risky.php -> /tmp/demo/out/risky.php
 
 $ ls /tmp/demo/out
-bytecode.manifest.json  bytecode.manifest.sig  bytecode.map  index.php.bytc  risky.php.bytc
+bytecode.manifest.json  bytecode.manifest.sig  bytecode.map  index.php  risky.php
 ```
+
+`/tmp/demo/out/index.php` is now the encrypted container, not PHP source —
+`file /tmp/demo/out/index.php` or `bytecode-info` (§3.5) shows its real
+contents.
 
 `PHP_BIN` picks which `php` binary compiles the source (default `php8.4`).
 `BYTECODE_KEY` (or `OPDUMP_KEY`) is required unless you pass `--raw` or use
 [license mode](#37-license-mode-rsa-wrapped-keys).
+
+**Always encode into a separate output directory, never back into the
+source tree.** Since the encoded output keeps the exact same filename as its
+source, pointing `<output-dir>` at (or inside) your source tree would
+overwrite your `.php` files in place with their own encrypted, unrecoverable
+replacements — there is no `--dry-run` and no confirmation prompt.
 
 Multiple files/folders, excludes, and `--scan` in one pass:
 
@@ -212,8 +223,9 @@ $ php8.4 -r '$m = json_decode(file_get_contents($argv[1]), true); echo json_enco
 }
 ```
 
-`--raw` skips encryption entirely and writes plaintext `.opd2` blobs instead
-of `.bytc` — useful for debugging the loader itself, never for anything you
+`--raw` skips encryption entirely and writes plaintext `<name>.opd2` blobs
+instead (the one case with a distinct suffix, since it's never meant to be
+deployed) — useful for debugging the loader itself, never for anything you
 intend to ship (no manifest/map/sig are written in `--raw` mode).
 
 ### 3.4 Verify a build
@@ -241,10 +253,10 @@ $ BYTECODE_KEY="0000000000000000000000000000000000000000000000000000000000000000
 /tmp/demo/out/bytecode.manifest.sig: signature mismatch (wrong key, or manifest/map tampered)
 ```
 
-You can also point it directly at one `.bytc` file (no manifest needed):
+You can also point it directly at one container file (no manifest needed):
 
 ```bash
-php8.4 php/bin/bytecode-verify /tmp/demo/out/index.php.bytc
+php8.4 php/bin/bytecode-verify /tmp/demo/out/index.php
 ```
 
 ### 3.5 Inspect a single container
@@ -252,8 +264,8 @@ php8.4 php/bin/bytecode-verify /tmp/demo/out/index.php.bytc
 Prints header fields without decrypting the payload — no key required:
 
 ```bash
-$ php8.4 php/bin/bytecode-info /tmp/demo/out/index.php.bytc
-path: /tmp/demo/out/index.php.bytc
+$ php8.4 php/bin/bytecode-info /tmp/demo/out/index.php
+path: /tmp/demo/out/index.php
 container: BYTC2
 container_version: 2
 php_version_id: 80423
@@ -277,14 +289,16 @@ container's size/hash without needing the key.
 The loader intercepts `zend_compile_file` for the whole request. Point
 `OPDUMP_MAP` at the `bytecode.map` from your build, set `OPDUMP_MODE=load-tree`,
 and load `opdump.so` — every `require`/`include`/entrypoint whose *source*
-path appears in the map is transparently served from its `.bytc` container
-instead of being compiled from the `.php` file on disk:
+path appears in the map is transparently served from its encoded container
+instead of being compiled from the `.php` file on disk. The container lives
+at a different path (your output directory), even though it has the same
+filename as the source it replaces:
 
 ```bash
 $ BYTECODE_KEY="$KEY" OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/demo/out/bytecode.map \
     php8.4 -n -d extension="$(pwd)/php/src/modules/opdump.so" -f /tmp/demo/app/index.php
 
-Notice: Unknown: opdump: loaded /tmp/demo/out/index.php.bytc (6 opcodes, 4 literals, 0 dynamic funcs, 1 functions, 0 classes) without parsing source in Unknown on line 0
+Notice: Unknown: opdump: loaded /tmp/demo/out/index.php (6 opcodes, 4 literals, 0 dynamic funcs, 1 functions, 0 classes) without parsing source in Unknown on line 0
 Hello, Bytecode!
 ```
 
@@ -306,12 +320,12 @@ Hello, Bytecode!
 
 Still works — the loader never read the (now broken) `.php` file at all.
 
-For a single file without a map, `OPDUMP_MODE=load` + `OPDUMP_IN=<file.bytc>`
+For a single file without a map, `OPDUMP_MODE=load` + `OPDUMP_IN=<path>`
 loads exactly one container as the entrypoint (used for debugging, not for
 whole-tree deployments):
 
 ```bash
-BYTECODE_KEY="$KEY" OPDUMP_MODE=load OPDUMP_IN=/tmp/demo/out/index.php.bytc \
+BYTECODE_KEY="$KEY" OPDUMP_MODE=load OPDUMP_IN=/tmp/demo/out/index.php \
   php8.4 -n -d extension="$(pwd)/php/src/modules/opdump.so" -f /tmp/demo/app/index.php
 ```
 
@@ -340,7 +354,7 @@ key:
 ```bash
 $ BYTECODE_LICENSE_PUBKEY=/tmp/demo/keys/license.pub.pem PHP_BIN=php8.4 \
     php8.4 php/bin/bytecode-dump /tmp/demo/app /tmp/demo/out-license
-/tmp/demo/app/index.php -> /tmp/demo/out-license/index.php.bytc
+/tmp/demo/app/index.php -> /tmp/demo/out-license/index.php
 wrote /tmp/demo/out-license/bytecode.license.json (RSA-OAEP-SHA256-wrapped DEK)
 ```
 
@@ -538,7 +552,7 @@ filled in after you run something).
 | **Scan** button | Runs `bytecode-scan` standalone (no dump) over the current source list. |
 | **Dump** button | Runs `bytecode-dump` with every option above, then loads the resulting manifest into the Artifacts table. |
 | **Verify** button | Runs `bytecode-verify <output>/bytecode.manifest.json`. |
-| **Inspect .bytc** field + info icon | Runs `bytecode-info <path>` — auto-filled with the first manifest entry after a successful Dump. |
+| **Inspect container** field + info icon | Runs `bytecode-info <path>` — auto-filled with the first manifest entry after a successful Dump. |
 | **Package version** field + AppImage/deb/macOS/Win ZIP/MSI buttons | The desktop packaging scripts (`scripts/build-*`) — see [`README.md`](README.md#desktop-packages). |
 | **Status banner** (bottom) | Last action's result or error, in plain text. |
 
@@ -564,9 +578,9 @@ filled in after you run something).
    for license mode).
 5. Set **Output folder** to wherever you want the build written.
 6. Click **Dump**. Watch the log pane; when it finishes, the manifest table
-   populates and **Inspect .bytc** auto-fills with the first file.
+   populates and **Inspect container** auto-fills with the first file.
 7. Click **Verify** to confirm the build is internally consistent.
-8. Click the info icon next to **Inspect .bytc** to see that container's
+8. Click the info icon next to **Inspect container** to see that container's
    header fields.
 
 Running the resulting build is not yet wired into the GUI — use the CLI
@@ -603,7 +617,7 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 | `OPDUMP_MODE` | `opdump.so` | `dump`, `load`, or `load-tree`. |
 | `OPDUMP_OUT` | `opdump.so` (dump mode) | Where to write the raw `.opd2` blob. |
 | `OPDUMP_OBFUSCATE` | `opdump.so` (dump mode) | Set (to any value) to enable variable-name obfuscation — set by `bytecode-dump --obfuscate`, not usually by hand. |
-| `OPDUMP_IN` | `opdump.so` (load mode) | Path to one `.bytc`/`.opd2` file to load as the entrypoint. |
+| `OPDUMP_IN` | `opdump.so` (load mode) | Path to one encoded container (or `.opd2` in `--raw` mode) to load as the entrypoint. |
 | `OPDUMP_MAP`, `BYTECODE_MAP` | `opdump.so` (load-tree mode) | Path to `bytecode.map`. |
 | `OPDUMP_DEBUG` | `opdump.so` | Set to dump verbose opcode/literal debug output to stderr. |
 | `BYTECODE_PHP` | GUI | PHP binary the GUI shells out to, when running from source. |
@@ -613,7 +627,7 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 
 | File | Contents |
 |---|---|
-| `<name>.bytc` | One encrypted container per source file. |
+| `<name>.php` | One encrypted container per source file, at the same relative path and filename the source had (`--raw` writes `<name>.php.opd2` instead). |
 | `bytecode.manifest.json` | Per-file source/output/hash/size list, PHP version, container format, and (if `--scan`) embedded scan results. |
 | `bytecode.map` | `absolute-source-path<TAB>relative-container-path`, one per line — the loader's runtime lookup table. |
 | `bytecode.manifest.sig` | Hex HMAC-SHA256 over manifest + map, keyed by an HKDF derivation of your IKM/DEK. |

@@ -47,7 +47,7 @@ fi
 
 echo "--- round trip: explicit OPDUMP_LICENSE_FILE ---"
 OPDUMP_LICENSE_KEY_FILE="$LICDIR/license.key.pem" OPDUMP_LICENSE_FILE="$OUT/bytecode.license.json" \
-  OPDUMP_MODE=load OPDUMP_IN="$OUT/rung1.php.bytc" \
+  OPDUMP_MODE=load OPDUMP_IN="$OUT/rung1.php" \
   "$PHP_BIN" -n -d extension="$SO" -f "$DECOY"
 
 echo
@@ -67,7 +67,7 @@ echo "--- wrong private key fails closed ---"
 set +e
 output="$(
   OPDUMP_LICENSE_KEY_FILE="$WRONGLICDIR/license.key.pem" OPDUMP_LICENSE_FILE="$OUT/bytecode.license.json" \
-    OPDUMP_MODE=load OPDUMP_IN="$OUT/rung1.php.bytc" \
+    OPDUMP_MODE=load OPDUMP_IN="$OUT/rung1.php" \
     "$PHP_BIN" -n -d extension="$SO" -f "$DECOY" 2>&1
 )"
 status=$?

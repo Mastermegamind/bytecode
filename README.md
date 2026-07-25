@@ -84,7 +84,7 @@ variables:
 - `OPDUMP_MODE=load`: read one blob and return a reconstructed `zend_op_array`
   instead of parsing the source file.
 - `OPDUMP_MODE=load-tree`: intercept requested source paths and load matching
-  `.bytc` containers through a generated `bytecode.map`.
+  encoded containers through a generated `bytecode.map`.
 
 The extension reconstructs opcodes, literals, functions, classes, properties,
 argument metadata, try/catch metadata, runtime caches, and enough class/function
@@ -93,8 +93,11 @@ minor versions, the loader contains compatibility branches for 8.1 through 8.5.
 
 ### 2. Container Format
 
-The CLI tools wrap raw Zend blobs into encrypted `.bytc` containers. Current
-containers default to `BYTC2`.
+The CLI tools wrap raw Zend blobs into encrypted `BYTC2`-format containers.
+The output file keeps the source's own filename and extension (e.g.
+`index.php` in → `index.php` out, encrypted) so it's a drop-in replacement —
+it's identified by content, not by a special extension. (`--raw` debug
+output is the exception, written as `<name>.opd2`.)
 
 `BYTC2` provides:
 
@@ -115,7 +118,7 @@ The command-line tools under [`php/bin`](php/bin) provide the user-facing
 workflow:
 
 - `bytecode-keygen`: generate a random shared key.
-- `bytecode-dump`: walk files/directories, dump bytecode, pack `.bytc`
+- `bytecode-dump`: walk files/directories, dump bytecode, pack encoded
   containers, and write the manifest/map.
 - `bytecode-pack`: pack one raw dump into a container.
 - `bytecode-info`: inspect a container header and metadata.

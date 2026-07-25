@@ -38,7 +38,7 @@ Supporting tools:
 
 ```bash
 php/bin/bytecode-keygen
-php/bin/bytecode-info file.bytc
+php/bin/bytecode-info file.php
 php/bin/bytecode-verify bytecode.manifest.json
 BYTECODE_KEY=... OPDUMP_MODE=load-tree OPDUMP_MAP=/encoded/bytecode.map \
   php8.4 -n -d extension=php/src/modules/opdump.so -f /app/public/index.php

@@ -16,20 +16,20 @@ fi
 
 OUT="$(mktemp -d)"
 DECOY="$(mktemp --suffix=.php)"
-TRUNCATED="$(mktemp --suffix=.bytc)"
+TRUNCATED="$(mktemp --suffix=.php)"
 trap 'rm -f "$DECOY" "$TRUNCATED"; rm -rf "$OUT"' EXIT
 
 printf '<?php this is not valid php syntax !!! %%%%%%\n' > "$DECOY"
 
 BYTECODE_KEY="$KEY" PHP_BIN="$PHP_BIN" "$ROOT/php/bin/bytecode-dump" "$ROOT/php/tests/rung1.php" "$OUT" >/dev/null
 
-size="$(wc -c < "$OUT/rung1.php.bytc" | tr -d ' ')"
+size="$(wc -c < "$OUT/rung1.php" | tr -d ' ')"
 if [[ "$size" -le 10 ]]; then
   echo "container unexpectedly too small to truncate: $size" >&2
   exit 1
 fi
 
-head -c "$((size - 10))" "$OUT/rung1.php.bytc" > "$TRUNCATED"
+head -c "$((size - 10))" "$OUT/rung1.php" > "$TRUNCATED"
 
 set +e
 output="$(

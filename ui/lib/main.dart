@@ -346,9 +346,7 @@ class _EncoderPageState extends State<EncoderPage> {
     final key = _keyController.text.trim();
     final licensePubkey = _licensePubkeyController.text.trim();
     if (_sources.isEmpty || output.isEmpty) {
-      setState(
-        () => _status = 'At least one source and output are required',
-      );
+      setState(() => _status = 'At least one source and output are required');
       return;
     }
     if (!_rawContainers &&
@@ -371,21 +369,17 @@ class _EncoderPageState extends State<EncoderPage> {
         env['BYTECODE_KEY'] = key;
       }
 
-      final exit = await _runStreaming(
-        _phpBinary(),
-        [
-          _join(_root, 'php/bin/bytecode-dump'),
-          if (_rawContainers) '--raw',
-          if (_obfuscate) '--obfuscate',
-          if (_scanBeforeDump) '--scan',
-          if (_failOnScanWarning) '--fail-on-scan-warning',
-          ..._configArgs(),
-          ..._excludeArgs(),
-          ..._sources,
-          output,
-        ],
-        environment: env,
-      );
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-dump'),
+        if (_rawContainers) '--raw',
+        if (_obfuscate) '--obfuscate',
+        if (_scanBeforeDump) '--scan',
+        if (_failOnScanWarning) '--fail-on-scan-warning',
+        ..._configArgs(),
+        ..._excludeArgs(),
+        ..._sources,
+        output,
+      ], environment: env);
 
       if (exit != 0) {
         throw StateError('bytecode-dump exited with $exit');
@@ -442,7 +436,7 @@ class _EncoderPageState extends State<EncoderPage> {
   Future<void> _inspectContainer() async {
     final path = _inspectPathController.text.trim();
     if (path.isEmpty) {
-      setState(() => _status = 'Choose a .bytc file to inspect');
+      setState(() => _status = 'Choose an encoded container to inspect');
       return;
     }
 
@@ -502,10 +496,7 @@ class _EncoderPageState extends State<EncoderPage> {
         phpVersion,
         if (buildOnly) '--build-only',
       ];
-      final exit = await _runStreaming(
-        _phpBinary(),
-        args,
-      );
+      final exit = await _runStreaming(_phpBinary(), args);
 
       if (exit != 0) {
         throw StateError(
@@ -592,7 +583,8 @@ class _EncoderPageState extends State<EncoderPage> {
           (entry) => ManifestEntry.fromJson(entry as Map<String, dynamic>),
         ),
       );
-    if (_inspectPathController.text.trim().isEmpty && _manifestRows.isNotEmpty) {
+    if (_inspectPathController.text.trim().isEmpty &&
+        _manifestRows.isNotEmpty) {
       _inspectPathController.text = _join(
         _outputController.text.trim(),
         _manifestRows.first.output,
@@ -964,227 +956,231 @@ class _Controls extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return _Panel(
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.stretch,
-        children: [
-          _PanelTitle(
-            icon: Icons.tune,
-            title: 'Build Setup',
-            trailing: busy
-                ? const SizedBox.square(
-                    dimension: 18,
-                    child: CircularProgressIndicator(strokeWidth: 2),
-                  )
-                : const Icon(Icons.check_circle, color: Color(0xff0f766e)),
-          ),
-          const SizedBox(height: 18),
-          _PathField(
-            label: 'Bytecode root',
-            controller: rootController,
-            icon: Icons.account_tree_outlined,
-            onPick: busy ? null : onPickRoot,
-          ),
-          const SizedBox(height: 12),
-          _PathField(
-            label: 'Output folder',
-            controller: outputController,
-            icon: Icons.folder_copy_outlined,
-            onPick: busy ? null : onPickOutput,
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: TextField(
-                  controller: phpVersionController,
-                  decoration: const InputDecoration(
-                    labelText: 'PHP version',
-                    prefixIcon: Icon(Icons.terminal),
+      child: SingleChildScrollView(
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            _PanelTitle(
+              icon: Icons.tune,
+              title: 'Build Setup',
+              trailing: busy
+                  ? const SizedBox.square(
+                      dimension: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.check_circle, color: Color(0xff0f766e)),
+            ),
+            const SizedBox(height: 18),
+            _PathField(
+              label: 'Bytecode root',
+              controller: rootController,
+              icon: Icons.account_tree_outlined,
+              onPick: busy ? null : onPickRoot,
+            ),
+            const SizedBox(height: 12),
+            _PathField(
+              label: 'Output folder',
+              controller: outputController,
+              icon: Icons.folder_copy_outlined,
+              onPick: busy ? null : onPickOutput,
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: TextField(
+                    controller: phpVersionController,
+                    decoration: const InputDecoration(
+                      labelText: 'PHP version',
+                      prefixIcon: Icon(Icons.terminal),
+                    ),
                   ),
                 ),
-              ),
-              const SizedBox(width: 10),
-              IconButton.filledTonal(
-                tooltip: 'Build loader',
-                onPressed: busy ? null : onBuildLoader,
-                icon: const Icon(Icons.construction),
-              ),
-              const SizedBox(width: 8),
-              IconButton.filled(
-                tooltip: 'Install Zend loader',
-                onPressed: busy ? null : onInstallLoader,
-                icon: const Icon(Icons.download_done),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          _OptionGrid(
-            rawContainers: rawContainers,
-            obfuscate: obfuscate,
-            scanBeforeDump: scanBeforeDump,
-            failOnScanWarning: failOnScanWarning,
-            busy: busy,
-            onRawContainersChanged: onRawContainersChanged,
-            onObfuscateChanged: onObfuscateChanged,
-            onScanBeforeDumpChanged: onScanBeforeDumpChanged,
-            onFailOnScanWarningChanged: onFailOnScanWarningChanged,
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: FilledButton.icon(
-                  onPressed: busy ? null : onAddFiles,
-                  icon: const Icon(Icons.note_add),
-                  label: const Text('Add Files'),
+                const SizedBox(width: 10),
+                IconButton.filledTonal(
+                  tooltip: 'Build loader',
+                  onPressed: busy ? null : onBuildLoader,
+                  icon: const Icon(Icons.construction),
                 ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                child: FilledButton.tonalIcon(
-                  onPressed: busy ? null : onAddFolder,
-                  icon: const Icon(Icons.create_new_folder),
-                  label: const Text('Add Folder'),
+                const SizedBox(width: 8),
+                IconButton.filled(
+                  tooltip: 'Install Zend loader',
+                  onPressed: busy ? null : onInstallLoader,
+                  icon: const Icon(Icons.download_done),
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          _PathField(
-            label: 'bytecode.json',
-            controller: configController,
-            icon: Icons.rule_folder_outlined,
-            onPick: busy ? null : onPickConfig,
-          ),
-          const SizedBox(height: 12),
-          _SourceList(
-            sources: sources,
-            busy: busy,
-            onRemove: onRemoveSource,
-            onClear: onClearSources,
-          ),
-          const SizedBox(height: 16),
-          TextField(
-            controller: keyController,
-            obscureText: !rawContainers,
-            enabled: !rawContainers,
-            decoration: InputDecoration(
-              labelText: rawContainers ? 'BYTECODE_KEY disabled' : 'BYTECODE_KEY',
-              prefixIcon: const Icon(Icons.key),
-              suffixIcon: IconButton(
-                tooltip: 'Generate key',
-                onPressed: busy || rawContainers ? null : onGenerateKey,
-                icon: const Icon(Icons.auto_awesome),
+              ],
+            ),
+            const SizedBox(height: 16),
+            _OptionGrid(
+              rawContainers: rawContainers,
+              obfuscate: obfuscate,
+              scanBeforeDump: scanBeforeDump,
+              failOnScanWarning: failOnScanWarning,
+              busy: busy,
+              onRawContainersChanged: onRawContainersChanged,
+              onObfuscateChanged: onObfuscateChanged,
+              onScanBeforeDumpChanged: onScanBeforeDumpChanged,
+              onFailOnScanWarningChanged: onFailOnScanWarningChanged,
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: FilledButton.icon(
+                    onPressed: busy ? null : onAddFiles,
+                    icon: const Icon(Icons.note_add),
+                    label: const Text('Add Files'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: FilledButton.tonalIcon(
+                    onPressed: busy ? null : onAddFolder,
+                    icon: const Icon(Icons.create_new_folder),
+                    label: const Text('Add Folder'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            _PathField(
+              label: 'bytecode.json',
+              controller: configController,
+              icon: Icons.rule_folder_outlined,
+              onPick: busy ? null : onPickConfig,
+            ),
+            const SizedBox(height: 12),
+            _SourceList(
+              sources: sources,
+              busy: busy,
+              onRemove: onRemoveSource,
+              onClear: onClearSources,
+            ),
+            const SizedBox(height: 16),
+            TextField(
+              controller: keyController,
+              obscureText: !rawContainers,
+              enabled: !rawContainers,
+              decoration: InputDecoration(
+                labelText: rawContainers
+                    ? 'BYTECODE_KEY disabled'
+                    : 'BYTECODE_KEY',
+                prefixIcon: const Icon(Icons.key),
+                suffixIcon: IconButton(
+                  tooltip: 'Generate key',
+                  onPressed: busy || rawContainers ? null : onGenerateKey,
+                  icon: const Icon(Icons.auto_awesome),
+                ),
               ),
             ),
-          ),
-          const SizedBox(height: 12),
-          _PathField(
-            label: 'License public key',
-            controller: licensePubkeyController,
-            icon: Icons.verified_user_outlined,
-            onPick: busy || rawContainers ? null : onPickLicensePubkey,
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: _PathField(
-                  label: 'License key folder',
-                  controller: licenseKeyDirController,
-                  icon: Icons.vpn_key_outlined,
-                  onPick: busy ? null : onPickLicenseKeyDir,
-                ),
-              ),
-              const SizedBox(width: 10),
-              IconButton.filledTonal(
-                tooltip: 'Generate license keys',
-                onPressed: busy ? null : onGenerateLicenseKeys,
-                icon: const Icon(Icons.key_outlined),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          TextField(
-            controller: excludeController,
-            minLines: 1,
-            maxLines: 3,
-            decoration: const InputDecoration(
-              labelText: 'Exclude globs',
-              prefixIcon: Icon(Icons.filter_alt_outlined),
+            const SizedBox(height: 12),
+            _PathField(
+              label: 'License public key',
+              controller: licensePubkeyController,
+              icon: Icons.verified_user_outlined,
+              onPick: busy || rawContainers ? null : onPickLicensePubkey,
             ),
-          ),
-          const SizedBox(height: 16),
-          Row(
-            children: [
-              Expanded(
-                flex: 2,
-                child: OutlinedButton.icon(
-                  onPressed: busy ? null : onScan,
-                  icon: const Icon(Icons.manage_search),
-                  label: const Text('Scan'),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: _PathField(
+                    label: 'License key folder',
+                    controller: licenseKeyDirController,
+                    icon: Icons.vpn_key_outlined,
+                    onPick: busy ? null : onPickLicenseKeyDir,
+                  ),
                 ),
-              ),
-              const SizedBox(width: 10),
-              Expanded(
-                flex: 3,
-                child: FilledButton.icon(
-                  onPressed: busy ? null : onDump,
-                  icon: busy
-                      ? const SizedBox.square(
-                          dimension: 18,
-                          child: CircularProgressIndicator(
-                            strokeWidth: 2,
-                            color: Colors.white,
-                          ),
-                        )
-                      : const Icon(Icons.play_arrow),
-                  label: const Text('Dump'),
+                const SizedBox(width: 10),
+                IconButton.filledTonal(
+                  tooltip: 'Generate license keys',
+                  onPressed: busy ? null : onGenerateLicenseKeys,
+                  icon: const Icon(Icons.key_outlined),
                 ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: excludeController,
+              minLines: 1,
+              maxLines: 3,
+              decoration: const InputDecoration(
+                labelText: 'Exclude globs',
+                prefixIcon: Icon(Icons.filter_alt_outlined),
               ),
-              const SizedBox(width: 10),
-              Expanded(
-                flex: 2,
-                child: OutlinedButton.icon(
-                  onPressed: busy ? null : onVerify,
-                  icon: const Icon(Icons.verified),
-                  label: const Text('Verify'),
+            ),
+            const SizedBox(height: 16),
+            Row(
+              children: [
+                Expanded(
+                  flex: 2,
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : onScan,
+                    icon: const Icon(Icons.manage_search),
+                    label: const Text('Scan'),
+                  ),
                 ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          Row(
-            children: [
-              Expanded(
-                child: _PathField(
-                  label: 'Inspect .bytc',
-                  controller: inspectPathController,
-                  icon: Icons.pageview_outlined,
-                  onPick: busy ? null : onPickInspectPath,
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 3,
+                  child: FilledButton.icon(
+                    onPressed: busy ? null : onDump,
+                    icon: busy
+                        ? const SizedBox.square(
+                            dimension: 18,
+                            child: CircularProgressIndicator(
+                              strokeWidth: 2,
+                              color: Colors.white,
+                            ),
+                          )
+                        : const Icon(Icons.play_arrow),
+                    label: const Text('Dump'),
+                  ),
                 ),
-              ),
-              const SizedBox(width: 10),
-              IconButton.filledTonal(
-                tooltip: 'Inspect BYTC',
-                onPressed: busy ? null : onInspect,
-                icon: const Icon(Icons.info_outline),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
-          _PackageActions(
-            versionController: packageVersionController,
-            busy: busy,
-            onBuildAppImage: onBuildAppImage,
-            onBuildDeb: onBuildDeb,
-            onBuildMac: onBuildMac,
-            onBuildWindowsZip: onBuildWindowsZip,
-            onBuildWindowsMsi: onBuildWindowsMsi,
-          ),
-          const SizedBox(height: 12),
-          _StatusBanner(status: status, busy: busy),
-        ],
+                const SizedBox(width: 10),
+                Expanded(
+                  flex: 2,
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : onVerify,
+                    icon: const Icon(Icons.verified),
+                    label: const Text('Verify'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: _PathField(
+                    label: 'Inspect container',
+                    controller: inspectPathController,
+                    icon: Icons.pageview_outlined,
+                    onPick: busy ? null : onPickInspectPath,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                IconButton.filledTonal(
+                  tooltip: 'Inspect BYTC',
+                  onPressed: busy ? null : onInspect,
+                  icon: const Icon(Icons.info_outline),
+                ),
+              ],
+            ),
+            const SizedBox(height: 16),
+            _PackageActions(
+              versionController: packageVersionController,
+              busy: busy,
+              onBuildAppImage: onBuildAppImage,
+              onBuildDeb: onBuildDeb,
+              onBuildMac: onBuildMac,
+              onBuildWindowsZip: onBuildWindowsZip,
+              onBuildWindowsMsi: onBuildWindowsMsi,
+            ),
+            const SizedBox(height: 12),
+            _StatusBanner(status: status, busy: busy),
+          ],
+        ),
       ),
     );
   }

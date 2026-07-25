@@ -21,7 +21,7 @@ fi
 
 OUT="$(mktemp -d)"
 DECOY="$(mktemp --suffix=.php)"
-CORRUPT="$(mktemp --suffix=.bytc)"
+CORRUPT="$(mktemp --suffix=.php)"
 trap 'rm -f "$DECOY" "$CORRUPT"; rm -rf "$OUT"' EXIT
 
 printf '<?php this is not valid php syntax !!! %%%%%%\n' > "$DECOY"
@@ -29,7 +29,7 @@ printf '<?php this is not valid php syntax !!! %%%%%%\n' > "$DECOY"
 BYTECODE_KEY="$KEY" PHP_BIN="$PHP_BIN" "$ROOT/php/bin/bytecode-dump" "$ROOT/php/tests/rung1.php" "$OUT" >/dev/null
 
 echo "--- bytecode-info reports BYTC2 ---"
-info="$("$ROOT/php/bin/bytecode-info" "$OUT/rung1.php.bytc")"
+info="$("$ROOT/php/bin/bytecode-info" "$OUT/rung1.php")"
 echo "$info"
 if ! grep -q '^container_version: 2$' <<<"$info"; then
   echo "expected container_version 2, bytecode-dump should default to BYTC2" >&2
@@ -43,11 +43,11 @@ header_size="$(grep '^header_size: ' <<<"$info" | cut -d' ' -f2)"
 
 echo
 echo "--- round trip: load rung1 BYTC2 (pointed at invalid-syntax decoy file) ---"
-BYTECODE_KEY="$KEY" OPDUMP_MODE=load OPDUMP_IN="$OUT/rung1.php.bytc" "$PHP_BIN" -n -d extension="$SO" -f "$DECOY"
+BYTECODE_KEY="$KEY" OPDUMP_MODE=load OPDUMP_IN="$OUT/rung1.php" "$PHP_BIN" -n -d extension="$SO" -f "$DECOY"
 
 echo
 echo "--- corrupted key_id byte fails closed before payload parsing ---"
-cp "$OUT/rung1.php.bytc" "$CORRUPT"
+cp "$OUT/rung1.php" "$CORRUPT"
 "$PHP_BIN" -r '
 $path = $argv[1];
 $offset = (int) $argv[2];

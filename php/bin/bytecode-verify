@@ -95,7 +95,7 @@ function verify_container(string $path): array
 }
 
 if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
-    fwrite(STDERR, "Usage: bytecode-verify <manifest.json|file.bytc>\n");
+    fwrite(STDERR, "Usage: bytecode-verify <manifest.json|encoded-file>\n");
     fwrite(STDERR, "\nValidates BYTC headers, manifest hashes, sizes, and bytecode.map consistency.\n");
     exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
 }

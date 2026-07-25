@@ -26,7 +26,7 @@ In scope:
 - Container format / cryptographic weaknesses (`BYTC1`/`BYTC2`, AES-256-GCM
   usage, HKDF key derivation, RSA-OAEP key wrapping in license mode).
 - Memory-safety issues in the `opdump` C extension, especially in the
-  untrusted-input paths (parsing `.bytc` containers, `bytecode.map`,
+  untrusted-input paths (parsing encoded containers, `bytecode.map`,
   `bytecode.license.json`).
 - Cases where the loader executes reconstructed bytecode with different
   semantics than the original source (a correctness bug with security

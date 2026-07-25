@@ -91,7 +91,7 @@ function bytc_info(string $path): array
 }
 
 if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
-    fwrite(STDERR, "Usage: bytecode-info <file.bytc>\n");
+    fwrite(STDERR, "Usage: bytecode-info <encoded-file>\n");
     exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
 }
 

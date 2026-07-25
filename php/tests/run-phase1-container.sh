@@ -24,7 +24,7 @@ BYTECODE_KEY="$KEY" PHP_BIN="$PHP_BIN" "$ROOT/php/bin/bytecode-dump" "$ROOT/php/
 
 for rung in rung1 rung2 rung3; do
   echo "--- load $rung BYTC1 (pointed at invalid-syntax decoy file) ---"
-  BYTECODE_KEY="$KEY" OPDUMP_MODE=load OPDUMP_IN="$OUT/$rung.php.bytc" "$PHP_BIN" -n -d extension="$SO" -f "$DECOY"
+  BYTECODE_KEY="$KEY" OPDUMP_MODE=load OPDUMP_IN="$OUT/$rung.php" "$PHP_BIN" -n -d extension="$SO" -f "$DECOY"
   echo
 done
 

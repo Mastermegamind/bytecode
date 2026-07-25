@@ -498,7 +498,10 @@ function dump_one(
         fail("cannot resolve source file: {$file}");
     }
 
-    $relativeOutput = $rel . ($raw ? '.opd2' : '.bytc');
+    // Encoded output keeps the source's own .php extension (a drop-in
+    // replacement for the original file, same path shape); only --raw debug
+    // output gets a distinct suffix, since it's never meant to be deployed.
+    $relativeOutput = $raw ? "{$rel}.opd2" : $rel;
     if (isset($seenOutputs[$relativeOutput])) {
         fail("duplicate output path {$relativeOutput} from {$file} and {$seenOutputs[$relativeOutput]}");
     }

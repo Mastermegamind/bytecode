@@ -60,7 +60,7 @@ fi
 
 echo
 echo "--- tampered map (swapped output columns) is refused before any file loads ---"
-awk -F'\t' '{print $1"\t"($1 ~ /main\.php$/ ? "lib.php.bytc" : "main.php.bytc")}' "$OUT/bytecode.map" > "$OUT/bytecode.map.tampered"
+awk -F'\t' '{print $1"\t"($1 ~ /main\.php$/ ? "lib.php" : "main.php")}' "$OUT/bytecode.map" > "$OUT/bytecode.map.tampered"
 mv "$OUT/bytecode.map.tampered" "$OUT/bytecode.map"
 
 # Destroy the real source too, so a signature-check bug that silently falls
