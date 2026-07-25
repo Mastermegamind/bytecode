@@ -18,6 +18,10 @@ Phase 1 already authenticates/decrypts `BYTC1` containers with AES-256-GCM
 using a 32-byte key from `BYTECODE_KEY` or `OPDUMP_KEY`. That is a development
 key path only, not the final Phase 4 model.
 
+See [`PHASE4_KEY_MODEL.md`](PHASE4_KEY_MODEL.md) for the early key/provider
+and container-integrity constraints that should shape the Phase 1/2 format
+before product licensing is implemented.
+
 ## Done Criteria
 
 1. Tampered containers fail before payload parsing.

@@ -16,12 +16,64 @@ class BytecodeApp extends StatelessWidget {
   Widget build(BuildContext context) {
     return MaterialApp(
       title: 'Bytecode Encoder',
+      debugShowCheckedModeBanner: false,
       theme: ThemeData(
         colorScheme: ColorScheme.fromSeed(
-          seedColor: const Color(0xff2563eb),
+          seedColor: const Color(0xff0f766e),
           brightness: Brightness.light,
         ),
+        scaffoldBackgroundColor: const Color(0xfff6f4ef),
         useMaterial3: true,
+        fontFamily: 'Roboto',
+        appBarTheme: const AppBarTheme(
+          backgroundColor: Colors.transparent,
+          foregroundColor: Color(0xff171717),
+          elevation: 0,
+          centerTitle: false,
+        ),
+        filledButtonTheme: FilledButtonThemeData(
+          style: FilledButton.styleFrom(
+            minimumSize: const Size(0, 44),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ),
+        outlinedButtonTheme: OutlinedButtonThemeData(
+          style: OutlinedButton.styleFrom(
+            minimumSize: const Size(0, 44),
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ),
+        iconButtonTheme: IconButtonThemeData(
+          style: IconButton.styleFrom(
+            shape: RoundedRectangleBorder(
+              borderRadius: BorderRadius.circular(8),
+            ),
+          ),
+        ),
+        inputDecorationTheme: InputDecorationTheme(
+          filled: true,
+          fillColor: Colors.white,
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: Color(0xffd8d3c7)),
+          ),
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: Color(0xffd8d3c7)),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.circular(8),
+            borderSide: const BorderSide(color: Color(0xff0f766e), width: 1.5),
+          ),
+          contentPadding: const EdgeInsets.symmetric(
+            horizontal: 14,
+            vertical: 13,
+          ),
+        ),
       ),
       home: const EncoderPage(),
     );
@@ -281,19 +333,24 @@ class _EncoderPageState extends State<EncoderPage> {
 
   @override
   Widget build(BuildContext context) {
+    final totalBytes = _manifestRows.fold<int>(
+      0,
+      (total, entry) => total + entry.size,
+    );
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Bytecode Encoder')),
-      body: Padding(
-        padding: const EdgeInsets.all(16),
-        child: Column(
-          children: [
-            _Controls(
+      body: SafeArea(
+        child: LayoutBuilder(
+          builder: (context, constraints) {
+            final compact = constraints.maxWidth < 960;
+            final controls = _Controls(
               rootController: _rootController,
               outputController: _outputController,
               keyController: _keyController,
               excludeController: _excludeController,
               sources: _sources,
               busy: _busy,
+              status: _status,
               onPickRoot: () => _pickFolder(_rootController),
               onPickOutput: () => _pickFolder(_outputController),
               onAddFiles: _addFiles,
@@ -303,29 +360,181 @@ class _EncoderPageState extends State<EncoderPage> {
               onGenerateKey: _generateKey,
               onDump: _dump,
               onVerify: _verify,
-            ),
-            const SizedBox(height: 12),
-            if (_status != null)
-              Align(
-                alignment: Alignment.centerLeft,
-                child: Text(
-                  _status!,
-                  style: Theme.of(context).textTheme.bodyMedium,
-                ),
-              ),
-            const SizedBox(height: 12),
-            Expanded(
-              child: Row(
+            );
+            final results = _ResultsPanel(
+              rows: _manifestRows,
+              logText: _log.toString(),
+            );
+
+            return Padding(
+              padding: EdgeInsets.all(compact ? 14 : 20),
+              child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
-                  Expanded(flex: 5, child: _ManifestTable(rows: _manifestRows)),
-                  const SizedBox(width: 12),
-                  Expanded(flex: 4, child: _LogPane(text: _log.toString())),
+                  _Header(
+                    busy: _busy,
+                    sourceCount: _sources.length,
+                    manifestCount: _manifestRows.length,
+                    totalBytes: totalBytes,
+                  ),
+                  const SizedBox(height: 16),
+                  Expanded(
+                    child: compact
+                        ? ListView(
+                            children: [
+                              controls,
+                              const SizedBox(height: 14),
+                              SizedBox(height: 620, child: results),
+                            ],
+                          )
+                        : Row(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              SizedBox(width: 420, child: controls),
+                              const SizedBox(width: 16),
+                              Expanded(child: results),
+                            ],
+                          ),
+                  ),
                 ],
               ),
+            );
+          },
+        ),
+      ),
+    );
+  }
+}
+
+class _Header extends StatelessWidget {
+  const _Header({
+    required this.busy,
+    required this.sourceCount,
+    required this.manifestCount,
+    required this.totalBytes,
+  });
+
+  final bool busy;
+  final int sourceCount;
+  final int manifestCount;
+  final int totalBytes;
+
+  @override
+  Widget build(BuildContext context) {
+    final textTheme = Theme.of(context).textTheme;
+
+    return Wrap(
+      spacing: 14,
+      runSpacing: 12,
+      crossAxisAlignment: WrapCrossAlignment.center,
+      alignment: WrapAlignment.spaceBetween,
+      children: [
+        Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Container(
+              width: 46,
+              height: 46,
+              decoration: BoxDecoration(
+                color: const Color(0xff1f2937),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Icon(Icons.memory, color: Color(0xfffff7ed)),
+            ),
+            const SizedBox(width: 12),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Bytecode Encoder',
+                  style: textTheme.headlineSmall?.copyWith(
+                    fontWeight: FontWeight.w800,
+                    color: const Color(0xff171717),
+                    letterSpacing: 0,
+                  ),
+                ),
+                Text(
+                  busy ? 'Process running' : 'Ready for packaging',
+                  style: textTheme.bodyMedium?.copyWith(
+                    color: const Color(0xff6b6256),
+                  ),
+                ),
+              ],
             ),
           ],
         ),
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            _MetricPill(
+              icon: Icons.inventory_2_outlined,
+              label: 'Sources',
+              value: sourceCount.toString(),
+            ),
+            _MetricPill(
+              icon: Icons.table_rows_outlined,
+              label: 'Manifest',
+              value: manifestCount.toString(),
+            ),
+            _MetricPill(
+              icon: Icons.data_usage,
+              label: 'Bytes',
+              value: _formatBytes(totalBytes),
+            ),
+          ],
+        ),
+      ],
+    );
+  }
+}
+
+class _MetricPill extends StatelessWidget {
+  const _MetricPill({
+    required this.icon,
+    required this.label,
+    required this.value,
+  });
+
+  final IconData icon;
+  final String label;
+  final String value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      height: 46,
+      padding: const EdgeInsets.symmetric(horizontal: 12),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xffddd6c8)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 18, color: const Color(0xff0f766e)),
+          const SizedBox(width: 9),
+          Column(
+            mainAxisAlignment: MainAxisAlignment.center,
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                value,
+                style: Theme.of(context).textTheme.labelLarge?.copyWith(
+                  fontWeight: FontWeight.w800,
+                  color: const Color(0xff171717),
+                ),
+              ),
+              Text(
+                label,
+                style: Theme.of(context).textTheme.labelSmall?.copyWith(
+                  color: const Color(0xff7a7165),
+                ),
+              ),
+            ],
+          ),
+        ],
       ),
     );
   }
@@ -339,6 +548,7 @@ class _Controls extends StatelessWidget {
     required this.excludeController,
     required this.sources,
     required this.busy,
+    required this.status,
     required this.onPickRoot,
     required this.onPickOutput,
     required this.onAddFiles,
@@ -356,6 +566,7 @@ class _Controls extends StatelessWidget {
   final TextEditingController excludeController;
   final List<String> sources;
   final bool busy;
+  final String? status;
   final VoidCallback onPickRoot;
   final VoidCallback onPickOutput;
   final VoidCallback onAddFiles;
@@ -368,120 +579,259 @@ class _Controls extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(
+    return _Panel(
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          _PanelTitle(
+            icon: Icons.tune,
+            title: 'Build Setup',
+            trailing: busy
+                ? const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.check_circle, color: Color(0xff0f766e)),
+          ),
+          const SizedBox(height: 18),
+          _PathField(
+            label: 'Bytecode root',
+            controller: rootController,
+            icon: Icons.account_tree_outlined,
+            onPick: busy ? null : onPickRoot,
+          ),
+          const SizedBox(height: 12),
+          _PathField(
+            label: 'Output folder',
+            controller: outputController,
+            icon: Icons.folder_copy_outlined,
+            onPick: busy ? null : onPickOutput,
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: busy ? null : onAddFiles,
+                  icon: const Icon(Icons.note_add),
+                  label: const Text('Add Files'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: busy ? null : onAddFolder,
+                  icon: const Icon(Icons.create_new_folder),
+                  label: const Text('Add Folder'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _SourceList(
+            sources: sources,
+            busy: busy,
+            onRemove: onRemoveSource,
+            onClear: onClearSources,
+          ),
+          const SizedBox(height: 16),
+          TextField(
+            controller: keyController,
+            obscureText: true,
+            decoration: InputDecoration(
+              labelText: 'BYTECODE_KEY',
+              prefixIcon: const Icon(Icons.key),
+              suffixIcon: IconButton(
+                tooltip: 'Generate key',
+                onPressed: busy ? null : onGenerateKey,
+                icon: const Icon(Icons.auto_awesome),
+              ),
+            ),
+          ),
+          const SizedBox(height: 12),
+          TextField(
+            controller: excludeController,
+            minLines: 1,
+            maxLines: 3,
+            decoration: const InputDecoration(
+              labelText: 'Exclude globs',
+              prefixIcon: Icon(Icons.filter_alt_outlined),
+            ),
+          ),
+          const SizedBox(height: 16),
+          Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: FilledButton.icon(
+                  onPressed: busy ? null : onDump,
+                  icon: busy
+                      ? const SizedBox.square(
+                          dimension: 18,
+                          child: CircularProgressIndicator(
+                            strokeWidth: 2,
+                            color: Colors.white,
+                          ),
+                        )
+                      : const Icon(Icons.play_arrow),
+                  label: const Text('Dump'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                flex: 2,
+                child: OutlinedButton.icon(
+                  onPressed: busy ? null : onVerify,
+                  icon: const Icon(Icons.verified),
+                  label: const Text('Verify'),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          _StatusBanner(status: status, busy: busy),
+        ],
+      ),
+    );
+  }
+}
+
+class _Panel extends StatelessWidget {
+  const _Panel({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        border: Border.all(color: const Color(0xffddd6c8)),
+        borderRadius: BorderRadius.circular(8),
+        boxShadow: const [
+          BoxShadow(
+            blurRadius: 28,
+            offset: Offset(0, 12),
+            color: Color(0x14000000),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+}
+
+class _PanelTitle extends StatelessWidget {
+  const _PanelTitle({required this.icon, required this.title, this.trailing});
+
+  final IconData icon;
+  final String title;
+  final Widget? trailing;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
       children: [
-        Row(
-          children: [
-            Expanded(
-              child: _PathField(
-                label: 'Bytecode root',
-                controller: rootController,
-              ),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              tooltip: 'Choose bytecode root',
-              onPressed: busy ? null : onPickRoot,
-              icon: const Icon(Icons.folder_open),
-            ),
-          ],
+        Container(
+          width: 34,
+          height: 34,
+          decoration: BoxDecoration(
+            color: const Color(0xfffff7ed),
+            borderRadius: BorderRadius.circular(8),
+          ),
+          child: Icon(icon, size: 19, color: const Color(0xffb45309)),
         ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            FilledButton.icon(
-              onPressed: busy ? null : onAddFiles,
-              icon: const Icon(Icons.note_add),
-              label: const Text('Add Files'),
+        const SizedBox(width: 10),
+        Expanded(
+          child: Text(
+            title,
+            style: Theme.of(context).textTheme.titleMedium?.copyWith(
+              color: const Color(0xff171717),
+              fontWeight: FontWeight.w800,
             ),
-            const SizedBox(width: 8),
-            FilledButton.tonalIcon(
-              onPressed: busy ? null : onAddFolder,
-              icon: const Icon(Icons.create_new_folder),
-              label: const Text('Add Folder'),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: _PathField(
-                label: 'Output folder',
-                controller: outputController,
-              ),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              tooltip: 'Choose output folder',
-              onPressed: busy ? null : onPickOutput,
-              icon: const Icon(Icons.create_new_folder),
-            ),
-          ],
+          ),
         ),
-        const SizedBox(height: 8),
-        _SourceList(
-          sources: sources,
-          busy: busy,
-          onRemove: onRemoveSource,
-          onClear: onClearSources,
-        ),
-        const SizedBox(height: 8),
-        Row(
-          children: [
-            Expanded(
-              flex: 3,
-              child: TextField(
-                controller: keyController,
-                obscureText: true,
-                decoration: const InputDecoration(
-                  labelText: 'BYTECODE_KEY',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ),
-            const SizedBox(width: 8),
-            IconButton(
-              tooltip: 'Generate key',
-              onPressed: busy ? null : onGenerateKey,
-              icon: const Icon(Icons.key),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              flex: 4,
-              child: TextField(
-                controller: excludeController,
-                decoration: const InputDecoration(
-                  labelText: 'Exclude globs',
-                  border: OutlineInputBorder(),
-                ),
-              ),
-            ),
-            const SizedBox(width: 12),
-            FilledButton.icon(
-              onPressed: busy ? null : onDump,
-              icon: busy
-                  ? const SizedBox.square(
-                      dimension: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.play_arrow),
-              label: const Text('Dump'),
-            ),
-            const SizedBox(width: 8),
-            OutlinedButton.icon(
-              onPressed: busy ? null : onVerify,
-              icon: const Icon(Icons.verified),
-              label: const Text('Verify'),
-            ),
-          ],
-        ),
+        ?trailing,
       ],
     );
   }
 }
 
+class _StatusBanner extends StatelessWidget {
+  const _StatusBanner({required this.status, required this.busy});
+
+  final String? status;
+  final bool busy;
+
+  @override
+  Widget build(BuildContext context) {
+    final message = status ?? (busy ? 'Working' : 'Idle');
+    final isError =
+        message.toLowerCase().contains('error') ||
+        message.toLowerCase().contains('failed') ||
+        message.toLowerCase().contains('required') ||
+        message.toLowerCase().contains('must be') ||
+        message.toLowerCase().contains('exited');
+    final color = isError
+        ? const Color(0xffb91c1c)
+        : busy
+        ? const Color(0xff92400e)
+        : const Color(0xff0f766e);
+    final background = isError
+        ? const Color(0xffffeeee)
+        : busy
+        ? const Color(0xfffff7ed)
+        : const Color(0xffecfdf5);
+
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: background,
+        border: Border.all(color: color.withValues(alpha: 0.25)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            isError
+                ? Icons.error_outline
+                : busy
+                ? Icons.sync
+                : Icons.radio_button_checked,
+            color: color,
+            size: 20,
+          ),
+          const SizedBox(width: 10),
+          Expanded(
+            child: Text(
+              message,
+              maxLines: 3,
+              overflow: TextOverflow.ellipsis,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: const Color(0xff24211d),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _PathField extends StatelessWidget {
-  const _PathField({required this.label, required this.controller});
+  const _PathField({
+    required this.label,
+    required this.controller,
+    required this.icon,
+    required this.onPick,
+  });
 
   final String label;
   final TextEditingController controller;
+  final IconData icon;
+  final VoidCallback? onPick;
 
   @override
   Widget build(BuildContext context) {
@@ -489,7 +839,12 @@ class _PathField extends StatelessWidget {
       controller: controller,
       decoration: InputDecoration(
         labelText: label,
-        border: const OutlineInputBorder(),
+        prefixIcon: Icon(icon),
+        suffixIcon: IconButton(
+          tooltip: 'Choose $label',
+          onPressed: onPick,
+          icon: const Icon(Icons.folder_open),
+        ),
       ),
     );
   }
@@ -510,15 +865,19 @@ class _SourceList extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
+    return Container(
       decoration: BoxDecoration(
-        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        color: const Color(0xfffaf9f6),
+        border: Border.all(color: const Color(0xffddd6c8)),
         borderRadius: BorderRadius.circular(8),
       ),
       child: SizedBox(
-        height: 108,
+        height: 176,
         child: sources.isEmpty
-            ? const Center(child: Text('No files or folders selected'))
+            ? const _EmptyState(
+                icon: Icons.upload_file,
+                title: 'No files or folders selected',
+              )
             : Column(
                 children: [
                   Expanded(
@@ -533,6 +892,7 @@ class _SourceList extends StatelessWidget {
                             FileSystemEntity.isDirectorySync(source)
                                 ? Icons.folder
                                 : Icons.description,
+                            color: const Color(0xff0f766e),
                           ),
                           title: Text(
                             source,
@@ -550,15 +910,65 @@ class _SourceList extends StatelessWidget {
                   ),
                   Align(
                     alignment: Alignment.centerRight,
-                    child: TextButton.icon(
-                      onPressed: busy ? null : onClear,
-                      icon: const Icon(Icons.clear_all),
-                      label: const Text('Clear'),
+                    child: Padding(
+                      padding: const EdgeInsets.only(right: 6),
+                      child: TextButton.icon(
+                        onPressed: busy ? null : onClear,
+                        icon: const Icon(Icons.clear_all),
+                        label: const Text('Clear'),
+                      ),
                     ),
                   ),
                 ],
               ),
       ),
+    );
+  }
+}
+
+class _ResultsPanel extends StatelessWidget {
+  const _ResultsPanel({required this.rows, required this.logText});
+
+  final List<ManifestEntry> rows;
+  final String logText;
+
+  @override
+  Widget build(BuildContext context) {
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final stacked = constraints.maxWidth < 760;
+
+        return _Panel(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              const _PanelTitle(
+                icon: Icons.analytics_outlined,
+                title: 'Artifacts',
+              ),
+              const SizedBox(height: 14),
+              Expanded(
+                child: stacked
+                    ? Column(
+                        children: [
+                          Expanded(child: _ManifestTable(rows: rows)),
+                          const SizedBox(height: 12),
+                          Expanded(child: _LogPane(text: logText)),
+                        ],
+                      )
+                    : Row(
+                        crossAxisAlignment: CrossAxisAlignment.stretch,
+                        children: [
+                          Expanded(flex: 7, child: _ManifestTable(rows: rows)),
+                          const SizedBox(width: 12),
+                          Expanded(flex: 5, child: _LogPane(text: logText)),
+                        ],
+                      ),
+              ),
+            ],
+          ),
+        );
+      },
     );
   }
 }
@@ -570,18 +980,33 @@ class _ManifestTable extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
+    return Container(
       decoration: BoxDecoration(
-        border: Border.all(color: Theme.of(context).colorScheme.outlineVariant),
+        color: const Color(0xfffaf9f6),
+        border: Border.all(color: const Color(0xffddd6c8)),
         borderRadius: BorderRadius.circular(8),
       ),
       child: rows.isEmpty
-          ? const Center(child: Text('No manifest loaded'))
+          ? const _EmptyState(
+              icon: Icons.table_chart_outlined,
+              title: 'No manifest loaded',
+            )
           : Scrollbar(
               child: SingleChildScrollView(
                 scrollDirection: Axis.horizontal,
                 child: SingleChildScrollView(
                   child: DataTable(
+                    headingRowColor: WidgetStateProperty.all(
+                      const Color(0xfffff7ed),
+                    ),
+                    headingTextStyle: Theme.of(context).textTheme.labelLarge
+                        ?.copyWith(
+                          color: const Color(0xff3f3529),
+                          fontWeight: FontWeight.w800,
+                        ),
+                    dataTextStyle: Theme.of(context).textTheme.bodySmall,
+                    columnSpacing: 26,
+                    horizontalMargin: 16,
                     columns: const [
                       DataColumn(label: Text('Source')),
                       DataColumn(label: Text('Output')),
@@ -594,7 +1019,7 @@ class _ManifestTable extends StatelessWidget {
                           cells: [
                             DataCell(SelectableText(row.source)),
                             DataCell(SelectableText(row.output)),
-                            DataCell(Text(row.size.toString())),
+                            DataCell(Text(_formatBytes(row.size))),
                             DataCell(SelectableText(row.sha256)),
                           ],
                         ),
@@ -614,9 +1039,10 @@ class _LogPane extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
+    return Container(
       decoration: BoxDecoration(
-        color: const Color(0xff111827),
+        color: const Color(0xff181512),
+        border: Border.all(color: const Color(0xff2f2923)),
         borderRadius: BorderRadius.circular(8),
       ),
       child: Padding(
@@ -626,13 +1052,61 @@ class _LogPane extends StatelessWidget {
           child: SelectableText(
             text.isEmpty ? 'Command output' : text,
             style: const TextStyle(
-              color: Color(0xffe5e7eb),
+              color: Color(0xfff5efe7),
               fontFamily: 'monospace',
               fontSize: 12,
+              height: 1.45,
             ),
           ),
         ),
       ),
     );
   }
+}
+
+class _EmptyState extends StatelessWidget {
+  const _EmptyState({required this.icon, required this.title});
+
+  final IconData icon;
+  final String title;
+
+  @override
+  Widget build(BuildContext context) {
+    return Center(
+      child: Padding(
+        padding: const EdgeInsets.all(20),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            Icon(icon, size: 34, color: const Color(0xff9a8f80)),
+            const SizedBox(height: 10),
+            Text(
+              title,
+              textAlign: TextAlign.center,
+              style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                color: const Color(0xff6b6256),
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+String _formatBytes(int bytes) {
+  if (bytes < 1024) {
+    return '$bytes B';
+  }
+
+  const units = ['KB', 'MB', 'GB'];
+  var size = bytes / 1024;
+  var unit = 0;
+  while (size >= 1024 && unit < units.length - 1) {
+    size /= 1024;
+    unit++;
+  }
+
+  return '${size.toStringAsFixed(size >= 10 ? 0 : 1)} ${units[unit]}';
 }

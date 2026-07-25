@@ -40,8 +40,9 @@ types, and a real method call. Return metadata is persisted through
 ## Real bugs hit and fixed getting rung 1 working
 
 These are kept here because they're exactly the kind of non-obvious,
-version-specific trap this whole project exists to map out — useful record
-for whoever tackles rungs 2–5 or the 8.1/8.2/8.3/8.5 matrix later.
+version-specific trap this whole project exists to map out. The shorter
+porting reference is [`ZEND_INTERNALS.md`](ZEND_INTERNALS.md); the notes below
+preserve the original debugging trail.
 
 1. **`php.h` does not auto-include `config.h`.** Without
    `#ifdef HAVE_CONFIG_H #include "config.h" #endif` at the top of the file,
