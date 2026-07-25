@@ -6,7 +6,7 @@ through a public GitHub issue.
 
 ## Reporting a Vulnerability
 
-Email **udechimarvellous@gmail.com** with:
+Email **hello@megamindtechnologies.com** with:
 
 - A description of the issue and its impact.
 - Steps to reproduce (a minimal PHP script + container/key setup is ideal).

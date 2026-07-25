@@ -1,5 +1,8 @@
 # bytecode
 
+**[Read the full How-To guide →](HOWTO.md)** — CLI and GUI walkthroughs with
+tested, copy-pasteable examples for every feature below.
+
 `bytecode` is an open implementation of a PHP bytecode encoder and loader. It
 compiles PHP source through the real Zend Engine compiler, serializes the
 resulting runtime bytecode into encrypted containers, and reloads those
@@ -33,9 +36,10 @@ and container tests.
 PHP_VERSIONS='8.1 8.2 8.3 8.4 8.5' php/tests/run-version-matrix.sh
 ```
 
-See [`docs/PLAN.md`](docs/PLAN.md) for the phased roadmap and the detailed
-phase notes:
+See [`HOWTO.md`](HOWTO.md) for usage (CLI and GUI), and [`docs/PLAN.md`](docs/PLAN.md)
+for the phased roadmap and the detailed phase notes:
 
+- [`HOWTO.md`](HOWTO.md): how to use the CLI tools and the desktop GUI, with examples
 - [`docs/PHASE0.md`](docs/PHASE0.md): Zend dump/load feasibility spike
 - [`docs/PHASE1.md`](docs/PHASE1.md): encrypted container and CLI packer
 - [`docs/PHASE2.md`](docs/PHASE2.md): PHP version matrix
