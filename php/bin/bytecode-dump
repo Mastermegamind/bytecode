@@ -15,7 +15,7 @@ declare(strict_types=1);
 function usage(): void
 {
     fwrite(STDERR, <<<'USAGE'
-Usage: bytecode-dump [--raw] [--obfuscate] [--exclude <glob>]... <source-file-or-dir>... <output-dir>
+Usage: bytecode-dump [--raw] [--obfuscate] [--scan] [--fail-on-scan-warning] [--config <bytecode.json>] [--exclude <glob>]... <source-file-or-dir>... <output-dir>
 
   --obfuscate  Rename non-parameter local variables to _v0, _v1, ... in the
                dumped bytecode. Off by default. Skipped per-function whenever
@@ -23,6 +23,8 @@ Usage: bytecode-dump [--raw] [--obfuscate] [--exclude <glob>]... <source-file-or
                style dynamic dispatch is detected, so it never risks changing
                behavior -- see opdump_op_array_uses_dynamic_vars() in
                php/src/opdump.c.
+  --scan       Run bytecode-scan before dumping and write scan diagnostics into
+               bytecode.manifest.json.
 
 Environment:
   PHP_BIN      PHP binary to use (default: php8.4)
@@ -43,6 +45,50 @@ function fail(string $message, int $code = 1): never
 {
     fwrite(STDERR, $message . PHP_EOL);
     exit($code);
+}
+
+function load_bytecode_config(?string $path): array
+{
+    if ($path === null || $path === '') {
+        $candidate = getcwd() . DIRECTORY_SEPARATOR . 'bytecode.json';
+        if (!is_file($candidate)) {
+            return [];
+        }
+        $path = $candidate;
+    }
+
+    if (!is_file($path)) {
+        fail("config file does not exist: {$path}", 2);
+    }
+    $decoded = json_decode((string) file_get_contents($path), true);
+    if (!is_array($decoded)) {
+        fail("invalid JSON config: {$path}", 2);
+    }
+    return $decoded;
+}
+
+function config_list(array $config, string $key): array
+{
+    $value = $config[$key] ?? [];
+    if ($value === null) {
+        return [];
+    }
+    if (!is_array($value)) {
+        fail("bytecode.json field '{$key}' must be an array", 2);
+    }
+    return array_values(array_filter($value, static fn (mixed $item): bool => is_string($item) && $item !== ''));
+}
+
+function scanner_config(array $config): array
+{
+    $scanner = $config['scanner'] ?? [];
+    if ($scanner === null) {
+        return [];
+    }
+    if (!is_array($scanner)) {
+        fail("bytecode.json field 'scanner' must be an object", 2);
+    }
+    return $scanner;
 }
 
 /** Translate a shell-style glob (`*`, `?`) into an anchored regex; no fnmatch() dependency (absent on Windows). */
@@ -113,6 +159,62 @@ function run_subprocess(array $cmd, array $envOverrides): int
     return $exit;
 }
 
+function run_capture(array $cmd): array
+{
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if ($proc === false) {
+        fail('failed to start subprocess: ' . implode(' ', $cmd));
+    }
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($proc);
+    return [$exit, $stdout, $stderr];
+}
+
+function run_scan(
+    string $phpBin,
+    string $scanner,
+    array $sources,
+    array $excludes,
+    ?string $configPath,
+    bool $failOnWarning
+): array {
+    $cmd = [$phpBin, $scanner, '--json'];
+    if ($failOnWarning) {
+        $cmd[] = '--fail-on-warning';
+    }
+    if ($configPath !== null && $configPath !== '') {
+        $cmd[] = '--config';
+        $cmd[] = $configPath;
+    }
+    foreach ($excludes as $exclude) {
+        $cmd[] = '--exclude';
+        $cmd[] = $exclude;
+    }
+    array_push($cmd, ...$sources);
+
+    [$exit, $stdout, $stderr] = run_capture($cmd);
+    if ($exit !== 0) {
+        if ($stderr !== '') {
+            fwrite(STDERR, $stderr);
+        }
+        if ($stdout !== '') {
+            fwrite(STDERR, $stdout);
+        }
+        fail('bytecode-scan failed', $exit);
+    }
+
+    $decoded = json_decode($stdout, true);
+    if (!is_array($decoded) || ($decoded['format'] ?? '') !== 'bytecode-scan-v1') {
+        fail('bytecode-scan returned invalid JSON');
+    }
+    return $decoded;
+}
+
 /**
  * RSA-OAEP-SHA256-wraps $plaintext with the given public key by shelling out
  * to the openssl CLI. PHP's openssl_public_encrypt() only supports OAEP with
@@ -158,6 +260,9 @@ if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
 
 $raw = false;
 $obfuscate = false;
+$scan = false;
+$failOnScanWarning = false;
+$configPath = null;
 $excludes = [];
 while ($args) {
     $a = $args[0];
@@ -168,6 +273,30 @@ while ($args) {
     }
     if ($a === '--obfuscate') {
         $obfuscate = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--scan') {
+        $scan = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--fail-on-scan-warning') {
+        $scan = true;
+        $failOnScanWarning = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--config') {
+        array_shift($args);
+        if (!$args) {
+            fail('--config requires a JSON config file', 2);
+        }
+        $configPath = array_shift($args);
+        continue;
+    }
+    if (str_starts_with($a, '--config=')) {
+        $configPath = substr($a, strlen('--config='));
         array_shift($args);
         continue;
     }
@@ -202,11 +331,22 @@ if (count($args) < 2) {
 $out = array_pop($args);
 $sources = $args;
 
+$config = load_bytecode_config($configPath);
+$scannerConfig = scanner_config($config);
+$excludes = array_values(array_unique([...config_list($config, 'exclude'), ...$excludes]));
+if (($scannerConfig['enabled'] ?? false) === true) {
+    $scan = true;
+}
+if (($scannerConfig['fail_on_warning'] ?? false) === true) {
+    $failOnScanWarning = true;
+}
+
 $scriptDir = __DIR__;
 $phpBin = getenv('PHP_BIN') ?: 'php8.4';
 $defaultSoName = PHP_OS_FAMILY === 'Windows' ? 'opdump.dll' : 'opdump.so';
 $opdumpSo = getenv('OPDUMP_SO') ?: $scriptDir . '/../src/modules/' . $defaultSoName;
 $packer = $scriptDir . '/bytecode-pack';
+$scanner = $scriptDir . '/bytecode-scan';
 
 if (!is_file($opdumpSo)) {
     fail("opdump extension not found at {$opdumpSo}; build php/src first");
@@ -320,6 +460,22 @@ foreach ($sourceAbsList as $sourceAbs) {
         : (is_dir($sourceAbs) ? $sourceAbs : dirname($sourceAbs));
 }
 $relativeBase = common_base($commonInputs);
+
+$scanReport = null;
+if ($scan) {
+    if (!is_file($scanner)) {
+        fail("bytecode scanner not found at {$scanner}");
+    }
+    $scanReport = run_scan($phpBin, $scanner, $sourceAbsList, $excludes, $configPath, $failOnScanWarning);
+    fwrite(
+        STDOUT,
+        sprintf(
+            "bytecode-scan: scanned %d file(s), %d warning(s)\n",
+            $scanReport['files_scanned'] ?? 0,
+            $scanReport['warning_count'] ?? 0,
+        ),
+    );
+}
 
 function dump_one(
     string $file,
@@ -456,6 +612,14 @@ if (!$raw) {
         'map' => 'bytecode.map',
         'files' => $manifestFiles,
     ];
+    if ($scanReport !== null) {
+        $manifest['scan'] = [
+            'format' => $scanReport['format'],
+            'files_scanned' => $scanReport['files_scanned'],
+            'warning_count' => $scanReport['warning_count'],
+            'warnings' => $scanReport['warnings'],
+        ];
+    }
 
     file_put_contents(
         $outAbs . DIRECTORY_SEPARATOR . 'bytecode.manifest.json',

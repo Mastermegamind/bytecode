@@ -12,7 +12,7 @@ declare(strict_types=1);
 function usage(): void
 {
     fwrite(STDERR, <<<'USAGE'
-Usage: bytecode-scan [--json] [--fail-on-warning] [--exclude <glob>]... <source-file-or-dir>...
+Usage: bytecode-scan [--json] [--fail-on-warning] [--config <bytecode.json>] [--exclude <glob>]... <source-file-or-dir>...
 
 Scans PHP sources for dynamic constructs that can break source-level symbol
 rewriting or make encoded-build debugging harder:
@@ -32,6 +32,50 @@ function fail(string $message, int $code = 1): never
 {
     fwrite(STDERR, $message . PHP_EOL);
     exit($code);
+}
+
+function load_bytecode_config(?string $path): array
+{
+    if ($path === null || $path === '') {
+        $candidate = getcwd() . DIRECTORY_SEPARATOR . 'bytecode.json';
+        if (!is_file($candidate)) {
+            return [];
+        }
+        $path = $candidate;
+    }
+
+    if (!is_file($path)) {
+        fail("config file does not exist: {$path}", 2);
+    }
+    $decoded = json_decode((string) file_get_contents($path), true);
+    if (!is_array($decoded)) {
+        fail("invalid JSON config: {$path}", 2);
+    }
+    return $decoded;
+}
+
+function config_list(array $config, string $key): array
+{
+    $value = $config[$key] ?? [];
+    if ($value === null) {
+        return [];
+    }
+    if (!is_array($value)) {
+        fail("bytecode.json field '{$key}' must be an array", 2);
+    }
+    return array_values(array_filter($value, static fn (mixed $item): bool => is_string($item) && $item !== ''));
+}
+
+function scanner_config(array $config): array
+{
+    $scanner = $config['scanner'] ?? [];
+    if ($scanner === null) {
+        return [];
+    }
+    if (!is_array($scanner)) {
+        fail("bytecode.json field 'scanner' must be an object", 2);
+    }
+    return $scanner;
 }
 
 function glob_to_regex(string $glob): string
@@ -182,6 +226,18 @@ function add_warning(array &$warnings, string $file, int $line, string $code, st
     ];
 }
 
+function filter_warnings(array $warnings, array $ignoreCodes): array
+{
+    if ($ignoreCodes === []) {
+        return $warnings;
+    }
+    $ignore = array_flip($ignoreCodes);
+    return array_values(array_filter(
+        $warnings,
+        static fn (array $warning): bool => !isset($ignore[$warning['code']]),
+    ));
+}
+
 function scan_file(string $file): array
 {
     $source = file_get_contents($file);
@@ -288,6 +344,7 @@ if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
 
 $json = false;
 $failOnWarning = false;
+$configPath = null;
 $excludes = [];
 while ($args) {
     $arg = $args[0];
@@ -298,6 +355,19 @@ while ($args) {
     }
     if ($arg === '--fail-on-warning') {
         $failOnWarning = true;
+        array_shift($args);
+        continue;
+    }
+    if ($arg === '--config') {
+        array_shift($args);
+        if (!$args) {
+            fail('--config requires a JSON config file', 2);
+        }
+        $configPath = array_shift($args);
+        continue;
+    }
+    if (str_starts_with($arg, '--config=')) {
+        $configPath = substr($arg, strlen('--config='));
         array_shift($args);
         continue;
     }
@@ -330,11 +400,20 @@ if (!$args) {
     exit(2);
 }
 
+$config = load_bytecode_config($configPath);
+$scanner = scanner_config($config);
+$excludes = array_values(array_unique([...config_list($config, 'exclude'), ...$excludes]));
+$ignoreCodes = config_list($scanner, 'ignore_codes');
+if (($scanner['fail_on_warning'] ?? false) === true) {
+    $failOnWarning = true;
+}
+
 $files = collect_php_files($args, $excludes);
 $warnings = [];
 foreach ($files as $file) {
     array_push($warnings, ...scan_file($file));
 }
+$warnings = filter_warnings($warnings, $ignoreCodes);
 
 if ($json) {
     echo json_encode(

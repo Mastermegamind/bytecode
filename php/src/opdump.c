@@ -41,6 +41,20 @@
 # include <sys/mman.h>
 #endif
 
+#ifndef ZEND_HASH_MAP_FOREACH_PTR
+# define ZEND_HASH_MAP_FOREACH_PTR ZEND_HASH_FOREACH_PTR
+#endif
+#ifndef ZEND_HASH_MAP_FOREACH_STR_KEY_PTR
+# define ZEND_HASH_MAP_FOREACH_STR_KEY_PTR ZEND_HASH_FOREACH_STR_KEY_PTR
+#endif
+
+#ifndef ZEND_TYPE_HAS_LITERAL_NAME
+# define ZEND_TYPE_HAS_LITERAL_NAME(t) (0)
+#endif
+#ifndef _ZEND_TYPE_LITERAL_NAME_BIT
+# define _ZEND_TYPE_LITERAL_NAME_BIT 0u
+#endif
+
 /* Best-effort in-memory hardening for key material (Rung D). mlock/munlock
  * and RLIMIT_CORE are POSIX-only; Windows builds compile these out entirely
  * rather than partially-lock memory in a way nothing here relies on. */
@@ -76,6 +90,71 @@ static void opdump_unlock_mem(void *p, size_t len)
 }
 
 static zend_op_array *(*opdump_orig_compile_file)(zend_file_handle *file_handle, int type);
+
+static void opdump_init_run_time_cache(zend_op_array *op_array)
+{
+    if (op_array->cache_size <= 0) {
+        return;
+    }
+    void **run_time_cache = (void **) ecalloc(1, (size_t) op_array->cache_size);
+#if PHP_VERSION_ID < 80200
+    void ***run_time_cache_ptr = (void ***) emalloc(sizeof(void **));
+    *run_time_cache_ptr = run_time_cache;
+    ZEND_MAP_PTR_INIT(op_array->run_time_cache, run_time_cache_ptr);
+#else
+    ZEND_MAP_PTR_INIT(op_array->run_time_cache, run_time_cache);
+#endif
+#ifdef ZEND_ACC_HEAP_RT_CACHE
+    op_array->fn_flags |= ZEND_ACC_HEAP_RT_CACHE;
+#endif
+}
+
+static void opdump_bind_fcall_caches(zend_op_array *op_array)
+{
+    if (op_array->cache_size <= 0) {
+        return;
+    }
+
+    void **run_time_cache = RUN_TIME_CACHE(op_array);
+    if (!run_time_cache) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < op_array->last; i++) {
+        zend_op *opline = &op_array->opcodes[i];
+        if (opline->opcode != ZEND_INIT_FCALL || opline->op2_type != IS_CONST) {
+            continue;
+        }
+        if (opline->result.num >= (uint32_t) op_array->cache_size) {
+            continue;
+        }
+
+        zval *fname = RT_CONSTANT(opline, opline->op2);
+        if (Z_TYPE_P(fname) != IS_STRING) {
+            continue;
+        }
+
+        zval *func_zv = zend_hash_find(EG(function_table), Z_STR_P(fname));
+        if (!func_zv) {
+            if (getenv("OPDUMP_DEBUG")) {
+                fprintf(stderr, "[opdump debug] fcall cache miss: %s\n", Z_STRVAL_P(fname));
+            }
+            continue;
+        }
+
+        zend_function *fbc = Z_FUNC_P(func_zv);
+        *(zend_function **)((char *) run_time_cache + opline->result.num) = fbc;
+        if (getenv("OPDUMP_DEBUG")) {
+            fprintf(stderr, "[opdump debug] fcall cache bind: %s offset=%u fbc=%p slot=%p\n",
+                Z_STRVAL_P(fname), opline->result.num, (void*) fbc,
+                (void*)((char *) run_time_cache + opline->result.num));
+        }
+    }
+
+    for (uint32_t i = 0; i < op_array->num_dynamic_func_defs; i++) {
+        opdump_bind_fcall_caches(op_array->dynamic_func_defs[i]);
+    }
+}
 
 typedef struct _opdump_map_entry {
     char *source;
@@ -203,6 +282,7 @@ static zend_string *r_zstr(FILE *f, bool intern)
     if (intern) {
         zs = zend_new_interned_string(zs);
     }
+    zend_string_hash_val(zs);
     return zs;
 }
 
@@ -1117,6 +1197,7 @@ static void opdump_read_literal(FILE *f, zval *zv)
             zend_string *zs = zend_string_init(s, slen, 0);
             free(s);
             zs = zend_new_interned_string(zs);
+            zend_string_hash_val(zs);
             ZVAL_STR(zv, zs);
             break;
         }
@@ -1397,7 +1478,9 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     ce->default_static_members_count = r_i32(f);
     opdump_guard_i32_nonnegative(ce->default_properties_count, OPDUMP_MAX_CLASS_PROPERTIES, "default properties");
     opdump_guard_i32_nonnegative(ce->default_static_members_count, OPDUMP_MAX_CLASS_PROPERTIES, "default static members");
+#if PHP_VERSION_ID >= 80300
     ce->default_object_handlers = &std_object_handlers;
+#endif
     ce->info.user.filename = r_zstr(f, true);
     ce->info.user.line_start = r_u32(f);
     ce->info.user.line_end = r_u32(f);
@@ -1508,6 +1591,11 @@ static zend_op_array *opdump_read_op_array(FILE *f)
     opdump_guard_i32_nonnegative(saved_cache_size, UINT32_MAX, "runtime cache size");
     opdump_guard_i32_nonnegative(saved_last_var, OPDUMP_MAX_VARS, "compiled variable");
     opdump_guard_i32_nonnegative(saved_last_try_catch, OPDUMP_MAX_TRY_CATCH, "try/catch");
+#if PHP_VERSION_ID < 80200
+    if (saved_cache_size == 0 && (saved_fn_flags & ZEND_ACC_HAS_TYPE_HINTS)) {
+        saved_cache_size = (int32_t) sizeof(void *);
+    }
+#endif
 
     uint32_t fname_len;
     char *fname = r_str(f, &fname_len);
@@ -1636,11 +1724,19 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         }
     }
 
+    opdump_init_run_time_cache(op_array);
+
     if (getenv("OPDUMP_DEBUG")) {
+        fprintf(stderr, "[opdump debug] op_array name=%s fn_flags=%u cache_size=%d num_args=%u required=%u T=%u last_var=%d runtime_cache=%p\n",
+            op_array->function_name ? ZSTR_VAL(op_array->function_name) : "{main}",
+            op_array->fn_flags, op_array->cache_size, op_array->num_args,
+            op_array->required_num_args, op_array->T, op_array->last_var,
+            op_array->cache_size > 0 ? (void*) RUN_TIME_CACHE(op_array) : NULL);
         for (uint32_t i = 0; i < op_array->last; i++) {
             zend_op *op = &op_array->opcodes[i];
-            fprintf(stderr, "[opdump debug] op[%u]: opcode=%u op1_type=%u op2_type=%u result_type=%u op1.num=%u op2.num=%u handler=%p\n",
-                i, op->opcode, op->op1_type, op->op2_type, op->result_type, op->op1.num, op->op2.num, op->handler);
+            fprintf(stderr, "[opdump debug] op[%u]: opcode=%u op1_type=%u op2_type=%u result_type=%u ext=%u op1.num=%u op2.num=%u result.num=%u handler=%p\n",
+                i, op->opcode, op->op1_type, op->op2_type, op->result_type,
+                op->extended_value, op->op1.num, op->op2.num, op->result.num, op->handler);
         }
         for (int i = 0; i < op_array->last_literal; i++) {
             zval *zv = &op_array->literals[i];
@@ -1648,6 +1744,14 @@ static zend_op_array *opdump_read_op_array(FILE *f)
             if (Z_TYPE_P(zv) == IS_STRING) fprintf(stderr, " value=\"%s\"", Z_STRVAL_P(zv));
             if (Z_TYPE_P(zv) == IS_LONG) fprintf(stderr, " value=%ld", (long)Z_LVAL_P(zv));
             fprintf(stderr, "\n");
+        }
+        for (uint32_t i = 0; i < op_array->num_args; i++) {
+            zend_arg_info *arg_info = &op_array->arg_info[i];
+            fprintf(stderr, "[opdump debug] arg[%u]: name=%s type_mask=%u default=%p\n",
+                i,
+                arg_info->name ? ZSTR_VAL(arg_info->name) : "{null}",
+                ZEND_TYPE_FULL_MASK(arg_info->type),
+                (void*) arg_info->default_value);
         }
         fprintf(stderr, "[opdump debug] literals base ptr = %p\n", (void*)op_array->literals);
     }
@@ -1697,6 +1801,15 @@ static zend_op_array *opdump_read_raw_stream(FILE *f, const char *path)
         zend_string_release(lcname);
         zend_string_release(key);
     }
+
+    opdump_bind_fcall_caches(op_array);
+    zend_function *func;
+    ZEND_HASH_MAP_FOREACH_PTR(EG(function_table), func) {
+        if (opdump_function_belongs_to_file(func, op_array->filename)) {
+            opdump_bind_fcall_caches(&func->op_array);
+        }
+    } ZEND_HASH_FOREACH_END();
+
     php_error_docref(NULL, E_NOTICE, "opdump: loaded %s (%u opcodes, %d literals, %u dynamic funcs, %u functions, %u classes) without parsing source",
         path, op_array->last, op_array->last_literal, op_array->num_dynamic_func_defs, function_count, class_count);
     return op_array;

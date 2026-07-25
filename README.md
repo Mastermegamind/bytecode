@@ -1,103 +1,180 @@
 # bytecode
 
-An engine for compiling source languages down to their runtime's native
-bytecode, dumping that bytecode to an encoded container, and reloading it
-back into the runtime without the original source — the same category of
-tool as ionCube/SourceGuardian/Zend Guard, built in the open.
+`bytecode` is an open implementation of a PHP bytecode encoder and loader. It
+compiles PHP source through the real Zend Engine compiler, serializes the
+resulting runtime bytecode into encrypted containers, and reloads those
+containers later without reading the original PHP source.
 
-The long-term goal is language-agnostic: a common container format and
-tooling shape that different per-language backends plug into. For now there
-is exactly one backend, because it's the only one that's been proven to
-work at all:
+The project is in the same broad category as commercial PHP encoders such as
+ionCube, SourceGuardian, and the old Zend Guard, but the design goal here is to
+make the moving parts visible: the Zend loader, the container format, the CLI
+tooling, the verification tests, and the desktop packaging are all developed in
+the open.
 
-## Status: PHP backend, Phase 0 (feasibility spike)
+The long-term shape is language-agnostic: one container/tooling model with
+backend adapters per runtime. Today, the only backend is PHP, because Zend
+bytecode round-tripping is the proven path in this repository.
 
-Targeting PHP **8.1, 8.2, 8.3, 8.4, 8.5**. See [`docs/PLAN.md`](docs/PLAN.md)
-for the full phased roadmap, [`docs/PHASE0.md`](docs/PHASE0.md) for the
-current feasibility gate, and [`docs/PHASE1.md`](docs/PHASE1.md),
-[`docs/PHASE2.md`](docs/PHASE2.md), [`docs/PHASE3.md`](docs/PHASE3.md), and
-[`docs/PHASE4.md`](docs/PHASE4.md) for the implementation track and gated
-follow-up phases.
+## Current Status
 
-Phase 0 is a hard go/no-go gate: a minimal Zend extension that dumps a
-compiled `zend_op_array` to disk and reloads it in a fresh process, tested
-against PHP 8.4 only, including a Reflection-parity check (the exact class of
-bug — `ReflectionParameter::isDefaultValueAvailable()` silently wrong — that
-made an existing commercial encoder unusable for a real PHP-DI-based
-application). If that doesn't hold up cleanly, the multi-version work in
-later phases isn't worth starting.
+The PHP backend currently builds and passes the local version matrix for:
 
-## Why this exists
+- PHP 8.1
+- PHP 8.2
+- PHP 8.3
+- PHP 8.4
+- PHP 8.5
 
-PHP source obfuscation (renaming identifiers, escaping strings) is not real
-protection — the output is still valid, fully-readable PHP source text.
-Actual bytecode encoding requires hooking the Zend Engine's compile step
-directly, which is what this project builds toward, version by version.
-
-## Current tools
+The matrix builds the native extension against each minor version's Zend
+headers and runs the current dump/load, Reflection parity, scanner, tree-load,
+and container tests.
 
 ```bash
-php/tests/run-rung1.sh
-php/tests/run-rung2.sh
-php/tests/run-rung3.sh
-php/tests/run-rung4.sh
-php/tests/run-rung5-reflection.sh
-php/tests/run-load-tree.sh
-php/tests/run-phase1-container.sh
-php/tests/run-rung6-hkdf.sh
-php/tests/run-rung7-license.sh
-php/tests/run-rung8-manifest-auth.sh
-php/tests/run-rung9-obfuscate.sh
-php/tests/run-bytecode-scan.sh
-
-php/bin/bytecode-keygen
-php/bin/bytecode-scan php/tests
-php/bin/bytecode-info /tmp/bytecode-out/rung1.php.bytc
-php/bin/bytecode-verify /tmp/bytecode-out/bytecode.manifest.json
-
-BYTECODE_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef \
-  php/bin/bytecode-dump php/tests /tmp/bytecode-out
-
-BYTECODE_KEY=... php/bin/bytecode-dump app routes/config.php /tmp/bytecode-out
-
-BYTECODE_KEY=... OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
-  php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
+PHP_VERSIONS='8.1 8.2 8.3 8.4 8.5' php/tests/run-version-matrix.sh
 ```
 
-Containers default to `BYTC2`: `BYTECODE_KEY`/`OPDUMP_KEY` is treated as HKDF
-input keying material (not the raw AES key), and `bytecode.manifest.json` +
-`bytecode.map` are authenticated together via `bytecode.manifest.sig`, closing
-the gap where the map could be edited to point a source path at a different,
-still-validly-encrypted container. `BYTC1` (the original shared-secret format)
-remains a supported read path. See
-[`docs/PHASE4_KEY_MODEL.md`](docs/PHASE4_KEY_MODEL.md) for the full model.
+See [`docs/PLAN.md`](docs/PLAN.md) for the phased roadmap and the detailed
+phase notes:
 
-Optional license mode replaces the shared secret with an RSA-wrapped
-per-build key, so the vendor encoding a build never has to hand the customer
-running it a raw shared key:
+- [`docs/PHASE0.md`](docs/PHASE0.md): Zend dump/load feasibility spike
+- [`docs/PHASE1.md`](docs/PHASE1.md): encrypted container and CLI packer
+- [`docs/PHASE2.md`](docs/PHASE2.md): PHP version matrix
+- [`docs/PHASE3.md`](docs/PHASE3.md): Reflection parity
+- [`docs/PHASE4.md`](docs/PHASE4.md): packaging, keys, licensing, integrity
+- [`docs/PHASE4_KEY_MODEL.md`](docs/PHASE4_KEY_MODEL.md): implemented key model
+- [`docs/ZEND_INTERNALS.md`](docs/ZEND_INTERNALS.md): Zend porting notes
+- [`docs/YAKPRO_PO_STUDY.md`](docs/YAKPRO_PO_STUDY.md): lessons from Yakpro PO
+
+## Why This Exists
+
+PHP source obfuscation is useful for slowing casual reading, but it is not the
+same as bytecode encoding. Obfuscators still emit valid PHP source text. A
+bytecode encoder changes the trust boundary: source is compiled once, converted
+to runtime structures, packed into authenticated containers, and loaded by a
+native extension later.
+
+That matters for commercial PHP distribution, private SaaS/customer
+deployments, and any environment where application code needs to run on a
+customer-controlled machine without shipping the original source tree in plain
+text.
+
+This project also exists because PHP encoders are easy to get subtly wrong.
+Reflection, dependency injection, named arguments, default values, class
+metadata, typed properties, method dispatch, and runtime caches all depend on
+Zend internals matching the version that is executing the code. A bytecode
+loader that "mostly works" can still break real applications. The test ladder
+here is built around catching those failures.
+
+## Architecture
+
+The repository has four main layers.
+
+### 1. Native Zend Extension
+
+The core loader is in [`php/src/opdump.c`](php/src/opdump.c). It hooks
+`zend_compile_file` and supports several runtime modes through environment
+variables:
+
+- `OPDUMP_MODE=dump`: compile PHP normally, then serialize the generated
+  `zend_op_array` to a blob.
+- `OPDUMP_MODE=load`: read one blob and return a reconstructed `zend_op_array`
+  instead of parsing the source file.
+- `OPDUMP_MODE=load-tree`: intercept requested source paths and load matching
+  `.bytc` containers through a generated `bytecode.map`.
+
+The extension reconstructs opcodes, literals, functions, classes, properties,
+argument metadata, try/catch metadata, runtime caches, and enough class/function
+state for the current test ladder. Because Zend internals change between PHP
+minor versions, the loader contains compatibility branches for 8.1 through 8.5.
+
+### 2. Container Format
+
+The CLI tools wrap raw Zend blobs into encrypted `.bytc` containers. Current
+containers default to `BYTC2`.
+
+`BYTC2` provides:
+
+- AES-256-GCM authenticated encryption for each container payload.
+- HKDF-SHA256 key derivation from `BYTECODE_KEY` or `OPDUMP_KEY`, so the
+  environment value is input keying material rather than the raw AES key.
+- A manifest signature over `bytecode.manifest.json` and `bytecode.map`, so a
+  deployment cannot silently rewrite the source-to-container map.
+- Optional license mode where a per-build data encryption key is RSA-wrapped
+  for the runtime holder of the private key.
+
+`BYTC1`, the earlier shared-secret format, remains a supported read path for
+compatibility.
+
+### 3. PHP CLI Tooling
+
+The command-line tools under [`php/bin`](php/bin) provide the user-facing
+workflow:
+
+- `bytecode-keygen`: generate a random shared key.
+- `bytecode-dump`: walk files/directories, dump bytecode, pack `.bytc`
+  containers, and write the manifest/map.
+- `bytecode-pack`: pack one raw dump into a container.
+- `bytecode-info`: inspect a container header and metadata.
+- `bytecode-verify`: verify manifests, hashes, sizes, map entries, and
+  signatures.
+- `bytecode-license-keygen`: generate RSA license keys.
+- `bytecode-scan`: preflight source scanner for dynamic PHP hazards.
+
+The scanner was inspired by Yakpro PO's practical PHP-obfuscation lessons. It
+does not replace bytecode encoding; it warns about constructs that affect safe
+name handling and future symbol rewriting, such as dynamic calls, variable
+variables, callable arrays, dynamic class/member access, and framework-sensitive
+object hydration patterns.
+
+### 4. Flutter Desktop UI And Packages
+
+The [`ui`](ui) directory is a Flutter desktop application intended to wrap the
+CLI workflow. The packaging scripts can bundle the UI, PHP runtime, helper
+scripts, and native extension into installable desktop artifacts.
+
+Supported packaging paths include:
+
+- Linux AppImage
+- Linux `.deb`
+- macOS `.app` zip
+- Windows zip
+- Windows MSI
+
+Packaging workflows live in [`scripts`](scripts) and
+[`.github/workflows`](.github/workflows).
+
+## Repository Layout
+
+```text
+php/src/                      Native Zend extension
+php/bin/                      Encoder, verifier, scanner, key, and license tools
+php/tests/                    Rung tests, parity tests, matrix runner
+docs/                         Roadmap, phase docs, internals notes
+ui/                           Flutter desktop application
+scripts/                      Linux/macOS/Windows packaging scripts
+.github/workflows/            CI for PHP matrix and desktop packages
+```
+
+## Build The PHP Extension
+
+Build against a specific PHP minor version by pairing the matching `phpize` and
+`php-config` binaries:
 
 ```bash
-php/bin/bytecode-license-keygen /path/to/keys   # writes license.key.pem + license.pub.pem
-
-BYTECODE_LICENSE_PUBKEY=/path/to/keys/license.pub.pem \
-  php/bin/bytecode-dump app /tmp/bytecode-out   # writes bytecode.license.json too
-
-OPDUMP_LICENSE_KEY_FILE=/path/to/keys/license.key.pem \
-  OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
-  php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
+cd php/src
+phpize8.4
+./configure --enable-opdump --with-php-config=/usr/bin/php-config8.4
+make
+cd ../..
 ```
 
-Optional variable-name obfuscation renames non-parameter locals to `_v0`,
-`_v1`, ... in the dumped bytecode, skipped per-function whenever
-`compact()`/`extract()`/`get_defined_vars()`/`$$name` could depend on the
-real name (safe because compiled opcodes reference locals by slot index, not
-name — see `opdump_op_array_uses_dynamic_vars()` in `php/src/opdump.c`):
+Then run a smoke test:
 
 ```bash
-BYTECODE_KEY=... php/bin/bytecode-dump --obfuscate app /tmp/bytecode-out
+PHP_BIN=php8.4 php/tests/run-rung1.sh
 ```
 
-macOS build shape:
+On macOS:
 
 ```bash
 brew install php openssl@3 pkg-config
@@ -112,30 +189,195 @@ php/tests/run-rung1.sh
 `config.m4` checks `pkg-config openssl` first, then Homebrew `openssl@3`, then
 falls back to the Linux-style `-lcrypto` link.
 
+## Test Ladder
+
+The tests are intentionally incremental. Each rung proves a little more Zend
+state survives dump/load:
+
+- `run-rung1.sh`: top-level script op_array
+- `run-rung2.sh`: function definition, typed parameter, default value
+- `run-rung3.sh`: class, constructor, typed property, method call
+- `run-rung4.sh`: try/catch/finally metadata
+- `run-rung5-reflection.sh`: Reflection spot check
+- `run-reflection-parity.sh`: source-vs-loader Reflection snapshots
+- `run-load-tree.sh`: map-driven loading of encoded source paths
+- `run-phase1-container.sh`: encrypted container load path
+- `run-rung6-hkdf.sh`: HKDF key derivation
+- `run-rung7-license.sh`: RSA-wrapped license key mode
+- `run-rung8-manifest-auth.sh`: manifest/map authentication
+- `run-rung9-obfuscate.sh`: safe local-variable obfuscation
+- `run-bytecode-scan.sh`: preflight scanner warnings
+- `run-bytecode-config-scan.sh`: `bytecode.json` scanner/dumper integration
+
+Run the current suite for one PHP version:
+
+```bash
+PHP_VERSIONS=8.4 php/tests/run-version-matrix.sh
+```
+
+Run every installed supported version:
+
+```bash
+PHP_VERSIONS='8.1 8.2 8.3 8.4 8.5' php/tests/run-version-matrix.sh
+```
+
+## Encode A PHP Project
+
+Generate a key, choose an output directory, and encode first-party PHP files
+into a separate tree. Do not write encoded artifacts back into the application
+source directory.
+
+```bash
+cd /var/www/bytecode
+
+KEY="$(php/bin/bytecode-keygen)"
+OUT="/tmp/app-bytecode"
+
+BYTECODE_KEY="$KEY" php/bin/bytecode-dump \
+  --exclude '.history/*' \
+  --exclude 'vendor/*' \
+  --exclude 'storage/*' \
+  --exclude 'node_modules/*' \
+  /path/to/app \
+  "$OUT"
+```
+
+Verify the encoded output:
+
+```bash
+php/bin/bytecode-verify "$OUT/bytecode.manifest.json"
+```
+
+Run an entrypoint through the encoded tree:
+
+```bash
+BYTECODE_KEY="$KEY" \
+OPDUMP_MODE=load-tree \
+OPDUMP_MAP="$OUT/bytecode.map" \
+php8.4 \
+  -d extension=/var/www/bytecode/php/src/modules/opdump.so \
+  -f /path/to/app/public/index.php
+```
+
+For Composer, PHP-DI, Slim, RoadRunner, Laravel-like, or framework-heavy
+applications, start conservatively:
+
+- Encode first-party PHP files first.
+- Leave `vendor/`, `.env`, `storage/`, caches, public assets, generated files,
+  and editor history outside the encoded set.
+- Keep framework and Composer internals running from normal source until the
+  parity suite covers the application shape.
+- Use `bytecode-scan` before encoding to find dynamic constructs.
+
+## Project Configuration
+
+`bytecode-dump` and `bytecode-scan` can read a project-level `bytecode.json`.
+It centralizes excludes and scanner behavior:
+
+```json
+{
+  "exclude": ["vendor/*", "storage/*", "node_modules/*"],
+  "scanner": {
+    "enabled": true,
+    "fail_on_warning": false,
+    "ignore_codes": []
+  },
+  "symbols": {
+    "classes": "preserve",
+    "methods": "preserve",
+    "properties": "preserve",
+    "functions": "preserve",
+    "variables": "internal"
+  }
+}
+```
+
+Use it directly:
+
+```bash
+php/bin/bytecode-scan --json --config bytecode.json app
+
+BYTECODE_KEY="$KEY" php/bin/bytecode-dump \
+  --config bytecode.json \
+  app \
+  /tmp/app-bytecode
+```
+
+When scanning is enabled, diagnostics are written into
+`bytecode.manifest.json`.
+
+## Key And License Modes
+
+### Shared Key Mode
+
+Shared key mode is the simplest development and deployment model:
+
+```bash
+KEY="$(php/bin/bytecode-keygen)"
+
+BYTECODE_KEY="$KEY" php/bin/bytecode-dump app /tmp/bytecode-out
+
+BYTECODE_KEY="$KEY" \
+OPDUMP_MODE=load-tree \
+OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
+php8.4 -n -d extension=php/src/modules/opdump.so -f app/index.php
+```
+
+The same key material must be present at encode time and runtime. Wrong keys
+fail during AES-GCM authentication before payload parsing.
+
+### License Key Mode
+
+License mode avoids handing the runtime a raw shared build key. The encoder
+generates one random data encryption key per build, wraps it with a public RSA
+key, and writes `bytecode.license.json`. Runtime unpacks that key with the
+private RSA key.
+
+```bash
+php/bin/bytecode-license-keygen /path/to/keys
+
+BYTECODE_LICENSE_PUBKEY=/path/to/keys/license.pub.pem \
+  php/bin/bytecode-dump app /tmp/bytecode-out
+
+OPDUMP_LICENSE_KEY_FILE=/path/to/keys/license.key.pem \
+OPDUMP_MODE=load-tree \
+OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
+php8.4 -n -d extension=php/src/modules/opdump.so -f app/index.php
+```
+
+## Obfuscation
+
+The primary protection model is encrypted bytecode containers, not source
+rewriting. There is also an optional, conservative variable-name obfuscation
+mode:
+
+```bash
+BYTECODE_KEY="$KEY" php/bin/bytecode-dump --obfuscate app /tmp/bytecode-out
+```
+
+This renames non-parameter local variables to `_v0`, `_v1`, and so on inside
+the dumped bytecode. It is skipped per function when PHP constructs such as
+`compact()`, `extract()`, `get_defined_vars()`, or variable variables could
+depend on the original local name. Parameters are preserved because named
+arguments and Reflection depend on them.
+
+Class names, method names, property names, function names, and public symbols
+are currently preserved. More aggressive symbol rewriting needs application
+metadata and Reflection parity coverage before it is safe.
+
 ## Desktop Packages
 
-Build the Flutter desktop UI, the PHP extension, and the PHP helper scripts
-into one AppImage:
+Build the Flutter desktop UI, PHP extension, PHP helper scripts, and runtime
+pieces into one Linux AppImage:
 
 ```bash
 scripts/build-linux-appimage.sh
 ```
 
-The output is written to:
+Output:
 
 ```bash
 dist/Bytecode_Encoder-x86_64.AppImage
-```
-
-The AppImage contains the Flutter bundle under `usr/bin/bytecode-encoder`, a
-bundled PHP CLI at `usr/bin/php`, and the bytecode tooling/extension under
-`usr/lib/bytecode`. When launched from an AppImage, the GUI automatically uses
-that embedded bytecode root.
-
-To build against a different installed PHP minor:
-
-```bash
-PHP_VERSION=8.3 scripts/build-linux-appimage.sh
 ```
 
 Build a Debian package:
@@ -144,13 +386,13 @@ Build a Debian package:
 scripts/build-linux-deb.sh
 ```
 
-The output is written to:
+Output:
 
 ```bash
 dist/bytecode-encoder_1.0.0_amd64.deb
 ```
 
-Override package metadata when needed:
+Override package metadata:
 
 ```bash
 VERSION=1.2.0 DEB_ARCH=amd64 PHP_VERSION=8.4 scripts/build-linux-deb.sh
@@ -162,7 +404,7 @@ Build a macOS `.app` bundle and zip on macOS:
 scripts/build-macos-app.sh
 ```
 
-The output is written to:
+Output:
 
 ```bash
 dist/Bytecode_Encoder-macos.zip
@@ -181,7 +423,7 @@ dotnet tool install --global wix
 .\scripts\build-windows-package.ps1 -BuildMsi
 ```
 
-The MSI output is written to:
+MSI output:
 
 ```powershell
 dist\Bytecode_Encoder-windows-x64.msi
@@ -196,68 +438,44 @@ $env:OPDUMP_DLL = "C:\path\to\php_opdump.dll"
 .\scripts\build-windows-package.ps1 -BuildMsi
 ```
 
-If you only want to smoke-test the Flutter Windows package:
+For a UI-only Windows smoke package:
 
 ```powershell
 .\scripts\build-windows-package.ps1 -SkipExtension
 ```
 
 GitHub Actions builds desktop artifacts in
-`.github/workflows/desktop-packages.yml`. Linux and macOS include the native
-PHP extension in the package. The default Windows CI job is UI-only until a
-Windows `php_opdump.dll` build step is added, but it still produces both the
-zip package and MSI installer.
+[`.github/workflows/desktop-packages.yml`](.github/workflows/desktop-packages.yml).
+Linux and macOS include the native PHP extension. The default Windows package
+workflow can produce UI-only artifacts until a native Windows extension build is
+provided.
 
-## Using It On A Large PHP Project
+## Continuous Integration
 
-Encode the project into a separate output directory. Do not write encoded
-artifacts back into the application tree. You can pass one file/folder or many
-files/folders; when more than one input is passed, the output keeps the selected
-paths under their common parent directory.
+The PHP version matrix workflow is in
+[`.github/workflows/php-version-matrix.yml`](.github/workflows/php-version-matrix.yml).
+It runs the matrix against PHP 8.1 through 8.5.
 
-```bash
-cd /var/www/bytecode
+Desktop packaging CI is in
+[`.github/workflows/desktop-packages.yml`](.github/workflows/desktop-packages.yml).
 
-KEY="$(php/bin/bytecode-keygen)"
-OUT="/tmp/exam-bytecode"
+## What Is Not Finished Yet
 
-BYTECODE_KEY="$KEY" php/bin/bytecode-dump \
-  --exclude '.history/*' \
-  --exclude 'vendor/*' \
-  --exclude 'storage/*' \
-  --exclude 'node_modules/*' \
-  /var/www/exam.test \
-  "$OUT"
-```
+This is still a rapidly evolving encoder, not a hardened commercial product.
+Important remaining work includes:
 
-Verify the manifest, container headers, hashes, sizes, map file, and (when
-`BYTECODE_KEY`/`OPDUMP_KEY` is set) the `bytecode.manifest.sig` signature:
-
-```bash
-php/bin/bytecode-verify "$OUT/bytecode.manifest.json"
-```
-
-Run an entrypoint through the encoded tree:
-
-```bash
-BYTECODE_KEY="$KEY" \
-OPDUMP_MODE=load-tree \
-OPDUMP_MAP="$OUT/bytecode.map" \
-php8.4 \
-  -d extension=/var/www/bytecode/php/src/modules/opdump.so \
-  -f /var/www/exam.test/public/index.php
-```
-
-For Composer/PHP-DI/Slim/RoadRunner apps, start by encoding first-party PHP
-files and leaving `vendor/`, `.env`, `storage/`, public assets, caches, and
-editor history out of the encoded set. Composer, PHP-DI, and framework code can
-then keep running normally while matching application files are loaded from
-`.bytc` containers through `bytecode.map`.
-
-Keep the key safe and stable for the deployment. The same `BYTECODE_KEY` used
-to pack the files is required at runtime; the C loader rejects wrong keys
-during AES-GCM authentication before executing the payload.
+- Broader real-application fixture coverage.
+- Deeper Reflection parity for more PHP language features.
+- OPcache behavior decisions.
+- Native Windows extension build automation.
+- Stronger Flutter UI workflow around dumping, verifying, and inspecting
+  manifests.
+- More complete support for advanced PHP features such as enums, readonly
+  edge cases, intersection/union metadata, attributes, closures, generators,
+  and framework-specific dynamic dispatch patterns.
+- Production policy around license expiry, revocation, and deployment
+  rotation.
 
 ## License
 
-MIT — see [`LICENSE`](LICENSE).
+MIT - see [`LICENSE`](LICENSE).

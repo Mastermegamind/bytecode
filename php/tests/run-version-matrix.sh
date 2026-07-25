@@ -13,6 +13,8 @@ TEST_SCRIPTS=(
   "$ROOT/php/tests/run-rung4.sh"
   "$ROOT/php/tests/run-rung5-reflection.sh"
   "$ROOT/php/tests/run-reflection-parity.sh"
+  "$ROOT/php/tests/run-bytecode-scan.sh"
+  "$ROOT/php/tests/run-bytecode-config-scan.sh"
   "$ROOT/php/tests/run-load-tree.sh"
   "$ROOT/php/tests/run-phase1-container.sh"
 )

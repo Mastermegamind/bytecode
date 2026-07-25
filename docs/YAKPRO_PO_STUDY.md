@@ -148,9 +148,35 @@ Initial implementation note: `php/bin/bytecode-scan` now exists and uses
 PHP's tokenizer so it has no new Composer dependency. A later version can move
 to `nikic/php-parser` when the scanner needs full AST awareness.
 
+`bytecode.json` is now loaded by `bytecode-scan` and `bytecode-dump`. Current
+active fields:
+
+```json
+{
+  "exclude": ["vendor/*", "storage/*"],
+  "scanner": {
+    "enabled": true,
+    "fail_on_warning": false,
+    "ignore_codes": ["pdo-fetch-obj"]
+  },
+  "symbols": {
+    "classes": "preserve",
+    "methods": "preserve",
+    "properties": "preserve",
+    "functions": "preserve",
+    "variables": "internal"
+  }
+}
+```
+
+`symbols` is intentionally accepted as forward-looking policy metadata; the
+current encoder does not perform broad source-level symbol rewriting from it
+yet.
+
 ## Feature Parity Checklist
 
-- [ ] Recursive keep/skip policy
+- [x] Recursive exclude policy
+- [ ] Recursive keep policy
 - [ ] Timestamp/incremental build cache
 - [ ] Stable build context
 - [ ] Ignore names by category
@@ -158,7 +184,7 @@ to `nikic/php-parser` when the scanner needs full AST awareness.
 - [ ] Built-in PHP symbol reservation
 - [x] Dynamic-call scanner
 - [x] Callable-array scanner
-- [ ] Manifest diagnostics
+- [x] Manifest diagnostics
 - [ ] Optional source-minify stage
 - [ ] Optional string literal source-obfuscation stage
 - [ ] Optional local-variable rename stage

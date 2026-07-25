@@ -42,13 +42,19 @@ tests/*.php.bak
 *.key
 *.pem
 
+# Build packages (distribute via GitHub Releases, not git)
+dist/
+
+# Autoconf backups left by repeated phpize runs
+*~
+
 # IDE / OS
 .idea/
 .vscode/
 !.vscode/extensions.json
+.history/
 *.swp
 *.swo
 .DS_Store
 Thumbs.db
 !*.code-workspace
-dist/Bytecode_Encoder-x86_64.AppImage
