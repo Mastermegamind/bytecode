@@ -174,6 +174,32 @@ Then run a smoke test:
 PHP_BIN=php8.4 php/tests/run-rung1.sh
 ```
 
+The easiest CLI path is the installer helper. It builds the native loader for
+the requested PHP minor, copies it into that version's extension directory,
+writes a Debian-style `mods-available` ini file when available, and enables it
+with `phpenmod`:
+
+```bash
+php8.4 php/bin/bytecode-install-loader --php-version 8.4
+```
+
+Enable additional SAPIs:
+
+```bash
+php php/bin/bytecode-install-loader --php-version 8.4 --sapi cli,fpm,apache2
+```
+
+Only build and print the test command:
+
+```bash
+php php/bin/bytecode-install-loader --php-version 8.4 --build-only
+```
+
+The Flutter UI exposes the same helper in **Build Setup**. Set the target PHP
+version, then use the construction button to build the loader or the install
+button to install it as a Zend extension. If the desktop process cannot prompt
+for sudo, run the printed `bytecode-install-loader` command in a terminal.
+
 For ionCube-style loading and a `php -v` banner entry, load the same shared
 object as a Zend extension:
 

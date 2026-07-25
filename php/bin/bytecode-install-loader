@@ -1,0 +1,280 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+function usage(): void
+{
+    fwrite(STDERR, <<<'USAGE'
+Usage: bytecode-install-loader [options]
+
+Build and optionally install the Bytecode PHP Loader as a Zend extension.
+
+Options:
+  --php-version <minor>   Target PHP minor, for example 8.4.
+  --php-bin <path>        PHP binary to test with. Default: php<minor>, then php.
+  --phpize <path>         phpize binary. Default: phpize<minor>, then phpize.
+  --php-config <path>     php-config binary. Default: php-config<minor>, then php-config.
+  --source-dir <path>     Extension source dir. Default: ../src relative to this script.
+  --loader-name <name>    Installed shared object name. Default: bytecode_loader.so.
+  --ini-name <name>       Debian mods-available ini base name. Default: bytecode.
+  --sapi <list>           Comma list for phpenmod. Default: cli. Example: cli,fpm,apache2
+  --no-enable             Do not run phpenmod.
+  --build-only            Build the loader but do not copy/write/enable system files.
+  --no-sudo               Do not prefix privileged operations with sudo.
+  --dry-run               Print commands without running them.
+  -h, --help              Show this help.
+
+Examples:
+  php8.4 php/bin/bytecode-install-loader --php-version 8.4
+  php php/bin/bytecode-install-loader --php-version 8.4 --sapi cli,fpm
+  php php/bin/bytecode-install-loader --php-version 8.4 --build-only
+
+USAGE);
+}
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+function command_exists(string $command): bool
+{
+    $check = DIRECTORY_SEPARATOR === '\\'
+        ? ['where', $command]
+        : ['sh', '-c', 'command -v ' . escapeshellarg($command) . ' >/dev/null 2>&1'];
+    $result = run($check, null, [], false);
+    return $result === 0;
+}
+
+function resolve_command(?string $explicit, array $candidates): string
+{
+    if ($explicit !== null && $explicit !== '') {
+        return $explicit;
+    }
+    foreach ($candidates as $candidate) {
+        if (command_exists($candidate)) {
+            return $candidate;
+        }
+    }
+    fail('could not find command; tried: ' . implode(', ', $candidates), 2);
+}
+
+function render_cmd(array $cmd): string
+{
+    return implode(' ', array_map(
+        static fn (string $part): string => preg_match('#^[A-Za-z0-9_@%+=:,./-]+$#', $part) ? $part : escapeshellarg($part),
+        $cmd,
+    ));
+}
+
+function run(array $cmd, ?string $cwd = null, array $env = [], bool $echo = true, bool $dryRun = false): int
+{
+    if ($echo) {
+        fwrite(STDOUT, '$ ' . render_cmd($cmd) . PHP_EOL);
+    }
+    if ($dryRun) {
+        return 0;
+    }
+
+    $descriptor = [0 => STDIN, 1 => STDOUT, 2 => STDERR];
+    $process = proc_open($cmd, $descriptor, $pipes, $cwd, $env ?: null);
+    if (!is_resource($process)) {
+        fail('failed to start command: ' . render_cmd($cmd));
+    }
+    return proc_close($process);
+}
+
+function capture(array $cmd, ?string $cwd = null): string
+{
+    $descriptor = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $process = proc_open($cmd, $descriptor, $pipes, $cwd);
+    if (!is_resource($process)) {
+        fail('failed to start command: ' . render_cmd($cmd));
+    }
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($process);
+    if ($exit !== 0) {
+        if ($stderr !== '') {
+            fwrite(STDERR, $stderr);
+        }
+        fail('command failed: ' . render_cmd($cmd), $exit);
+    }
+    return trim((string) $stdout);
+}
+
+function sudo_prefix(bool $noSudo): array
+{
+    if ($noSudo || DIRECTORY_SEPARATOR === '\\' || function_exists('posix_geteuid') && posix_geteuid() === 0) {
+        return [];
+    }
+    return command_exists('sudo') ? ['sudo'] : [];
+}
+
+function write_privileged_file(string $path, string $content, bool $noSudo, bool $dryRun): void
+{
+    $tmp = tempnam(sys_get_temp_dir(), 'bytecode-ini-');
+    if ($tmp === false) {
+        fail('failed to create temporary ini file');
+    }
+    file_put_contents($tmp, $content);
+    $cmd = [...sudo_prefix($noSudo), 'cp', $tmp, $path];
+    $exit = run($cmd, null, [], true, $dryRun);
+    @unlink($tmp);
+    if ($exit !== 0) {
+        fail("failed to write {$path}", $exit);
+    }
+}
+
+$args = $argv;
+array_shift($args);
+
+if (in_array('-h', $args, true) || in_array('--help', $args, true)) {
+    usage();
+    exit(0);
+}
+
+$opts = [
+    'php-version' => getenv('PHP_VERSION') ?: null,
+    'php-bin' => null,
+    'phpize' => null,
+    'php-config' => null,
+    'source-dir' => realpath(__DIR__ . '/../src') ?: (__DIR__ . '/../src'),
+    'loader-name' => DIRECTORY_SEPARATOR === '\\' ? 'php_bytecode_loader.dll' : 'bytecode_loader.so',
+    'ini-name' => 'bytecode',
+    'sapi' => 'cli',
+    'enable' => true,
+    'build-only' => false,
+    'no-sudo' => false,
+    'dry-run' => false,
+];
+
+while ($args) {
+    $arg = array_shift($args);
+    $valueOption = static function (string $name) use (&$args, $arg): string {
+        if (!$args) {
+            fail("{$arg} requires a value", 2);
+        }
+        return array_shift($args);
+    };
+
+    if ($arg === '--no-enable') {
+        $opts['enable'] = false;
+    } elseif ($arg === '--build-only') {
+        $opts['build-only'] = true;
+    } elseif ($arg === '--no-sudo') {
+        $opts['no-sudo'] = true;
+    } elseif ($arg === '--dry-run') {
+        $opts['dry-run'] = true;
+    } elseif (str_starts_with($arg, '--') && str_contains($arg, '=')) {
+        [$name, $value] = explode('=', substr($arg, 2), 2);
+        if (!array_key_exists($name, $opts)) {
+            fail("unknown option: --{$name}", 2);
+        }
+        $opts[$name] = $value;
+    } elseif (in_array($arg, ['--php-version', '--php-bin', '--phpize', '--php-config', '--source-dir', '--loader-name', '--ini-name', '--sapi'], true)) {
+        $opts[substr($arg, 2)] = $valueOption($arg);
+    } else {
+        fail("unknown option: {$arg}", 2);
+    }
+}
+
+$minor = is_string($opts['php-version']) && $opts['php-version'] !== '' ? $opts['php-version'] : null;
+if ($minor !== null && !preg_match('/^\d+\.\d+$/', $minor)) {
+    fail('--php-version must look like 8.4', 2);
+}
+
+$phpBin = resolve_command($opts['php-bin'], $minor ? ["php{$minor}", 'php'] : ['php']);
+$phpize = resolve_command($opts['phpize'], $minor ? ["phpize{$minor}", 'phpize'] : ['phpize']);
+$phpConfig = resolve_command($opts['php-config'], $minor ? ["php-config{$minor}", 'php-config'] : ['php-config']);
+$sourceDir = (string) $opts['source-dir'];
+$dryRun = (bool) $opts['dry-run'];
+
+if (!is_dir($sourceDir)) {
+    fail("source dir does not exist: {$sourceDir}", 2);
+}
+
+$versionId = capture([$phpBin, '-r', 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;']);
+if ($minor === null) {
+    $minor = $versionId;
+}
+if ($versionId !== $minor) {
+    fail("{$phpBin} reports PHP {$versionId}, but target is {$minor}", 2);
+}
+
+$extensionDir = capture([$phpConfig, '--extension-dir']);
+if ($extensionDir === '') {
+    fail("{$phpConfig} returned an empty extension dir", 2);
+}
+
+fwrite(STDOUT, "== Build Bytecode PHP Loader for PHP {$minor} ==\n");
+foreach ([['make', 'clean'], [$phpize], ['./configure', '--enable-opdump', '--with-php-config=' . $phpConfig], ['make']] as $cmd) {
+    $exit = run($cmd, $sourceDir, [], true, $dryRun);
+    if ($exit !== 0 && $cmd !== ['make', 'clean']) {
+        fail('build failed', $exit);
+    }
+}
+
+$built = $sourceDir . DIRECTORY_SEPARATOR . 'modules' . DIRECTORY_SEPARATOR . (DIRECTORY_SEPARATOR === '\\' ? 'opdump.dll' : 'opdump.so');
+if (!$dryRun && !is_file($built)) {
+    fail("built loader not found: {$built}");
+}
+
+fwrite(STDOUT, PHP_EOL . "Built loader:\n{$built}\n");
+
+if ($opts['build-only']) {
+    fwrite(STDOUT, PHP_EOL . "Build-only mode complete.\n");
+    fwrite(STDOUT, "Test with:\n{$phpBin} -n -d zend_extension={$built} -v\n");
+    exit(0);
+}
+
+if (DIRECTORY_SEPARATOR === '\\') {
+    fwrite(STDOUT, PHP_EOL . "Windows system install is not automated yet.\n");
+    fwrite(STDOUT, "Copy {$built} beside your PHP installation and add zend_extension=... to php.ini.\n");
+    exit(0);
+}
+
+$targetDir = $extensionDir;
+$target = rtrim($targetDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . (string) $opts['loader-name'];
+$sudo = sudo_prefix((bool) $opts['no-sudo']);
+
+fwrite(STDOUT, PHP_EOL . "== Install Zend extension ==\n");
+foreach ([[...$sudo, 'mkdir', '-p', $targetDir], [...$sudo, 'cp', $built, $target], [...$sudo, 'chmod', '755', $target]] as $cmd) {
+    $exit = run($cmd, null, [], true, $dryRun);
+    if ($exit !== 0) {
+        fail('install failed', $exit);
+    }
+}
+
+$iniLine = "zend_extension={$target}\n";
+$modsAvailable = "/etc/php/{$minor}/mods-available";
+$iniPath = "{$modsAvailable}/{$opts['ini-name']}.ini";
+if (is_dir($modsAvailable) || $dryRun) {
+    write_privileged_file($iniPath, $iniLine, (bool) $opts['no-sudo'], $dryRun);
+    fwrite(STDOUT, "Wrote {$iniPath}\n");
+
+    if ($opts['enable'] && command_exists('phpenmod')) {
+        $sapis = array_filter(array_map('trim', explode(',', (string) $opts['sapi'])));
+        foreach ($sapis as $sapi) {
+            $exit = run([...$sudo, 'phpenmod', '-v', $minor, '-s', $sapi, (string) $opts['ini-name']], null, [], true, $dryRun);
+            if ($exit !== 0) {
+                fail("phpenmod failed for {$sapi}", $exit);
+            }
+        }
+    }
+} else {
+    fwrite(STDOUT, "No Debian mods-available dir found at {$modsAvailable}.\n");
+    fwrite(STDOUT, "Add this line to your php.ini instead:\n{$iniLine}");
+}
+
+fwrite(STDOUT, PHP_EOL . "== Verify ==\n");
+$exit = run([$phpBin, '-d', "zend_extension={$target}", '-v'], null, [], true, $dryRun);
+if ($exit !== 0) {
+    fail('verification failed', $exit);
+}
+fwrite(STDOUT, PHP_EOL . "Bytecode PHP Loader installed for PHP {$minor}.\n");

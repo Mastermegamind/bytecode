@@ -114,6 +114,12 @@ class _EncoderPageState extends State<EncoderPage> {
   late final TextEditingController _rootController;
   final _outputController = TextEditingController();
   final _keyController = TextEditingController();
+  final _phpVersionController = TextEditingController(text: '8.4');
+  final _configController = TextEditingController();
+  final _licensePubkeyController = TextEditingController();
+  final _licenseKeyDirController = TextEditingController();
+  final _inspectPathController = TextEditingController();
+  final _packageVersionController = TextEditingController(text: '1.0.0');
   final _excludeController = TextEditingController(
     text: '.history/*, vendor/*, storage/*, node_modules/*',
   );
@@ -123,6 +129,10 @@ class _EncoderPageState extends State<EncoderPage> {
   final _sources = <String>[];
 
   bool _busy = false;
+  bool _rawContainers = false;
+  bool _obfuscate = false;
+  bool _scanBeforeDump = true;
+  bool _failOnScanWarning = false;
   String? _status;
 
   @override
@@ -136,6 +146,12 @@ class _EncoderPageState extends State<EncoderPage> {
     _rootController.dispose();
     _outputController.dispose();
     _keyController.dispose();
+    _phpVersionController.dispose();
+    _configController.dispose();
+    _licensePubkeyController.dispose();
+    _licenseKeyDirController.dispose();
+    _inspectPathController.dispose();
+    _packageVersionController.dispose();
     _excludeController.dispose();
     super.dispose();
   }
@@ -235,6 +251,13 @@ class _EncoderPageState extends State<EncoderPage> {
     }
   }
 
+  Future<void> _pickFile(TextEditingController controller) async {
+    final file = await openFile();
+    if (file != null) {
+      setState(() => controller.text = file.path);
+    }
+  }
+
   Future<void> _addFiles() async {
     final files = await openFiles();
     if (files.isEmpty) {
@@ -293,16 +316,44 @@ class _EncoderPageState extends State<EncoderPage> {
     ];
   }
 
+  List<String> _configArgs() {
+    final config = _configController.text.trim();
+    return config.isEmpty ? [] : ['--config', config];
+  }
+
+  Future<int> _runStreaming(
+    String executable,
+    List<String> args, {
+    Map<String, String>? environment,
+  }) async {
+    final process = await Process.start(
+      executable,
+      args,
+      workingDirectory: _root,
+      environment: environment,
+    );
+
+    final stdoutSub = process.stdout.transform(utf8.decoder).listen(_append);
+    final stderrSub = process.stderr.transform(utf8.decoder).listen(_append);
+    final exit = await process.exitCode;
+    await stdoutSub.cancel();
+    await stderrSub.cancel();
+    return exit;
+  }
+
   Future<void> _dump() async {
     final output = _outputController.text.trim();
     final key = _keyController.text.trim();
-    if (_sources.isEmpty || output.isEmpty || key.isEmpty) {
+    final licensePubkey = _licensePubkeyController.text.trim();
+    if (_sources.isEmpty || output.isEmpty) {
       setState(
-        () => _status = 'At least one source, output, and key are required',
+        () => _status = 'At least one source and output are required',
       );
       return;
     }
-    if (!RegExp(r'\A[0-9a-fA-F]{64}\z').hasMatch(key)) {
+    if (!_rawContainers &&
+        licensePubkey.isEmpty &&
+        !RegExp(r'\A[0-9a-fA-F]{64}\z').hasMatch(key)) {
       setState(() => _status = 'Key must be 64 hex characters');
       return;
     }
@@ -313,23 +364,28 @@ class _EncoderPageState extends State<EncoderPage> {
       _status = 'Dumping';
       setState(() {});
 
-      final process = await Process.start(
+      final env = <String, String>{};
+      if (!_rawContainers && licensePubkey.isNotEmpty) {
+        env['BYTECODE_LICENSE_PUBKEY'] = licensePubkey;
+      } else if (!_rawContainers) {
+        env['BYTECODE_KEY'] = key;
+      }
+
+      final exit = await _runStreaming(
         _phpBinary(),
         [
           _join(_root, 'php/bin/bytecode-dump'),
+          if (_rawContainers) '--raw',
+          if (_obfuscate) '--obfuscate',
+          if (_scanBeforeDump) '--scan',
+          if (_failOnScanWarning) '--fail-on-scan-warning',
+          ..._configArgs(),
           ..._excludeArgs(),
           ..._sources,
           output,
         ],
-        workingDirectory: _root,
-        environment: {'BYTECODE_KEY': key},
+        environment: env,
       );
-
-      final stdoutSub = process.stdout.transform(utf8.decoder).listen(_append);
-      final stderrSub = process.stderr.transform(utf8.decoder).listen(_append);
-      final exit = await process.exitCode;
-      await stdoutSub.cancel();
-      await stderrSub.cancel();
 
       if (exit != 0) {
         throw StateError('bytecode-dump exited with $exit');
@@ -337,6 +393,32 @@ class _EncoderPageState extends State<EncoderPage> {
 
       await _loadManifest();
       _status = 'Dump complete';
+    });
+  }
+
+  Future<void> _scanSources() async {
+    if (_sources.isEmpty) {
+      setState(() => _status = 'At least one source is required');
+      return;
+    }
+
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Scanning sources';
+      setState(() {});
+
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-scan'),
+        if (_failOnScanWarning) '--fail-on-warning',
+        ..._configArgs(),
+        ..._excludeArgs(),
+        ..._sources,
+      ]);
+
+      if (exit != 0) {
+        throw StateError('bytecode-scan exited with $exit');
+      }
+      _status = 'Scan complete';
     });
   }
 
@@ -357,6 +439,144 @@ class _EncoderPageState extends State<EncoderPage> {
     });
   }
 
+  Future<void> _inspectContainer() async {
+    final path = _inspectPathController.text.trim();
+    if (path.isEmpty) {
+      setState(() => _status = 'Choose a .bytc file to inspect');
+      return;
+    }
+
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Inspecting container';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-info'),
+        path,
+      ]);
+      if (exit != 0) {
+        throw StateError('bytecode-info exited with $exit');
+      }
+      _status = 'Container inspected';
+    });
+  }
+
+  Future<void> _generateLicenseKeys() async {
+    final output = _licenseKeyDirController.text.trim();
+    if (output.isEmpty) {
+      setState(() => _status = 'Choose a license key output folder');
+      return;
+    }
+
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Generating license keys';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-license-keygen'),
+        output,
+      ]);
+      if (exit != 0) {
+        throw StateError('license key generation exited with $exit');
+      }
+      _licensePubkeyController.text = _join(output, 'license.pub.pem');
+      _status = 'License keys generated';
+    });
+  }
+
+  Future<void> _installLoader({required bool buildOnly}) async {
+    final phpVersion = _phpVersionController.text.trim();
+    if (!RegExp(r'\A\d+\.\d+\z').hasMatch(phpVersion)) {
+      setState(() => _status = 'PHP version must look like 8.4');
+      return;
+    }
+
+    await _runLocked(() async {
+      _log.clear();
+      _status = buildOnly ? 'Building loader' : 'Installing loader';
+      setState(() {});
+
+      final args = [
+        _join(_root, 'php/bin/bytecode-install-loader'),
+        '--php-version',
+        phpVersion,
+        if (buildOnly) '--build-only',
+      ];
+      final exit = await _runStreaming(
+        _phpBinary(),
+        args,
+      );
+
+      if (exit != 0) {
+        throw StateError(
+          buildOnly
+              ? 'loader build exited with $exit'
+              : 'loader install exited with $exit',
+        );
+      }
+
+      _status = buildOnly ? 'Loader build complete' : 'Loader installed';
+    });
+  }
+
+  Future<void> _buildDesktopPackage(String kind) async {
+    final phpVersion = _phpVersionController.text.trim();
+    final version = _packageVersionController.text.trim();
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Building $kind package';
+      setState(() {});
+
+      late final String executable;
+      late final List<String> args;
+      final env = <String, String>{
+        'PHP_VERSION': phpVersion.isEmpty ? '8.4' : phpVersion,
+        'VERSION': version.isEmpty ? '1.0.0' : version,
+      };
+
+      switch (kind) {
+        case 'AppImage':
+          executable = 'bash';
+          args = [_join(_root, 'scripts/build-linux-appimage.sh')];
+        case 'Debian':
+          executable = 'bash';
+          args = [_join(_root, 'scripts/build-linux-deb.sh')];
+        case 'macOS':
+          executable = 'bash';
+          args = [_join(_root, 'scripts/build-macos-app.sh')];
+        case 'Windows ZIP':
+          executable = Platform.isWindows ? 'powershell' : 'pwsh';
+          args = [
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            _join(_root, 'scripts/build-windows-package.ps1'),
+            '-Version',
+            env['VERSION']!,
+          ];
+        case 'Windows MSI':
+          executable = Platform.isWindows ? 'powershell' : 'pwsh';
+          args = [
+            '-ExecutionPolicy',
+            'Bypass',
+            '-File',
+            _join(_root, 'scripts/build-windows-package.ps1'),
+            '-BuildMsi',
+            '-Version',
+            env['VERSION']!,
+          ];
+        default:
+          throw StateError('unknown package kind: $kind');
+      }
+
+      final exit = await _runStreaming(executable, args, environment: env);
+      if (exit != 0) {
+        throw StateError('$kind package build exited with $exit');
+      }
+      _status = '$kind package built';
+    });
+  }
+
   Future<void> _loadManifest() async {
     final file = File(_manifestPath);
     if (!await file.exists()) {
@@ -372,6 +592,12 @@ class _EncoderPageState extends State<EncoderPage> {
           (entry) => ManifestEntry.fromJson(entry as Map<String, dynamic>),
         ),
       );
+    if (_inspectPathController.text.trim().isEmpty && _manifestRows.isNotEmpty) {
+      _inspectPathController.text = _join(
+        _outputController.text.trim(),
+        _manifestRows.first.output,
+      );
+    }
   }
 
   void _append(String text) {
@@ -418,19 +644,50 @@ class _EncoderPageState extends State<EncoderPage> {
               rootController: _rootController,
               outputController: _outputController,
               keyController: _keyController,
+              phpVersionController: _phpVersionController,
+              configController: _configController,
+              licensePubkeyController: _licensePubkeyController,
+              licenseKeyDirController: _licenseKeyDirController,
+              inspectPathController: _inspectPathController,
+              packageVersionController: _packageVersionController,
               excludeController: _excludeController,
               sources: _sources,
               busy: _busy,
               status: _status,
+              rawContainers: _rawContainers,
+              obfuscate: _obfuscate,
+              scanBeforeDump: _scanBeforeDump,
+              failOnScanWarning: _failOnScanWarning,
               onPickRoot: () => _pickFolder(_rootController),
               onPickOutput: () => _pickFolder(_outputController),
+              onPickConfig: () => _pickFile(_configController),
+              onPickLicensePubkey: () => _pickFile(_licensePubkeyController),
+              onPickLicenseKeyDir: () => _pickFolder(_licenseKeyDirController),
+              onPickInspectPath: () => _pickFile(_inspectPathController),
               onAddFiles: _addFiles,
               onAddFolder: _addFolder,
               onRemoveSource: _removeSource,
               onClearSources: _clearSources,
               onGenerateKey: _generateKey,
+              onGenerateLicenseKeys: _generateLicenseKeys,
+              onScan: _scanSources,
               onDump: _dump,
               onVerify: _verify,
+              onInspect: _inspectContainer,
+              onBuildLoader: () => _installLoader(buildOnly: true),
+              onInstallLoader: () => _installLoader(buildOnly: false),
+              onBuildAppImage: () => _buildDesktopPackage('AppImage'),
+              onBuildDeb: () => _buildDesktopPackage('Debian'),
+              onBuildMac: () => _buildDesktopPackage('macOS'),
+              onBuildWindowsZip: () => _buildDesktopPackage('Windows ZIP'),
+              onBuildWindowsMsi: () => _buildDesktopPackage('Windows MSI'),
+              onRawContainersChanged: (value) =>
+                  setState(() => _rawContainers = value),
+              onObfuscateChanged: (value) => setState(() => _obfuscate = value),
+              onScanBeforeDumpChanged: (value) =>
+                  setState(() => _scanBeforeDump = value),
+              onFailOnScanWarningChanged: (value) =>
+                  setState(() => _failOnScanWarning = value),
             );
             final results = _ResultsPanel(
               rows: _manifestRows,
@@ -616,37 +873,93 @@ class _Controls extends StatelessWidget {
     required this.rootController,
     required this.outputController,
     required this.keyController,
+    required this.phpVersionController,
+    required this.configController,
+    required this.licensePubkeyController,
+    required this.licenseKeyDirController,
+    required this.inspectPathController,
+    required this.packageVersionController,
     required this.excludeController,
     required this.sources,
     required this.busy,
     required this.status,
+    required this.rawContainers,
+    required this.obfuscate,
+    required this.scanBeforeDump,
+    required this.failOnScanWarning,
     required this.onPickRoot,
     required this.onPickOutput,
+    required this.onPickConfig,
+    required this.onPickLicensePubkey,
+    required this.onPickLicenseKeyDir,
+    required this.onPickInspectPath,
     required this.onAddFiles,
     required this.onAddFolder,
     required this.onRemoveSource,
     required this.onClearSources,
     required this.onGenerateKey,
+    required this.onGenerateLicenseKeys,
+    required this.onScan,
     required this.onDump,
     required this.onVerify,
+    required this.onInspect,
+    required this.onBuildLoader,
+    required this.onInstallLoader,
+    required this.onBuildAppImage,
+    required this.onBuildDeb,
+    required this.onBuildMac,
+    required this.onBuildWindowsZip,
+    required this.onBuildWindowsMsi,
+    required this.onRawContainersChanged,
+    required this.onObfuscateChanged,
+    required this.onScanBeforeDumpChanged,
+    required this.onFailOnScanWarningChanged,
   });
 
   final TextEditingController rootController;
   final TextEditingController outputController;
   final TextEditingController keyController;
+  final TextEditingController phpVersionController;
+  final TextEditingController configController;
+  final TextEditingController licensePubkeyController;
+  final TextEditingController licenseKeyDirController;
+  final TextEditingController inspectPathController;
+  final TextEditingController packageVersionController;
   final TextEditingController excludeController;
   final List<String> sources;
   final bool busy;
   final String? status;
+  final bool rawContainers;
+  final bool obfuscate;
+  final bool scanBeforeDump;
+  final bool failOnScanWarning;
   final VoidCallback onPickRoot;
   final VoidCallback onPickOutput;
+  final VoidCallback onPickConfig;
+  final VoidCallback onPickLicensePubkey;
+  final VoidCallback onPickLicenseKeyDir;
+  final VoidCallback onPickInspectPath;
   final VoidCallback onAddFiles;
   final VoidCallback onAddFolder;
   final ValueChanged<String> onRemoveSource;
   final VoidCallback onClearSources;
   final VoidCallback onGenerateKey;
+  final VoidCallback onGenerateLicenseKeys;
+  final VoidCallback onScan;
   final VoidCallback onDump;
   final VoidCallback onVerify;
+  final VoidCallback onInspect;
+  final VoidCallback onBuildLoader;
+  final VoidCallback onInstallLoader;
+  final VoidCallback onBuildAppImage;
+  final VoidCallback onBuildDeb;
+  final VoidCallback onBuildMac;
+  final VoidCallback onBuildWindowsZip;
+  final VoidCallback onBuildWindowsMsi;
+  final ValueChanged<bool> onRawContainersChanged;
+  final ValueChanged<bool> onObfuscateChanged;
+  final ValueChanged<bool> onScanBeforeDumpChanged;
+  final ValueChanged<bool> onFailOnScanWarningChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -678,7 +991,45 @@ class _Controls extends StatelessWidget {
             icon: Icons.folder_copy_outlined,
             onPick: busy ? null : onPickOutput,
           ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: phpVersionController,
+                  decoration: const InputDecoration(
+                    labelText: 'PHP version',
+                    prefixIcon: Icon(Icons.terminal),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton.filledTonal(
+                tooltip: 'Build loader',
+                onPressed: busy ? null : onBuildLoader,
+                icon: const Icon(Icons.construction),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filled(
+                tooltip: 'Install Zend loader',
+                onPressed: busy ? null : onInstallLoader,
+                icon: const Icon(Icons.download_done),
+              ),
+            ],
+          ),
           const SizedBox(height: 16),
+          _OptionGrid(
+            rawContainers: rawContainers,
+            obfuscate: obfuscate,
+            scanBeforeDump: scanBeforeDump,
+            failOnScanWarning: failOnScanWarning,
+            busy: busy,
+            onRawContainersChanged: onRawContainersChanged,
+            onObfuscateChanged: onObfuscateChanged,
+            onScanBeforeDumpChanged: onScanBeforeDumpChanged,
+            onFailOnScanWarningChanged: onFailOnScanWarningChanged,
+          ),
+          const SizedBox(height: 12),
           Row(
             children: [
               Expanded(
@@ -699,6 +1050,13 @@ class _Controls extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 12),
+          _PathField(
+            label: 'bytecode.json',
+            controller: configController,
+            icon: Icons.rule_folder_outlined,
+            onPick: busy ? null : onPickConfig,
+          ),
+          const SizedBox(height: 12),
           _SourceList(
             sources: sources,
             busy: busy,
@@ -708,16 +1066,43 @@ class _Controls extends StatelessWidget {
           const SizedBox(height: 16),
           TextField(
             controller: keyController,
-            obscureText: true,
+            obscureText: !rawContainers,
+            enabled: !rawContainers,
             decoration: InputDecoration(
-              labelText: 'BYTECODE_KEY',
+              labelText: rawContainers ? 'BYTECODE_KEY disabled' : 'BYTECODE_KEY',
               prefixIcon: const Icon(Icons.key),
               suffixIcon: IconButton(
                 tooltip: 'Generate key',
-                onPressed: busy ? null : onGenerateKey,
+                onPressed: busy || rawContainers ? null : onGenerateKey,
                 icon: const Icon(Icons.auto_awesome),
               ),
             ),
+          ),
+          const SizedBox(height: 12),
+          _PathField(
+            label: 'License public key',
+            controller: licensePubkeyController,
+            icon: Icons.verified_user_outlined,
+            onPick: busy || rawContainers ? null : onPickLicensePubkey,
+          ),
+          const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: _PathField(
+                  label: 'License key folder',
+                  controller: licenseKeyDirController,
+                  icon: Icons.vpn_key_outlined,
+                  onPick: busy ? null : onPickLicenseKeyDir,
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton.filledTonal(
+                tooltip: 'Generate license keys',
+                onPressed: busy ? null : onGenerateLicenseKeys,
+                icon: const Icon(Icons.key_outlined),
+              ),
+            ],
           ),
           const SizedBox(height: 12),
           TextField(
@@ -732,6 +1117,15 @@ class _Controls extends StatelessWidget {
           const SizedBox(height: 16),
           Row(
             children: [
+              Expanded(
+                flex: 2,
+                child: OutlinedButton.icon(
+                  onPressed: busy ? null : onScan,
+                  icon: const Icon(Icons.manage_search),
+                  label: const Text('Scan'),
+                ),
+              ),
+              const SizedBox(width: 10),
               Expanded(
                 flex: 3,
                 child: FilledButton.icon(
@@ -760,7 +1154,215 @@ class _Controls extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 12),
+          Row(
+            children: [
+              Expanded(
+                child: _PathField(
+                  label: 'Inspect .bytc',
+                  controller: inspectPathController,
+                  icon: Icons.pageview_outlined,
+                  onPick: busy ? null : onPickInspectPath,
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton.filledTonal(
+                tooltip: 'Inspect BYTC',
+                onPressed: busy ? null : onInspect,
+                icon: const Icon(Icons.info_outline),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          _PackageActions(
+            versionController: packageVersionController,
+            busy: busy,
+            onBuildAppImage: onBuildAppImage,
+            onBuildDeb: onBuildDeb,
+            onBuildMac: onBuildMac,
+            onBuildWindowsZip: onBuildWindowsZip,
+            onBuildWindowsMsi: onBuildWindowsMsi,
+          ),
+          const SizedBox(height: 12),
           _StatusBanner(status: status, busy: busy),
+        ],
+      ),
+    );
+  }
+}
+
+class _OptionGrid extends StatelessWidget {
+  const _OptionGrid({
+    required this.rawContainers,
+    required this.obfuscate,
+    required this.scanBeforeDump,
+    required this.failOnScanWarning,
+    required this.busy,
+    required this.onRawContainersChanged,
+    required this.onObfuscateChanged,
+    required this.onScanBeforeDumpChanged,
+    required this.onFailOnScanWarningChanged,
+  });
+
+  final bool rawContainers;
+  final bool obfuscate;
+  final bool scanBeforeDump;
+  final bool failOnScanWarning;
+  final bool busy;
+  final ValueChanged<bool> onRawContainersChanged;
+  final ValueChanged<bool> onObfuscateChanged;
+  final ValueChanged<bool> onScanBeforeDumpChanged;
+  final ValueChanged<bool> onFailOnScanWarningChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Wrap(
+      spacing: 8,
+      runSpacing: 8,
+      children: [
+        _OptionChip(
+          icon: Icons.lock_open,
+          label: 'Raw',
+          selected: rawContainers,
+          busy: busy,
+          onChanged: onRawContainersChanged,
+        ),
+        _OptionChip(
+          icon: Icons.shuffle,
+          label: 'Obfuscate',
+          selected: obfuscate,
+          busy: busy,
+          onChanged: onObfuscateChanged,
+        ),
+        _OptionChip(
+          icon: Icons.manage_search,
+          label: 'Scan',
+          selected: scanBeforeDump,
+          busy: busy,
+          onChanged: onScanBeforeDumpChanged,
+        ),
+        _OptionChip(
+          icon: Icons.report_gmailerrorred,
+          label: 'Fail warnings',
+          selected: failOnScanWarning,
+          busy: busy,
+          onChanged: onFailOnScanWarningChanged,
+        ),
+      ],
+    );
+  }
+}
+
+class _OptionChip extends StatelessWidget {
+  const _OptionChip({
+    required this.icon,
+    required this.label,
+    required this.selected,
+    required this.busy,
+    required this.onChanged,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool selected;
+  final bool busy;
+  final ValueChanged<bool> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return FilterChip(
+      avatar: Icon(icon, size: 17),
+      label: Text(label),
+      selected: selected,
+      onSelected: busy ? null : onChanged,
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+    );
+  }
+}
+
+class _PackageActions extends StatelessWidget {
+  const _PackageActions({
+    required this.versionController,
+    required this.busy,
+    required this.onBuildAppImage,
+    required this.onBuildDeb,
+    required this.onBuildMac,
+    required this.onBuildWindowsZip,
+    required this.onBuildWindowsMsi,
+  });
+
+  final TextEditingController versionController;
+  final bool busy;
+  final VoidCallback onBuildAppImage;
+  final VoidCallback onBuildDeb;
+  final VoidCallback onBuildMac;
+  final VoidCallback onBuildWindowsZip;
+  final VoidCallback onBuildWindowsMsi;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xfffaf9f6),
+        border: Border.all(color: const Color(0xffddd6c8)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: TextField(
+                  controller: versionController,
+                  decoration: const InputDecoration(
+                    labelText: 'Package version',
+                    prefixIcon: Icon(Icons.sell_outlined),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton.filledTonal(
+                tooltip: 'Build AppImage',
+                onPressed: busy ? null : onBuildAppImage,
+                icon: const Icon(Icons.apps),
+              ),
+              const SizedBox(width: 8),
+              IconButton.filledTonal(
+                tooltip: 'Build deb',
+                onPressed: busy ? null : onBuildDeb,
+                icon: const Icon(Icons.inventory_2_outlined),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: busy ? null : onBuildMac,
+                  icon: const Icon(Icons.desktop_mac_outlined),
+                  label: const Text('macOS'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: busy ? null : onBuildWindowsZip,
+                  icon: const Icon(Icons.window),
+                  label: const Text('Win ZIP'),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: OutlinedButton.icon(
+                  onPressed: busy ? null : onBuildWindowsMsi,
+                  icon: const Icon(Icons.install_desktop),
+                  label: const Text('MSI'),
+                ),
+              ),
+            ],
+          ),
         ],
       ),
     );
