@@ -49,9 +49,20 @@ function bytc_info(string $path): array
 
     $offset = 4;
     $version = u32le($bytes, $offset);
+    if ($version !== 1 && $version !== 2) {
+        fail("{$path}: unsupported container version {$version}");
+    }
     $phpVersionId = u32le($bytes, $offset);
     $backendId = take($bytes, $offset, u32le($bytes, $offset));
     $backendFormat = take($bytes, $offset, u32le($bytes, $offset));
+
+    $cipherId = null;
+    $keyId = '';
+    if ($version === 2) {
+        $cipherId = u32le($bytes, $offset);
+        $keyId = take($bytes, $offset, u32le($bytes, $offset));
+    }
+
     $headerLength = $offset;
     $nonce = take($bytes, $offset, u32le($bytes, $offset));
     $tag = take($bytes, $offset, u32le($bytes, $offset));
@@ -63,11 +74,13 @@ function bytc_info(string $path): array
 
     return [
         'path' => $path,
-        'container' => 'BYTC1',
+        'container' => 'BYTC' . $version,
         'container_version' => $version,
         'php_version_id' => $phpVersionId,
         'backend' => $backendId,
         'backend_format' => $backendFormat,
+        'cipher_id' => $cipherId,
+        'key_id' => $keyId === '' ? null : bin2hex($keyId),
         'header_size' => $headerLength,
         'nonce_size' => strlen($nonce),
         'tag_size' => strlen($tag),
@@ -83,5 +96,8 @@ if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
 }
 
 foreach (bytc_info($argv[1]) as $key => $value) {
+    if ($value === null) {
+        continue;
+    }
     echo $key, ': ', $value, PHP_EOL;
 }

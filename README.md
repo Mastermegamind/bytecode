@@ -44,8 +44,14 @@ php/tests/run-rung4.sh
 php/tests/run-rung5-reflection.sh
 php/tests/run-load-tree.sh
 php/tests/run-phase1-container.sh
+php/tests/run-rung6-hkdf.sh
+php/tests/run-rung7-license.sh
+php/tests/run-rung8-manifest-auth.sh
+php/tests/run-rung9-obfuscate.sh
+php/tests/run-bytecode-scan.sh
 
 php/bin/bytecode-keygen
+php/bin/bytecode-scan php/tests
 php/bin/bytecode-info /tmp/bytecode-out/rung1.php.bytc
 php/bin/bytecode-verify /tmp/bytecode-out/bytecode.manifest.json
 
@@ -56,6 +62,39 @@ BYTECODE_KEY=... php/bin/bytecode-dump app routes/config.php /tmp/bytecode-out
 
 BYTECODE_KEY=... OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
   php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
+```
+
+Containers default to `BYTC2`: `BYTECODE_KEY`/`OPDUMP_KEY` is treated as HKDF
+input keying material (not the raw AES key), and `bytecode.manifest.json` +
+`bytecode.map` are authenticated together via `bytecode.manifest.sig`, closing
+the gap where the map could be edited to point a source path at a different,
+still-validly-encrypted container. `BYTC1` (the original shared-secret format)
+remains a supported read path. See
+[`docs/PHASE4_KEY_MODEL.md`](docs/PHASE4_KEY_MODEL.md) for the full model.
+
+Optional license mode replaces the shared secret with an RSA-wrapped
+per-build key, so the vendor encoding a build never has to hand the customer
+running it a raw shared key:
+
+```bash
+php/bin/bytecode-license-keygen /path/to/keys   # writes license.key.pem + license.pub.pem
+
+BYTECODE_LICENSE_PUBKEY=/path/to/keys/license.pub.pem \
+  php/bin/bytecode-dump app /tmp/bytecode-out   # writes bytecode.license.json too
+
+OPDUMP_LICENSE_KEY_FILE=/path/to/keys/license.key.pem \
+  OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/bytecode-out/bytecode.map \
+  php8.4 -n -d extension=php/src/modules/opdump.so -f path/to/entrypoint.php
+```
+
+Optional variable-name obfuscation renames non-parameter locals to `_v0`,
+`_v1`, ... in the dumped bytecode, skipped per-function whenever
+`compact()`/`extract()`/`get_defined_vars()`/`$$name` could depend on the
+real name (safe because compiled opcodes reference locals by slot index, not
+name — see `opdump_op_array_uses_dynamic_vars()` in `php/src/opdump.c`):
+
+```bash
+BYTECODE_KEY=... php/bin/bytecode-dump --obfuscate app /tmp/bytecode-out
 ```
 
 macOS build shape:
@@ -72,6 +111,102 @@ php/tests/run-rung1.sh
 
 `config.m4` checks `pkg-config openssl` first, then Homebrew `openssl@3`, then
 falls back to the Linux-style `-lcrypto` link.
+
+## Desktop Packages
+
+Build the Flutter desktop UI, the PHP extension, and the PHP helper scripts
+into one AppImage:
+
+```bash
+scripts/build-linux-appimage.sh
+```
+
+The output is written to:
+
+```bash
+dist/Bytecode_Encoder-x86_64.AppImage
+```
+
+The AppImage contains the Flutter bundle under `usr/bin/bytecode-encoder`, a
+bundled PHP CLI at `usr/bin/php`, and the bytecode tooling/extension under
+`usr/lib/bytecode`. When launched from an AppImage, the GUI automatically uses
+that embedded bytecode root.
+
+To build against a different installed PHP minor:
+
+```bash
+PHP_VERSION=8.3 scripts/build-linux-appimage.sh
+```
+
+Build a Debian package:
+
+```bash
+scripts/build-linux-deb.sh
+```
+
+The output is written to:
+
+```bash
+dist/bytecode-encoder_1.0.0_amd64.deb
+```
+
+Override package metadata when needed:
+
+```bash
+VERSION=1.2.0 DEB_ARCH=amd64 PHP_VERSION=8.4 scripts/build-linux-deb.sh
+```
+
+Build a macOS `.app` bundle and zip on macOS:
+
+```bash
+scripts/build-macos-app.sh
+```
+
+The output is written to:
+
+```bash
+dist/Bytecode_Encoder-macos.zip
+```
+
+Build a Windows zip package on Windows:
+
+```powershell
+.\scripts\build-windows-package.ps1
+```
+
+Build a Windows zip and MSI installer with WiX Toolset:
+
+```powershell
+dotnet tool install --global wix
+.\scripts\build-windows-package.ps1 -BuildMsi
+```
+
+The MSI output is written to:
+
+```powershell
+dist\Bytecode_Encoder-windows-x64.msi
+```
+
+For a complete Windows package, provide a PHP for Windows directory and a
+native `php_opdump.dll` built with the PHP SDK:
+
+```powershell
+$env:PHP_DIR = "C:\php-8.4"
+$env:OPDUMP_DLL = "C:\path\to\php_opdump.dll"
+.\scripts\build-windows-package.ps1 -BuildMsi
+```
+
+If you only want to smoke-test the Flutter Windows package:
+
+```powershell
+.\scripts\build-windows-package.ps1 -SkipExtension
+```
+
+GitHub Actions builds desktop artifacts in
+`.github/workflows/desktop-packages.yml`. Linux and macOS include the native
+PHP extension in the package. The default Windows CI job is UI-only until a
+Windows `php_opdump.dll` build step is added, but it still produces both the
+zip package and MSI installer.
 
 ## Using It On A Large PHP Project
 
@@ -95,7 +230,8 @@ BYTECODE_KEY="$KEY" php/bin/bytecode-dump \
   "$OUT"
 ```
 
-Verify the manifest, container headers, hashes, sizes, and map file:
+Verify the manifest, container headers, hashes, sizes, map file, and (when
+`BYTECODE_KEY`/`OPDUMP_KEY` is set) the `bytecode.manifest.sig` signature:
 
 ```bash
 php/bin/bytecode-verify "$OUT/bytecode.manifest.json"

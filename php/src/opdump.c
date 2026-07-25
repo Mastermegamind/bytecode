@@ -21,6 +21,10 @@
 #include "zend_vm.h"
 #include "zend_string.h"
 #include <openssl/evp.h>
+#include <openssl/hmac.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
+#include <openssl/crypto.h>
 #include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -32,7 +36,44 @@
 #  define PATH_MAX MAX_PATH
 # endif
 # define realpath(path, resolved) _fullpath((resolved), (path), PATH_MAX)
+#else
+# include <sys/resource.h>
+# include <sys/mman.h>
 #endif
+
+/* Best-effort in-memory hardening for key material (Rung D). mlock/munlock
+ * and RLIMIT_CORE are POSIX-only; Windows builds compile these out entirely
+ * rather than partially-lock memory in a way nothing here relies on. */
+static void opdump_disable_core_dumps(void)
+{
+#ifndef _WIN32
+    struct rlimit rl = {0, 0};
+    /* Best-effort: an unprivileged process may not be able to raise this
+     * back up, which is exactly the point -- it only ever tightens. */
+    setrlimit(RLIMIT_CORE, &rl);
+#endif
+}
+
+static void opdump_lock_mem(void *p, size_t len)
+{
+#ifndef _WIN32
+    /* Best-effort: no CAP_IPC_LOCK/RLIMIT_MEMLOCK is common under containers.
+     * A failure here only means this buffer isn't pinned against swap, not
+     * that key handling is broken. */
+    mlock(p, len);
+#else
+    (void) p; (void) len;
+#endif
+}
+
+static void opdump_unlock_mem(void *p, size_t len)
+{
+#ifndef _WIN32
+    munlock(p, len);
+#else
+    (void) p; (void) len;
+#endif
+}
 
 static zend_op_array *(*opdump_orig_compile_file)(zend_file_handle *file_handle, int type);
 
@@ -239,6 +280,22 @@ static int opdump_hex_nibble(char c)
     return -1;
 }
 
+static bool opdump_hex_decode(const char *hex, unsigned char *out, size_t out_len)
+{
+    if (strlen(hex) != out_len * 2) {
+        return false;
+    }
+    for (size_t i = 0; i < out_len; i++) {
+        int hi = opdump_hex_nibble(hex[i * 2]);
+        int lo = opdump_hex_nibble(hex[i * 2 + 1]);
+        if (hi < 0 || lo < 0) {
+            return false;
+        }
+        out[i] = (unsigned char)((hi << 4) | lo);
+    }
+    return true;
+}
+
 static bool opdump_key_from_env(unsigned char key[32])
 {
     const char *hex = getenv("BYTECODE_KEY");
@@ -257,6 +314,58 @@ static bool opdump_key_from_env(unsigned char key[32])
         key[i] = (unsigned char)((hi << 4) | lo);
     }
     return true;
+}
+
+/* RFC 5869 HKDF-SHA256, fixed 32-byte output (== one HMAC-SHA256 block, so
+ * Expand needs exactly T(1); no need for the general multi-block loop). Must
+ * match PHP's hash_hkdf('sha256', $ikm, 32, $info, $salt) bit for bit --
+ * that's how bytecode-pack derives the same per-container key on the write
+ * side without duplicating this in C. */
+static bool opdump_hkdf_sha256(
+    const unsigned char *ikm, size_t ikm_len,
+    const unsigned char *salt, size_t salt_len,
+    const char *info, unsigned char out[32]
+) {
+    unsigned char prk[32];
+    unsigned int prk_len = 0;
+    if (!HMAC(EVP_sha256(), salt, (int)salt_len, ikm, ikm_len, prk, &prk_len) || prk_len != 32) {
+        return false;
+    }
+
+    size_t info_len = strlen(info);
+    unsigned char t[256];
+    if (info_len + 1 > sizeof(t)) {
+        OPENSSL_cleanse(prk, sizeof(prk));
+        return false;
+    }
+    memcpy(t, info, info_len);
+    t[info_len] = 0x01;
+
+    unsigned int out_len = 0;
+    bool ok = HMAC(EVP_sha256(), prk, (int)sizeof(prk), t, info_len + 1, out, &out_len) != NULL
+        && out_len == 32;
+    OPENSSL_cleanse(prk, sizeof(prk));
+    OPENSSL_cleanse(t, sizeof(t));
+    return ok;
+}
+
+/* Defined further down (needs the path-joining helpers below it). */
+static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[32]);
+
+/* Resolves the IKM (input keying material) used to derive BYTC2+ per-container
+ * keys. If OPDUMP_LICENSE_KEY_FILE is set, license mode is what the caller
+ * intended, so a failure there is reported and NOT silently downgraded to
+ * the shared-secret path -- a misconfigured license should fail loudly, not
+ * quietly fall back to a dev key. BYTC1 containers never call this -- they
+ * use opdump_key_from_env()'s output directly as the AES key, unchanged, so
+ * existing v1 containers keep decrypting exactly as before. */
+static bool opdump_resolve_ikm(unsigned char ikm[32])
+{
+    const char *key_file = getenv("OPDUMP_LICENSE_KEY_FILE");
+    if (key_file && key_file[0]) {
+        return opdump_license_resolve_ikm(key_file, ikm);
+    }
+    return opdump_key_from_env(ikm);
 }
 
 static uint32_t opdump_le32(const unsigned char *p)
@@ -430,15 +539,24 @@ static void opdump_map_add(char *source, char *encoded)
     opdump_tree_map = entry;
 }
 
+/* Defined further down (needs opdump_read_text_file). */
+static bool opdump_verify_manifest_signature(const char *map_dir, const char *map_path);
+
 static bool opdump_load_tree_map(const char *path)
 {
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        php_error_docref(NULL, E_WARNING, "opdump: cannot open OPDUMP_MAP %s", path);
+    char *map_dir = opdump_dirname_dup(path);
+    if (!opdump_verify_manifest_signature(map_dir, path)) {
+        free(map_dir);
         return false;
     }
 
-    char *map_dir = opdump_dirname_dup(path);
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        php_error_docref(NULL, E_WARNING, "opdump: cannot open OPDUMP_MAP %s", path);
+        free(map_dir);
+        return false;
+    }
+
     char line[8192];
     while (fgets(line, sizeof(line), f)) {
         char *newline = strpbrk(line, "\r\n");
@@ -500,6 +618,336 @@ static const char *opdump_find_tree_blob(zend_file_handle *file_handle)
     return NULL;
 }
 
+/* ---- license-mode key unwrap (Rung B) ---- */
+
+static char *opdump_read_text_file(const char *path)
+{
+    size_t len = 0;
+    unsigned char *raw = opdump_read_file_bytes(path, &len);
+    if (!raw) {
+        return NULL;
+    }
+    char *text = (char *) malloc(len + 1);
+    if (!text) {
+        free(raw);
+        return NULL;
+    }
+    memcpy(text, raw, len);
+    text[len] = '\0';
+    free(raw);
+    return text;
+}
+
+/* Deliberately narrow: bytecode.license.json is a flat, self-generated
+ * object of quoted-string values (base64/hex/fixed literals only, written
+ * with JSON_UNESCAPED_SLASHES), so a full JSON parser would be pure
+ * unused-generality. Same spirit as bytecode.map's hand-rolled tab format. */
+static char *opdump_json_extract_string(const char *json, const char *key)
+{
+    char needle[128];
+    snprintf(needle, sizeof(needle), "\"%s\"", key);
+    const char *p = strstr(json, needle);
+    if (!p) {
+        return NULL;
+    }
+    p += strlen(needle);
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != ':') {
+        return NULL;
+    }
+    p++;
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+    if (*p != '"') {
+        return NULL;
+    }
+    p++;
+    const char *start = p;
+    while (*p && *p != '"') p++;
+    if (*p != '"') {
+        return NULL;
+    }
+    size_t val_len = (size_t)(p - start);
+    char *out = (char *) malloc(val_len + 1);
+    if (!out) {
+        return NULL;
+    }
+    memcpy(out, start, val_len);
+    out[val_len] = '\0';
+    return out;
+}
+
+static int opdump_b64_val(char c)
+{
+    if (c >= 'A' && c <= 'Z') return c - 'A';
+    if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+    if (c >= '0' && c <= '9') return c - '0' + 52;
+    if (c == '+') return 62;
+    if (c == '/') return 63;
+    return -1;
+}
+
+static unsigned char *opdump_base64_decode(const char *in, size_t *out_len)
+{
+    size_t in_len = strlen(in);
+    unsigned char *out = (unsigned char *) malloc(in_len / 4 * 3 + 3);
+    if (!out) {
+        return NULL;
+    }
+    size_t o = 0;
+    int vals[4];
+    int n = 0;
+    for (size_t i = 0; i < in_len; i++) {
+        char c = in[i];
+        if (c == '=' || c == '\n' || c == '\r') {
+            continue;
+        }
+        int v = opdump_b64_val(c);
+        if (v < 0) {
+            free(out);
+            return NULL;
+        }
+        vals[n++] = v;
+        if (n == 4) {
+            out[o++] = (unsigned char)((vals[0] << 2) | (vals[1] >> 4));
+            out[o++] = (unsigned char)((vals[1] << 4) | (vals[2] >> 2));
+            out[o++] = (unsigned char)((vals[2] << 6) | vals[3]);
+            n = 0;
+        }
+    }
+    if (n == 1) {
+        free(out);
+        return NULL;
+    } else if (n == 2) {
+        out[o++] = (unsigned char)((vals[0] << 2) | (vals[1] >> 4));
+    } else if (n == 3) {
+        out[o++] = (unsigned char)((vals[0] << 2) | (vals[1] >> 4));
+        out[o++] = (unsigned char)((vals[1] << 4) | (vals[2] >> 2));
+    }
+    *out_len = o;
+    return out;
+}
+
+/* RSA-OAEP-SHA256 unwrap via the EVP_PKEY API. The digest is set explicitly
+ * on both OAEP and MGF1 rather than relying on OpenSSL's legacy SHA-1
+ * default for RSA_PKCS1_OAEP_PADDING -- bytecode-dump wraps the DEK the same
+ * way via `openssl pkeyutl -pkeyopt rsa_oaep_md:sha256 -pkeyopt rsa_mgf1_md:sha256`
+ * (PHP's openssl_public_encrypt() has no way to choose the OAEP digest, so
+ * wrapping shells out to the openssl CLI instead of using that function). */
+static bool opdump_rsa_unwrap_dek(
+    const char *private_key_path, const char *passphrase,
+    const unsigned char *wrapped, size_t wrapped_len,
+    unsigned char dek[32]
+) {
+    FILE *f = fopen(private_key_path, "rb");
+    if (!f) {
+        php_error_docref(NULL, E_WARNING, "opdump: cannot open OPDUMP_LICENSE_KEY_FILE %s", private_key_path);
+        return false;
+    }
+    EVP_PKEY *pkey = PEM_read_PrivateKey(f, NULL, NULL, (void *) passphrase);
+    fclose(f);
+    if (!pkey) {
+        php_error_docref(NULL, E_WARNING, "opdump: cannot parse RSA private key %s (wrong passphrase?)", private_key_path);
+        return false;
+    }
+
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(pkey, NULL);
+    bool ok = ctx
+        && EVP_PKEY_decrypt_init(ctx) == 1
+        && EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING) == 1
+        && EVP_PKEY_CTX_set_rsa_oaep_md(ctx, EVP_sha256()) == 1
+        && EVP_PKEY_CTX_set_rsa_mgf1_md(ctx, EVP_sha256()) == 1;
+
+    /* The OpenSSL 3.0 provider path requires querying the maximum output
+     * size first (out=NULL) before the real decrypt call -- it rejects a
+     * buffer pre-sized to the known 32-byte plaintext length with a
+     * generic "bad length" error, since it can't tell that's sufficient
+     * before unpadding. The query conservatively returns the RSA modulus
+     * size (e.g. 512 bytes for RSA-4096). */
+    size_t max_len = 0;
+    ok = ok && EVP_PKEY_decrypt(ctx, NULL, &max_len, wrapped, wrapped_len) == 1 && max_len > 0;
+
+    unsigned char *out = ok ? (unsigned char *) malloc(max_len) : NULL;
+    ok = ok && out != NULL;
+
+    size_t out_len = max_len;
+    ok = ok && EVP_PKEY_decrypt(ctx, out, &out_len, wrapped, wrapped_len) == 1 && out_len == 32;
+    if (ok) {
+        memcpy(dek, out, 32);
+    }
+    if (out) {
+        OPENSSL_cleanse(out, max_len);
+        free(out);
+    }
+    if (ctx) {
+        EVP_PKEY_CTX_free(ctx);
+    }
+    EVP_PKEY_free(pkey);
+    return ok;
+}
+
+/* Cached for the process lifetime: load-tree mode may decrypt many
+ * containers per request, and RSA-OAEP decrypt is comparatively expensive.
+ * The cache itself is key material and gets cleansed at MSHUTDOWN
+ * (Rung D) rather than immediately, since it must survive for the whole
+ * request. */
+static bool opdump_license_ikm_ready = false;
+static bool opdump_license_ikm_failed = false;
+static unsigned char opdump_license_ikm_cache[32];
+
+static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[32])
+{
+    if (opdump_license_ikm_ready) {
+        memcpy(ikm, opdump_license_ikm_cache, 32);
+        return true;
+    }
+    if (opdump_license_ikm_failed) {
+        return false;
+    }
+    opdump_license_ikm_failed = true; /* pessimistic default; cleared below on success */
+
+    const char *license_file = getenv("OPDUMP_LICENSE_FILE");
+    char *derived_path = NULL;
+    if (!license_file || !license_file[0]) {
+        const char *map = getenv("OPDUMP_MAP");
+        if (!map || !map[0]) {
+            map = getenv("BYTECODE_MAP");
+        }
+        if (map && map[0]) {
+            char *map_dir = opdump_dirname_dup(map);
+            derived_path = opdump_join_path(map_dir, "bytecode.license.json");
+            free(map_dir);
+            license_file = derived_path;
+        }
+    }
+    if (!license_file || !license_file[0]) {
+        php_error_docref(NULL, E_WARNING, "opdump: OPDUMP_LICENSE_KEY_FILE set but no OPDUMP_LICENSE_FILE and no OPDUMP_MAP to derive one from");
+        free(derived_path);
+        return false;
+    }
+
+    char *json = opdump_read_text_file(license_file);
+    if (!json) {
+        php_error_docref(NULL, E_WARNING, "opdump: cannot read license file %s", license_file);
+        free(derived_path);
+        return false;
+    }
+
+    char *wrapped_b64 = opdump_json_extract_string(json, "wrapped_dek");
+    free(json);
+    if (!wrapped_b64) {
+        php_error_docref(NULL, E_WARNING, "opdump: license file %s missing wrapped_dek", license_file);
+        free(derived_path);
+        return false;
+    }
+
+    size_t wrapped_len = 0;
+    unsigned char *wrapped = opdump_base64_decode(wrapped_b64, &wrapped_len);
+    free(wrapped_b64);
+    free(derived_path);
+    if (!wrapped) {
+        php_error_docref(NULL, E_WARNING, "opdump: license file %s has malformed wrapped_dek", license_file);
+        return false;
+    }
+
+    const char *passphrase = getenv("OPDUMP_LICENSE_KEY_PASSPHRASE");
+    bool unwrapped = opdump_rsa_unwrap_dek(key_file, passphrase, wrapped, wrapped_len, opdump_license_ikm_cache);
+    OPENSSL_cleanse(wrapped, wrapped_len);
+    free(wrapped);
+    if (!unwrapped) {
+        php_error_docref(NULL, E_WARNING, "opdump: failed to unwrap license DEK using %s", key_file);
+        return false;
+    }
+
+    opdump_license_ikm_failed = false;
+    opdump_license_ikm_ready = true;
+    opdump_lock_mem(opdump_license_ikm_cache, sizeof(opdump_license_ikm_cache));
+    memcpy(ikm, opdump_license_ikm_cache, 32);
+    return true;
+}
+
+/* ---- manifest/map authentication (Rung C) ----
+ *
+ * BYTC's per-file GCM tag only authenticates that one container's own bytes.
+ * Nothing previously stopped bytecode.map itself from being edited to point
+ * a source path at a *different*, still-validly-encrypted container -- each
+ * file would still decrypt and authenticate cleanly on its own. This
+ * verifies bytecode.manifest.json + bytecode.map together against
+ * bytecode.manifest.sig (an HMAC-SHA256 under an HKDF-derived signing key,
+ * written by bytecode-dump) before a single map entry is trusted. */
+static bool opdump_verify_manifest_signature(const char *map_dir, const char *map_path)
+{
+    char *manifest_path = opdump_join_path(map_dir, "bytecode.manifest.json");
+    char *sig_path = opdump_join_path(map_dir, "bytecode.manifest.sig");
+    char *manifest_text = manifest_path ? opdump_read_text_file(manifest_path) : NULL;
+    char *map_text = opdump_read_text_file(map_path);
+    char *sig_text = sig_path ? opdump_read_text_file(sig_path) : NULL;
+    bool ok = false;
+
+    if (!manifest_text || !map_text || !sig_text) {
+        php_error_docref(NULL, E_WARNING,
+            "opdump: cannot verify bytecode.manifest.sig in %s (missing bytecode.manifest.json, bytecode.map, or bytecode.manifest.sig)",
+            map_dir);
+        goto cleanup;
+    }
+
+    size_t sig_len = strlen(sig_text);
+    while (sig_len > 0 && (sig_text[sig_len - 1] == '\n' || sig_text[sig_len - 1] == '\r' || sig_text[sig_len - 1] == ' ')) {
+        sig_text[--sig_len] = '\0';
+    }
+
+    unsigned char expected_sig[32];
+    if (!opdump_hex_decode(sig_text, expected_sig, sizeof(expected_sig))) {
+        php_error_docref(NULL, E_WARNING, "opdump: malformed bytecode.manifest.sig in %s", map_dir);
+        goto cleanup;
+    }
+
+    unsigned char ikm[32];
+    if (!opdump_resolve_ikm(ikm)) {
+        php_error_docref(NULL, E_WARNING, "opdump: no key material available to verify bytecode.manifest.sig in %s", map_dir);
+        goto cleanup;
+    }
+    unsigned char sig_key[32];
+    const unsigned char empty_salt[1] = {0};
+    bool derived = opdump_hkdf_sha256(ikm, sizeof(ikm), empty_salt, 0, "bytecode-manifest-auth", sig_key);
+    OPENSSL_cleanse(ikm, sizeof(ikm));
+    if (!derived) {
+        php_error_docref(NULL, E_WARNING, "opdump: manifest signing key derivation failed");
+        goto cleanup;
+    }
+
+    size_t manifest_len = strlen(manifest_text);
+    size_t map_len = strlen(map_text);
+    size_t msg_len = manifest_len + 1 + map_len;
+    unsigned char *msg = (unsigned char *) malloc(msg_len ? msg_len : 1);
+    if (msg) {
+        memcpy(msg, manifest_text, manifest_len);
+        msg[manifest_len] = 0x00;
+        memcpy(msg + manifest_len + 1, map_text, map_len);
+
+        unsigned char actual_sig[32];
+        unsigned int actual_sig_len = 0;
+        if (HMAC(EVP_sha256(), sig_key, sizeof(sig_key), msg, msg_len, actual_sig, &actual_sig_len)
+            && actual_sig_len == sizeof(actual_sig)) {
+            ok = CRYPTO_memcmp(actual_sig, expected_sig, sizeof(actual_sig)) == 0;
+        }
+        OPENSSL_cleanse(msg, msg_len);
+        free(msg);
+    }
+    OPENSSL_cleanse(sig_key, sizeof(sig_key));
+
+    if (!ok) {
+        php_error_docref(NULL, E_WARNING, "opdump: bytecode.manifest.sig mismatch in %s -- refusing to trust bytecode.map", map_dir);
+    }
+
+cleanup:
+    free(manifest_path);
+    free(sig_path);
+    free(manifest_text);
+    free(map_text);
+    free(sig_text);
+    return ok;
+}
+
 static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned char **out, size_t *out_len)
 {
     size_t off = 4;
@@ -518,8 +966,7 @@ static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned c
         return false;
     }
 
-    size_t aad_len = off;
-    if (container_version != 1) {
+    if (container_version != 1 && container_version != 2) {
         php_error_docref(NULL, E_ERROR, "opdump: unsupported BYTC version %u", container_version);
         return false;
     }
@@ -534,6 +981,25 @@ static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned c
         php_error_docref(NULL, E_ERROR, "opdump: unsupported BYTC backend");
         return false;
     }
+
+    /* v2 adds an authenticated cipher_id + key_id before the nonce/tag/ciphertext
+     * trailer; v1's layout is unchanged from Phase 1. */
+    uint32_t cipher_id = 1;
+    const unsigned char *key_id = NULL;
+    uint32_t key_id_len = 0;
+    if (container_version == 2) {
+        if (!opdump_take_u32(buf, len, &off, &cipher_id)
+            || !opdump_take_u32(buf, len, &off, &key_id_len)
+            || !opdump_take_bytes(buf, len, &off, key_id_len, &key_id)) {
+            php_error_docref(NULL, E_ERROR, "opdump: malformed BYTC2 key header");
+            return false;
+        }
+        if (cipher_id != 1) {
+            php_error_docref(NULL, E_ERROR, "opdump: unsupported BYTC2 cipher_id %u", cipher_id);
+            return false;
+        }
+    }
+    size_t aad_len = off;
 
     if (!opdump_take_u32(buf, len, &off, &nonce_len)
         || !opdump_take_bytes(buf, len, &off, nonce_len, &nonce)
@@ -558,13 +1024,28 @@ static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned c
     }
 
     unsigned char key[32];
-    if (!opdump_key_from_env(key)) {
-        php_error_docref(NULL, E_ERROR, "opdump: BYTECODE_KEY/OPDUMP_KEY must be 64 hex chars for BYTC load");
-        return false;
+    if (container_version == 1) {
+        if (!opdump_key_from_env(key)) {
+            php_error_docref(NULL, E_ERROR, "opdump: BYTECODE_KEY/OPDUMP_KEY must be 64 hex chars for BYTC load");
+            return false;
+        }
+    } else {
+        unsigned char ikm[32];
+        if (!opdump_resolve_ikm(ikm)) {
+            php_error_docref(NULL, E_ERROR, "opdump: no key material available for BYTC2 load (checked license and BYTECODE_KEY/OPDUMP_KEY)");
+            return false;
+        }
+        bool derived = opdump_hkdf_sha256(ikm, sizeof(ikm), key_id, key_id_len, "bytecode-v2", key);
+        OPENSSL_cleanse(ikm, sizeof(ikm));
+        if (!derived) {
+            php_error_docref(NULL, E_ERROR, "opdump: key derivation failed for BYTC2 container");
+            return false;
+        }
     }
 
     unsigned char *plain = (unsigned char *) malloc(ciphertext_len ? ciphertext_len : 1);
     if (!plain) {
+        OPENSSL_cleanse(key, sizeof(key));
         return false;
     }
 
@@ -579,6 +1060,7 @@ static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned c
         && EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, (int)tag_len, (void *)tag) == 1
         && EVP_DecryptFinal_ex(ctx, plain + len1, &len2) == 1;
 
+    OPENSSL_cleanse(key, sizeof(key));
     if (ctx) {
         EVP_CIPHER_CTX_free(ctx);
     }
@@ -643,6 +1125,71 @@ static void opdump_read_literal(FILE *f, zval *zv)
     }
 }
 
+/* ---- safe variable-name obfuscation (Rung E) ----
+ *
+ * Compiled opcodes reference CVs (local variables) by integer slot index,
+ * never by name -- op_array->vars[] is purely a name-lookup table used by
+ * compact()/extract()/get_defined_vars(), `$$name`/`${expr}`, and
+ * Reflection/debugging. Renaming entries in that table is a pure metadata
+ * edit with zero effect on control flow (unlike opcode reordering, which
+ * this project deliberately does not do -- see docs/PHASE4.md). This scan
+ * decides, per op_array, whether ANY construct could read a local variable
+ * by a name string derived at runtime; if so, that op_array is left
+ * untouched rather than risk it silently returning the wrong thing to
+ * compact()/extract() -- the same "fail safe, not fail clever" bar as the
+ * rest of this loader. It does not chase dynamic dispatch (call_user_func()
+ * with a computed callable, a variable holding the string "compact") past
+ * one level of indirection; those opcodes (INIT_DYNAMIC_CALL/INIT_USER_CALL)
+ * are conservatively treated as unsafe outright rather than attempted. */
+static bool opdump_is_dynamic_var_fname(zend_string *fname)
+{
+    return zend_string_equals_literal_ci(fname, "compact")
+        || zend_string_equals_literal_ci(fname, "extract")
+        || zend_string_equals_literal_ci(fname, "get_defined_vars");
+}
+
+static bool opdump_op_array_uses_dynamic_vars(zend_op_array *op_array)
+{
+    for (uint32_t i = 0; i < op_array->last; i++) {
+        zend_op *opline = &op_array->opcodes[i];
+        switch (opline->opcode) {
+            case ZEND_INIT_FCALL:
+            case ZEND_INIT_FCALL_BY_NAME:
+            case ZEND_INIT_NS_FCALL_BY_NAME: {
+                if (opline->op2_type != IS_CONST) {
+                    return true; /* not a literal function name we can inspect */
+                }
+                zval *fname_zv = RT_CONSTANT(opline, opline->op2);
+                if (Z_TYPE_P(fname_zv) != IS_STRING || opdump_is_dynamic_var_fname(Z_STR_P(fname_zv))) {
+                    return true;
+                }
+                break;
+            }
+            case ZEND_INIT_DYNAMIC_CALL:
+            case ZEND_INIT_USER_CALL:
+                return true;
+            case ZEND_FETCH_R:
+            case ZEND_FETCH_W:
+            case ZEND_FETCH_RW:
+            case ZEND_FETCH_IS:
+            case ZEND_FETCH_FUNC_ARG:
+            case ZEND_FETCH_UNSET:
+                /* $$name / ${$expr}: the variable's name is itself a runtime
+                 * value (IS_VAR/IS_TMP_VAR), not a fixed CV or literal name.
+                 * `global $x;` also uses this opcode family but with
+                 * op1_type IS_CONST -- it looks up an unrelated global-table
+                 * literal, not this op_array's CV table, so it's fine. */
+                if (opline->op1_type == IS_VAR || opline->op1_type == IS_TMP_VAR) {
+                    return true;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+    return false;
+}
+
 static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
 {
     w_u8(f, op_array->type);
@@ -688,8 +1235,22 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
         w_u32(f, elem->finally_op);
         w_u32(f, elem->finally_end);
     }
+    /* Only non-parameter locals are ever renamed: arg_info[i].name (used for
+     * named-argument matching and ReflectionParameter::getName()) is a
+     * separate zend_string from the CV table and is never touched here, so
+     * renaming a parameter's CV entry would make the two silently diverge. */
+    bool obfuscate_vars = getenv("OPDUMP_OBFUSCATE") != NULL
+        && !opdump_op_array_uses_dynamic_vars(op_array);
+    uint32_t protected_var_count = op_array->num_args + ((op_array->fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0);
     for (int i = 0; i < op_array->last_var; i++) {
-        w_zstr(f, op_array->vars[i]);
+        if (obfuscate_vars && (uint32_t) i >= protected_var_count) {
+            char renamed[24];
+            snprintf(renamed, sizeof(renamed), "_v%d", i);
+            w_u8(f, 1);
+            w_str(f, renamed, strlen(renamed));
+        } else {
+            w_zstr(f, op_array->vars[i]);
+        }
     }
     if (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE) {
         opdump_write_arg_info(f, &op_array->arg_info[-1]);
@@ -1217,6 +1778,7 @@ static zend_op_array *opdump_load_tree_compile_file(zend_file_handle *file_handl
 
 PHP_MINIT_FUNCTION(opdump)
 {
+    opdump_disable_core_dumps();
     opdump_orig_compile_file = zend_compile_file;
     const char *mode = getenv("OPDUMP_MODE");
     if (mode && strcmp(mode, "dump") == 0) {
@@ -1237,12 +1799,27 @@ PHP_MINIT_FUNCTION(opdump)
     return SUCCESS;
 }
 
+/* Cleanses the cached license DEK (if license mode ever unwrapped one) once
+ * per process, rather than immediately after each derivation -- it has to
+ * survive for the whole request/process to avoid re-doing an RSA-OAEP
+ * unwrap per file in load-tree mode (see opdump_license_resolve_ikm). */
+PHP_MSHUTDOWN_FUNCTION(opdump)
+{
+    if (opdump_license_ikm_ready) {
+        opdump_unlock_mem(opdump_license_ikm_cache, sizeof(opdump_license_ikm_cache));
+        OPENSSL_cleanse(opdump_license_ikm_cache, sizeof(opdump_license_ikm_cache));
+        opdump_license_ikm_ready = false;
+    }
+    return SUCCESS;
+}
+
 zend_module_entry opdump_module_entry = {
     STANDARD_MODULE_HEADER,
     "opdump",
     NULL,
     PHP_MINIT(opdump),
-    NULL, NULL, NULL, NULL,
+    PHP_MSHUTDOWN(opdump),
+    NULL, NULL, NULL,
     "0.0.1-phase0",
     STANDARD_MODULE_PROPERTIES
 };

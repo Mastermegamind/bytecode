@@ -49,9 +49,18 @@ function parse_bytc(string $path): array
 
     $offset = 4;
     $version = u32le($bytes, $offset);
+    if ($version !== 1 && $version !== 2) {
+        fail("{$path}: unsupported container version {$version}");
+    }
     $phpVersionId = u32le($bytes, $offset);
     $backendId = take($bytes, $offset, u32le($bytes, $offset));
     $backendFormat = take($bytes, $offset, u32le($bytes, $offset));
+    $cipherId = null;
+    $keyId = '';
+    if ($version === 2) {
+        $cipherId = u32le($bytes, $offset);
+        $keyId = take($bytes, $offset, u32le($bytes, $offset));
+    }
     $headerSize = $offset;
     $nonce = take($bytes, $offset, u32le($bytes, $offset));
     $tag = take($bytes, $offset, u32le($bytes, $offset));
@@ -60,20 +69,20 @@ function parse_bytc(string $path): array
         fail("{$path}: trailing bytes after ciphertext");
     }
 
-    return compact('bytes', 'version', 'phpVersionId', 'backendId', 'backendFormat', 'headerSize', 'nonce', 'tag', 'ciphertext');
+    return compact('bytes', 'version', 'phpVersionId', 'backendId', 'backendFormat', 'cipherId', 'keyId', 'headerSize', 'nonce', 'tag', 'ciphertext');
 }
 
 function verify_container(string $path): array
 {
     $container = parse_bytc($path);
-    if ($container['version'] !== 1) {
-        fail("{$path}: unsupported container version {$container['version']}");
-    }
     if ($container['phpVersionId'] !== PHP_VERSION_ID) {
         fail("{$path}: PHP_VERSION_ID {$container['phpVersionId']} does not match " . PHP_VERSION_ID);
     }
     if ($container['backendId'] !== 'php-zend-opdump' || $container['backendFormat'] !== 'OPD2') {
         fail("{$path}: unsupported backend {$container['backendId']}/{$container['backendFormat']}");
+    }
+    if ($container['version'] === 2 && $container['cipherId'] !== 1) {
+        fail("{$path}: unsupported cipher_id {$container['cipherId']}");
     }
     if (strlen($container['nonce']) !== 12 || strlen($container['tag']) !== 16) {
         fail("{$path}: unsupported nonce/tag length");
@@ -142,6 +151,27 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
             fail("{$path}: manifest size mismatch");
         }
         $files[] = $path;
+    }
+
+    $sigPath = $baseDir . DIRECTORY_SEPARATOR . 'bytecode.manifest.sig';
+    if (!is_file($sigPath)) {
+        fail("manifest signature missing: {$sigPath}");
+    }
+    $sig = trim(file_get_contents($sigPath));
+    if (!preg_match('/\A[0-9a-f]{64}\z/', $sig)) {
+        fail("{$sigPath}: malformed signature (expected 64 hex chars)");
+    }
+    // Cryptographic verification needs the same IKM the loader resolves via
+    // BYTECODE_KEY/OPDUMP_KEY -- license-mode (RSA-wrapped DEK) builds can
+    // only get a structural check here without also implementing an RSA
+    // unwrap in this tool, so this stays a hex-shape check in that case.
+    $ikmHex = getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '';
+    if (preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
+        $sigKey = hash_hkdf('sha256', hex2bin($ikmHex), 32, 'bytecode-manifest-auth', '');
+        $expected = hash_hmac('sha256', file_get_contents($manifestPath) . "\0" . file_get_contents($mapPath), $sigKey);
+        if (!hash_equals($expected, $sig)) {
+            fail("{$sigPath}: signature mismatch (wrong key, or manifest/map tampered)");
+        }
     }
 } else {
     verify_container($target);

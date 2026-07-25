@@ -1,0 +1,366 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Preflight scanner inspired by the Yakpro study. It does not obfuscate code;
+ * it reports dynamic PHP constructs that make future symbol rewriting risky
+ * and are useful diagnostics before bytecode packaging.
+ */
+
+function usage(): void
+{
+    fwrite(STDERR, <<<'USAGE'
+Usage: bytecode-scan [--json] [--fail-on-warning] [--exclude <glob>]... <source-file-or-dir>...
+
+Scans PHP sources for dynamic constructs that can break source-level symbol
+rewriting or make encoded-build debugging harder:
+
+  - variable variables
+  - dynamic function/class/property/method access
+  - define()/defined()/function_exists()/class_exists()/method_exists()
+    calls with non-literal names
+  - call_user_func()/call_user_func_array()/is_callable()
+  - callable arrays like [SomeClass::class, 'method']
+  - PDO::FETCH_OBJ
+
+USAGE);
+}
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+function glob_to_regex(string $glob): string
+{
+    $regex = '';
+    for ($i = 0, $n = strlen($glob); $i < $n; $i++) {
+        $c = $glob[$i];
+        $regex .= match ($c) {
+            '*' => '.*',
+            '?' => '.',
+            default => preg_quote($c, '#'),
+        };
+    }
+    return '#\A' . $regex . '\z#';
+}
+
+function is_excluded(string $rel, array $excludes): bool
+{
+    foreach ($excludes as $pattern) {
+        if (preg_match(glob_to_regex($pattern), $rel)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+function normalize_path(string $path): string
+{
+    return str_replace('\\', '/', $path);
+}
+
+function collect_php_files(array $sources, array $excludes): array
+{
+    $files = [];
+    foreach ($sources as $source) {
+        if (!file_exists($source)) {
+            fail("source does not exist: {$source}", 2);
+        }
+        $root = realpath($source);
+        if ($root === false) {
+            fail("cannot resolve source: {$source}", 2);
+        }
+
+        if (is_file($root)) {
+            if (strtolower(pathinfo($root, PATHINFO_EXTENSION)) === 'php') {
+                $files[$root] = $root;
+            }
+            continue;
+        }
+
+        $base = rtrim($root, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR;
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($root, FilesystemIterator::SKIP_DOTS),
+        );
+        foreach ($iterator as $entry) {
+            if (!$entry->isFile()) {
+                continue;
+            }
+            $path = $entry->getPathname();
+            if (strtolower(pathinfo($path, PATHINFO_EXTENSION)) !== 'php') {
+                continue;
+            }
+            $rel = normalize_path(substr($path, strlen($base)));
+            if (is_excluded($rel, $excludes)) {
+                continue;
+            }
+            $files[$path] = $path;
+        }
+    }
+
+    ksort($files);
+    return array_values($files);
+}
+
+function token_line(mixed $token): int
+{
+    return is_array($token) ? $token[2] : 0;
+}
+
+function token_text(mixed $token): string
+{
+    return is_array($token) ? $token[1] : $token;
+}
+
+function next_significant(array $tokens, int $index): ?array
+{
+    for ($i = $index + 1, $n = count($tokens); $i < $n; $i++) {
+        $token = $tokens[$i];
+        if (is_array($token) && in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+            continue;
+        }
+        return [$i, $token];
+    }
+    return null;
+}
+
+function previous_significant(array $tokens, int $index): ?array
+{
+    for ($i = $index - 1; $i >= 0; $i--) {
+        $token = $tokens[$i];
+        if (is_array($token) && in_array($token[0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+            continue;
+        }
+        return [$i, $token];
+    }
+    return null;
+}
+
+function first_call_arg_tokens(array $tokens, int $openParenIndex): array
+{
+    $depth = 0;
+    $arg = [];
+    for ($i = $openParenIndex + 1, $n = count($tokens); $i < $n; $i++) {
+        $text = token_text($tokens[$i]);
+        if ($text === '(' || $text === '[' || $text === '{') {
+            $depth++;
+        } elseif ($text === ')' || $text === ']' || $text === '}') {
+            if ($depth === 0) {
+                break;
+            }
+            $depth--;
+        } elseif ($text === ',' && $depth === 0) {
+            break;
+        }
+        if (is_array($tokens[$i]) && in_array($tokens[$i][0], [T_WHITESPACE, T_COMMENT, T_DOC_COMMENT], true)) {
+            continue;
+        }
+        $arg[] = $tokens[$i];
+    }
+    return $arg;
+}
+
+function first_arg_is_literal_string(array $tokens, int $openParenIndex): bool
+{
+    $arg = first_call_arg_tokens($tokens, $openParenIndex);
+    return count($arg) === 1
+        && is_array($arg[0])
+        && $arg[0][0] === T_CONSTANT_ENCAPSED_STRING;
+}
+
+function add_warning(array &$warnings, string $file, int $line, string $code, string $message): void
+{
+    $warnings[] = [
+        'file' => $file,
+        'line' => max(1, $line),
+        'code' => $code,
+        'message' => $message,
+    ];
+}
+
+function scan_file(string $file): array
+{
+    $source = file_get_contents($file);
+    if ($source === false) {
+        fail("cannot read {$file}");
+    }
+
+    $warnings = [];
+    $tokens = token_get_all($source);
+
+    $regexChecks = [
+        ['#\$\s*(?:\$|\{)#', 'variable-variable', 'variable variables depend on runtime names and block safe variable rewriting'],
+        ['#\bnew\s+\$#i', 'dynamic-class', 'dynamic class instantiation depends on runtime class names'],
+        ['#(?:->|::)\s*(?:\$|\{)#', 'dynamic-member', 'dynamic property/method/member access depends on runtime names'],
+        ['#\[\s*[^\\]]*::class\s*,\s*(["\'])#s', 'callable-array', 'callable array contains a literal method name that must stay in sync if methods are renamed'],
+        ['#PDO\s*::\s*FETCH_OBJ#i', 'pdo-fetch-obj', 'PDO::FETCH_OBJ hydrates object properties by name; property rewriting can break it'],
+    ];
+    foreach ($regexChecks as [$pattern, $code, $message]) {
+        if (preg_match_all($pattern, $source, $matches, PREG_OFFSET_CAPTURE)) {
+            foreach ($matches[0] as $match) {
+                $line = substr_count(substr($source, 0, $match[1]), "\n") + 1;
+                add_warning($warnings, $file, $line, $code, $message);
+            }
+        }
+    }
+
+    $literalNameFunctions = [
+        'define' => 'define() with non-literal constant name cannot be safely renamed',
+        'defined' => 'defined() with non-literal constant name cannot be safely renamed',
+        'function_exists' => 'function_exists() with non-literal function name cannot be safely renamed',
+        'class_exists' => 'class_exists() with non-literal class name cannot be safely renamed',
+        'interface_exists' => 'interface_exists() with non-literal interface name cannot be safely renamed',
+        'trait_exists' => 'trait_exists() with non-literal trait name cannot be safely renamed',
+        'method_exists' => 'method_exists() with non-literal method name cannot be safely renamed',
+        'property_exists' => 'property_exists() with non-literal property name cannot be safely renamed',
+        'constant' => 'constant() with non-literal constant name cannot be safely renamed',
+    ];
+    $dynamicDispatchFunctions = [
+        'call_user_func' => 'call_user_func() uses runtime callable names; symbol rewriting needs an explicit policy',
+        'call_user_func_array' => 'call_user_func_array() uses runtime callable names; symbol rewriting needs an explicit policy',
+        'is_callable' => 'is_callable() often references runtime callable names; symbol rewriting needs an explicit policy',
+    ];
+
+    for ($i = 0, $n = count($tokens); $i < $n; $i++) {
+        $token = $tokens[$i];
+
+        if (is_array($token) && $token[0] === T_VARIABLE) {
+            $next = next_significant($tokens, $i);
+            if ($next !== null && token_text($next[1]) === '(') {
+                $previous = previous_significant($tokens, $i);
+                $previousKind = is_array($previous[1] ?? null) ? $previous[1][0] : null;
+                $previousText = $previous === null ? '' : token_text($previous[1]);
+                if ($previousKind === T_NEW || $previousText === '->' || $previousText === '::') {
+                    continue;
+                }
+                add_warning(
+                    $warnings,
+                    $file,
+                    $token[2],
+                    'dynamic-function-call',
+                    'variable function call depends on runtime function names',
+                );
+            }
+        }
+
+        if (!is_array($token) || $token[0] !== T_STRING) {
+            continue;
+        }
+
+        $name = strtolower($token[1]);
+        $next = next_significant($tokens, $i);
+        if ($next === null || token_text($next[1]) !== '(') {
+            continue;
+        }
+
+        $previous = previous_significant($tokens, $i);
+        if ($previous !== null) {
+            $prevText = token_text($previous[1]);
+            if ($prevText === '->' || $prevText === '::' || $prevText === '\\') {
+                continue;
+            }
+        }
+
+        if (isset($literalNameFunctions[$name]) && !first_arg_is_literal_string($tokens, $next[0])) {
+            add_warning($warnings, $file, $token[2], 'nonliteral-symbol-name', $literalNameFunctions[$name]);
+        }
+        if (isset($dynamicDispatchFunctions[$name])) {
+            add_warning($warnings, $file, $token[2], 'dynamic-dispatch', $dynamicDispatchFunctions[$name]);
+        }
+    }
+
+    usort(
+        $warnings,
+        fn (array $a, array $b): int => [$a['file'], $a['line'], $a['code']] <=> [$b['file'], $b['line'], $b['code']],
+    );
+    return $warnings;
+}
+
+$args = array_slice($argv, 1);
+if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
+    usage();
+    exit(0);
+}
+
+$json = false;
+$failOnWarning = false;
+$excludes = [];
+while ($args) {
+    $arg = $args[0];
+    if ($arg === '--json') {
+        $json = true;
+        array_shift($args);
+        continue;
+    }
+    if ($arg === '--fail-on-warning') {
+        $failOnWarning = true;
+        array_shift($args);
+        continue;
+    }
+    if ($arg === '--exclude') {
+        array_shift($args);
+        if (!$args) {
+            fail('--exclude requires a glob pattern', 2);
+        }
+        $excludes[] = array_shift($args);
+        continue;
+    }
+    if (str_starts_with($arg, '--exclude=')) {
+        $excludes[] = substr($arg, strlen('--exclude='));
+        array_shift($args);
+        continue;
+    }
+    if ($arg === '--') {
+        array_shift($args);
+        break;
+    }
+    if ($arg !== '' && $arg[0] === '-') {
+        usage();
+        exit(2);
+    }
+    break;
+}
+
+if (!$args) {
+    usage();
+    exit(2);
+}
+
+$files = collect_php_files($args, $excludes);
+$warnings = [];
+foreach ($files as $file) {
+    array_push($warnings, ...scan_file($file));
+}
+
+if ($json) {
+    echo json_encode(
+        [
+            'format' => 'bytecode-scan-v1',
+            'files_scanned' => count($files),
+            'warning_count' => count($warnings),
+            'warnings' => $warnings,
+        ],
+        JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES,
+    ), PHP_EOL;
+} else {
+    foreach ($warnings as $warning) {
+        fwrite(
+            STDOUT,
+            sprintf(
+                "%s:%d [%s] %s%s",
+                $warning['file'],
+                $warning['line'],
+                $warning['code'],
+                $warning['message'],
+                PHP_EOL,
+            ),
+        );
+    }
+    fwrite(STDOUT, sprintf("bytecode-scan: scanned %d file(s), %d warning(s)%s", count($files), count($warnings), PHP_EOL));
+}
+
+exit($failOnWarning && $warnings !== [] ? 1 : 0);

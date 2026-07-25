@@ -1,0 +1,117 @@
+name: Desktop packages
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+jobs:
+  linux-appimage:
+    name: Linux AppImage
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: phpize, php-config
+          coverage: none
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf pkg-config libssl-dev libgtk-3-dev
+
+      - name: Build AppImage
+        run: scripts/build-linux-appimage.sh
+
+      - name: Build Debian package
+        run: scripts/build-linux-deb.sh
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bytecode_Encoder-linux-x86_64
+          path: dist/Bytecode_Encoder-x86_64.AppImage
+
+      - name: Upload Debian package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bytecode_Encoder-linux-deb-amd64
+          path: dist/bytecode-encoder_*.deb
+
+  macos-app:
+    name: macOS app
+    runs-on: macos-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install PHP build dependencies
+        run: brew install php openssl@3 pkg-config
+
+      - name: Build macOS app
+        run: scripts/build-macos-app.sh
+        env:
+          PHP_BIN: php
+          PHPIZE_BIN: phpize
+          PHP_CONFIG_BIN: php-config
+
+      - name: Upload macOS app
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bytecode_Encoder-macos
+          path: dist/Bytecode_Encoder-macos.zip
+
+  windows-package:
+    name: Windows package
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Install WiX Toolset
+        shell: pwsh
+        run: |
+          dotnet tool install --global wix
+          echo "$env:USERPROFILE\.dotnet\tools" >> $env:GITHUB_PATH
+
+      - name: Build Windows UI package and MSI
+        shell: pwsh
+        run: ./scripts/build-windows-package.ps1 -SkipExtension -BuildMsi
+
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bytecode_Encoder-windows-x64
+          path: dist/Bytecode_Encoder-windows-x64.zip
+
+      - name: Upload Windows MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: Bytecode_Encoder-windows-msi-x64
+          path: dist/Bytecode_Encoder-windows-x64.msi

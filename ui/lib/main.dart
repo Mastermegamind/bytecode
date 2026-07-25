@@ -141,6 +141,39 @@ class _EncoderPageState extends State<EncoderPage> {
   }
 
   String _defaultRepoRoot() {
+    final envRoot = Platform.environment['BYTECODE_ROOT'];
+    if (envRoot != null &&
+        envRoot.isNotEmpty &&
+        Directory(envRoot).existsSync()) {
+      return envRoot;
+    }
+
+    final appDir = Platform.environment['APPDIR'];
+    if (appDir != null && appDir.isNotEmpty) {
+      final bundledRoot = _join(_join(appDir, 'usr'), 'lib/bytecode');
+      if (Directory(bundledRoot).existsSync()) {
+        return bundledRoot;
+      }
+    }
+
+    final executable = File(Platform.resolvedExecutable);
+    final executableDir = executable.parent.path;
+
+    if (Platform.isMacOS) {
+      final contentsDir = executable.parent.parent.path;
+      final bundledRoot = _join(_join(contentsDir, 'Resources'), 'bytecode');
+      if (Directory(bundledRoot).existsSync()) {
+        return bundledRoot;
+      }
+    }
+
+    if (Platform.isWindows) {
+      final bundledRoot = _join(executableDir, 'bytecode');
+      if (Directory(bundledRoot).existsSync()) {
+        return bundledRoot;
+      }
+    }
+
     final current = Directory.current;
     if (current.path.endsWith('${Platform.pathSeparator}ui')) {
       return current.parent.path;
@@ -151,6 +184,44 @@ class _EncoderPageState extends State<EncoderPage> {
   String _join(String a, String b) {
     final sep = Platform.pathSeparator;
     return a.endsWith(sep) ? '$a$b' : '$a$sep$b';
+  }
+
+  String _phpBinary() {
+    final envPhp = Platform.environment['BYTECODE_PHP'];
+    if (envPhp != null && envPhp.isNotEmpty && File(envPhp).existsSync()) {
+      return envPhp;
+    }
+
+    final appDir = Platform.environment['APPDIR'];
+    if (appDir != null && appDir.isNotEmpty) {
+      final bundledPhp = _join(_join(appDir, 'usr'), 'bin/php');
+      if (File(bundledPhp).existsSync()) {
+        return bundledPhp;
+      }
+    }
+
+    final executable = File(Platform.resolvedExecutable);
+    final executableDir = executable.parent.path;
+
+    if (Platform.isMacOS) {
+      final contentsDir = executable.parent.parent.path;
+      final bundledPhp = _join(
+        _join(_join(contentsDir, 'Resources'), 'php'),
+        'bin/php',
+      );
+      if (File(bundledPhp).existsSync()) {
+        return bundledPhp;
+      }
+    }
+
+    if (Platform.isWindows) {
+      final bundledPhp = _join(_join(executableDir, 'php'), 'php.exe');
+      if (File(bundledPhp).existsSync()) {
+        return bundledPhp;
+      }
+    }
+
+    return 'php';
   }
 
   String get _root => _rootController.text.trim();
@@ -200,7 +271,7 @@ class _EncoderPageState extends State<EncoderPage> {
 
   Future<void> _generateKey() async {
     await _runLocked(() async {
-      final result = await Process.run('php', [
+      final result = await Process.run(_phpBinary(), [
         _join(_root, 'php/bin/bytecode-keygen'),
       ], workingDirectory: _root);
       if (result.exitCode != 0) {
@@ -243,7 +314,7 @@ class _EncoderPageState extends State<EncoderPage> {
       setState(() {});
 
       final process = await Process.start(
-        'php',
+        _phpBinary(),
         [
           _join(_root, 'php/bin/bytecode-dump'),
           ..._excludeArgs(),
@@ -273,7 +344,7 @@ class _EncoderPageState extends State<EncoderPage> {
     await _runLocked(() async {
       _status = 'Verifying';
       setState(() {});
-      final result = await Process.run('php', [
+      final result = await Process.run(_phpBinary(), [
         _join(_root, 'php/bin/bytecode-verify'),
         _manifestPath,
       ], workingDirectory: _root);

@@ -3,16 +3,20 @@
 
 if ($argc !== 3 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
     fwrite(STDERR, "Usage: bytecode-pack <raw-opd2-blob> <container-output>\n");
-    fwrite(STDERR, "\nEnvironment:\n  BYTECODE_KEY or OPDUMP_KEY  64 hex chars / 32 bytes\n");
+    fwrite(STDERR, "\nEnvironment:\n  BYTECODE_DEK, BYTECODE_KEY, or OPDUMP_KEY  64 hex chars / 32 bytes\n");
+    fwrite(STDERR, "    Treated as HKDF-SHA256 input keying material (IKM); the actual\n");
+    fwrite(STDERR, "    AES-256-GCM key is derived per file from a random key_id salt.\n");
+    fwrite(STDERR, "    BYTECODE_DEK (set internally by bytecode-dump in license mode)\n");
+    fwrite(STDERR, "    takes priority over BYTECODE_KEY/OPDUMP_KEY.\n");
     exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
 }
 
 $rawPath = $argv[1];
 $outPath = $argv[2];
-$hexKey = getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '';
+$hexKey = getenv('BYTECODE_DEK') ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '';
 
 if (!preg_match('/\\A[0-9a-fA-F]{64}\\z/', $hexKey)) {
-    fwrite(STDERR, "BYTECODE_KEY/OPDUMP_KEY must be exactly 64 hex characters\n");
+    fwrite(STDERR, "BYTECODE_DEK/BYTECODE_KEY/OPDUMP_KEY must be exactly 64 hex characters\n");
     exit(1);
 }
 
@@ -26,17 +30,22 @@ if (substr($raw, 0, 4) !== 'OPD2') {
     exit(1);
 }
 
-$key = hex2bin($hexKey);
+$ikm = hex2bin($hexKey);
+$keyId = random_bytes(16);
+$key = hash_hkdf('sha256', $ikm, 32, 'bytecode-v2', $keyId);
 $nonce = random_bytes(12);
+$cipherId = 1; // AES-256-GCM
 $backendId = 'php-zend-opdump';
 $backendFormat = 'OPD2';
 $phpVersionId = PHP_VERSION_ID;
 
 $header = 'BYTC'
-    . pack('V', 1)
+    . pack('V', 2)
     . pack('V', $phpVersionId)
     . pack('V', strlen($backendId)) . $backendId
-    . pack('V', strlen($backendFormat)) . $backendFormat;
+    . pack('V', strlen($backendFormat)) . $backendFormat
+    . pack('V', $cipherId)
+    . pack('V', strlen($keyId)) . $keyId;
 
 $tag = '';
 $ciphertext = openssl_encrypt(

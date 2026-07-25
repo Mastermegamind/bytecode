@@ -51,4 +51,3 @@ tests/*.php.bak
 .DS_Store
 Thumbs.db
 !*.code-workspace
-dist/Bytecode_Encoder-x86_64.AppImage

@@ -4,7 +4,7 @@
 declare(strict_types=1);
 
 /*
- * Phase 1 tree dumper: walk PHP source and emit encrypted BYTC1 containers.
+ * Phase 1 tree dumper: walk PHP source and emit encrypted BYTC2 containers.
  * Uses lint mode (-l) so PHP compiles each file without executing it.
  *
  * Rewritten from the original Bash version so this tool runs the same way
@@ -15,13 +15,26 @@ declare(strict_types=1);
 function usage(): void
 {
     fwrite(STDERR, <<<'USAGE'
-Usage: bytecode-dump [--raw] [--exclude <glob>]... <source-file-or-dir>... <output-dir>
+Usage: bytecode-dump [--raw] [--obfuscate] [--exclude <glob>]... <source-file-or-dir>... <output-dir>
+
+  --obfuscate  Rename non-parameter local variables to _v0, _v1, ... in the
+               dumped bytecode. Off by default. Skipped per-function whenever
+               compact()/extract()/get_defined_vars()/$$name/call_user_func()-
+               style dynamic dispatch is detected, so it never risks changing
+               behavior -- see opdump_op_array_uses_dynamic_vars() in
+               php/src/opdump.c.
 
 Environment:
   PHP_BIN      PHP binary to use (default: php8.4)
   OPDUMP_SO    Path to opdump.so/opdump.dll (default: ../src/modules/<name>)
   BYTECODE_KEY or OPDUMP_KEY
-               64 hex chars / 32 bytes, required unless --raw is used
+               64 hex chars / 32 bytes, required unless --raw or
+               BYTECODE_LICENSE_PUBKEY is used
+  BYTECODE_LICENSE_PUBKEY
+               Path to a license.pub.pem (see bytecode-license-keygen).
+               When set, one random DEK is generated for this whole run and
+               RSA-OAEP-SHA256-wrapped into bytecode.license.json instead of
+               using BYTECODE_KEY/OPDUMP_KEY directly.
 
 USAGE);
 }
@@ -100,6 +113,43 @@ function run_subprocess(array $cmd, array $envOverrides): int
     return $exit;
 }
 
+/**
+ * RSA-OAEP-SHA256-wraps $plaintext with the given public key by shelling out
+ * to the openssl CLI. PHP's openssl_public_encrypt() only supports OAEP with
+ * a hardcoded SHA-1 digest -- there is no core-PHP function to choose
+ * SHA-256 for OAEP/MGF1, so the wrap step goes through `openssl pkeyutl`
+ * instead, matching the explicit SHA-256 digest opdump.c's loader requires
+ * on unwrap (see opdump_rsa_unwrap_dek in php/src/opdump.c).
+ */
+function openssl_rsa_oaep_sha256_wrap(string $publicKeyPath, string $plaintext): string
+{
+    $cmd = [
+        'openssl', 'pkeyutl', '-encrypt',
+        '-pubin', '-inkey', $publicKeyPath,
+        '-pkeyopt', 'rsa_padding_mode:oaep',
+        '-pkeyopt', 'rsa_oaep_md:sha256',
+        '-pkeyopt', 'rsa_mgf1_md:sha256',
+    ];
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if ($proc === false) {
+        fail('failed to start openssl pkeyutl for RSA-OAEP wrap');
+    }
+    fwrite($pipes[0], $plaintext);
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[2]);
+    $exit = proc_close($proc);
+
+    if ($exit !== 0) {
+        fwrite(STDERR, $stderr);
+        fail('openssl pkeyutl RSA-OAEP wrap failed -- is the openssl CLI installed and is the public key valid PEM?');
+    }
+    return $stdout;
+}
+
 $args = array_slice($argv, 1);
 if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
     usage();
@@ -107,11 +157,17 @@ if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
 }
 
 $raw = false;
+$obfuscate = false;
 $excludes = [];
 while ($args) {
     $a = $args[0];
     if ($a === '--raw') {
         $raw = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--obfuscate') {
+        $obfuscate = true;
         array_shift($args);
         continue;
     }
@@ -179,6 +235,22 @@ function php_version_id(string $phpBin): int
 }
 
 $phpVersionId = php_version_id($phpBin);
+
+$licensePubkey = getenv('BYTECODE_LICENSE_PUBKEY') ?: null;
+$dekHex = null;
+if ($licensePubkey !== null && $licensePubkey !== '') {
+    if (!is_file($licensePubkey)) {
+        fail("BYTECODE_LICENSE_PUBKEY does not exist: {$licensePubkey}");
+    }
+    if (!$raw) {
+        $dekHex = bin2hex(random_bytes(32));
+    }
+}
+// Same IKM every container in this run is HKDF-derived from (see bytecode-pack
+// and opdump_resolve_ikm() in php/src/opdump.c); used again below to sign
+// bytecode.manifest.json + bytecode.map so tampering with the map's source-to-
+// container wiring is detectable, not just tampering with a single container.
+$ikmHex = $dekHex ?? (getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '');
 
 $manifestFiles = [];
 $mapLines = [];
@@ -257,7 +329,9 @@ function dump_one(
     string $opdumpSo,
     string $packer,
     bool $raw,
+    bool $obfuscate,
     int $phpVersionId,
+    ?string $dekHex,
     array &$manifestFiles,
     array &$mapLines
 ): void {
@@ -274,12 +348,17 @@ function dump_one(
     }
     $seenOutputs[$relativeOutput] = $file;
 
+    $dumpEnv = ['OPDUMP_MODE' => 'dump'];
+    if ($obfuscate) {
+        $dumpEnv['OPDUMP_OBFUSCATE'] = '1';
+    }
+
     if ($raw) {
         $dest = $outAbs . DIRECTORY_SEPARATOR . $relativeOutput;
         @mkdir(dirname($dest), 0777, true);
         $exit = run_subprocess(
             [$phpBin, '-n', '-d', "extension={$opdumpSo}", '-l', $file],
-            ['OPDUMP_MODE' => 'dump', 'OPDUMP_OUT' => $dest]
+            $dumpEnv + ['OPDUMP_OUT' => $dest]
         );
         if ($exit !== 0) {
             fail("dump failed for {$file}");
@@ -294,14 +373,17 @@ function dump_one(
 
         $exit = run_subprocess(
             [$phpBin, '-n', '-d', "extension={$opdumpSo}", '-l', $file],
-            ['OPDUMP_MODE' => 'dump', 'OPDUMP_OUT' => $rawTmp]
+            $dumpEnv + ['OPDUMP_OUT' => $rawTmp]
         );
         if ($exit !== 0) {
             unlink($rawTmp);
             fail("dump failed for {$file}");
         }
 
-        $exit = run_subprocess([$phpBin, $packer, $rawTmp, $dest], []);
+        $exit = run_subprocess(
+            [$phpBin, $packer, $rawTmp, $dest],
+            $dekHex !== null ? ['BYTECODE_DEK' => $dekHex] : []
+        );
         unlink($rawTmp);
         if ($exit !== 0) {
             fail("pack failed for {$file}");
@@ -316,7 +398,7 @@ function dump_one(
             'output' => $relBytc,
             'php_version_id' => $phpVersionId,
             'backend' => 'php-zend-opdump',
-            'container' => 'BYTC1',
+            'container' => 'BYTC2',
             'sha256' => $sha,
             'size' => $size,
         ];
@@ -339,7 +421,7 @@ foreach ($sourceAbsList as $srcAbs) {
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $phpVersionId, $manifestFiles, $mapLines);
+        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $manifestFiles, $mapLines);
         continue;
     }
 
@@ -359,7 +441,7 @@ foreach ($sourceAbsList as $srcAbs) {
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $phpVersionId, $manifestFiles, $mapLines);
+        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $manifestFiles, $mapLines);
     }
 }
 
@@ -368,7 +450,7 @@ if (!$raw) {
         'format' => 'bytecode-manifest-v1',
         'php_version_id' => $phpVersionId,
         'backend' => 'php-zend-opdump',
-        'container' => 'BYTC1',
+        'container' => 'BYTC2',
         'source_root' => str_replace('\\', '/', $relativeBase),
         'source_roots' => array_map(static fn (string $source): string => str_replace('\\', '/', $source), $sourceAbsList),
         'map' => 'bytecode.map',
@@ -383,4 +465,30 @@ if (!$raw) {
         $outAbs . DIRECTORY_SEPARATOR . 'bytecode.map',
         implode("\n", $mapLines) . ($mapLines ? "\n" : '')
     );
+
+    if ($ikmHex !== '') {
+        $manifestBytes = file_get_contents($outAbs . DIRECTORY_SEPARATOR . 'bytecode.manifest.json');
+        $mapBytes = file_get_contents($outAbs . DIRECTORY_SEPARATOR . 'bytecode.map');
+        $sigKey = hash_hkdf('sha256', hex2bin($ikmHex), 32, 'bytecode-manifest-auth', '');
+        $sig = hash_hmac('sha256', $manifestBytes . "\0" . $mapBytes, $sigKey);
+        file_put_contents(
+            $outAbs . DIRECTORY_SEPARATOR . 'bytecode.manifest.sig',
+            $sig . "\n"
+        );
+    }
+
+    if ($dekHex !== null) {
+        $wrappedDek = openssl_rsa_oaep_sha256_wrap($licensePubkey, hex2bin($dekHex));
+        $license = [
+            'format' => 'bytecode-license-v1',
+            'alg' => 'RSA-OAEP-SHA256',
+            'key_id' => bin2hex(random_bytes(8)),
+            'wrapped_dek' => base64_encode($wrappedDek),
+        ];
+        file_put_contents(
+            $outAbs . DIRECTORY_SEPARATOR . 'bytecode.license.json',
+            json_encode($license, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+        );
+        fwrite(STDOUT, "wrote {$outAbs}" . DIRECTORY_SEPARATOR . "bytecode.license.json (RSA-OAEP-SHA256-wrapped DEK)\n");
+    }
 }
