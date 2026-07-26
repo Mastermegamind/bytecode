@@ -45,6 +45,10 @@
 # include <sys/mman.h>
 #endif
 
+#ifndef OPDUMP_VENDOR_SECRET_HEX
+# define OPDUMP_VENDOR_SECRET_HEX ""
+#endif
+
 #ifndef ZEND_HASH_MAP_FOREACH_PTR
 # define ZEND_HASH_MAP_FOREACH_PTR ZEND_HASH_FOREACH_PTR
 #endif
@@ -401,6 +405,15 @@ static bool opdump_key_from_env(unsigned char key[32])
     return true;
 }
 
+static bool opdump_vendor_key(unsigned char key[32])
+{
+    const char *hex = OPDUMP_VENDOR_SECRET_HEX;
+    if (!hex || !hex[0] || strlen(hex) != 64) {
+        return false;
+    }
+    return opdump_hex_decode(hex, key, 32);
+}
+
 /* RFC 5869 HKDF-SHA256, fixed 32-byte output (== one HMAC-SHA256 block, so
  * Expand needs exactly T(1); no need for the general multi-block loop). Must
  * match PHP's hash_hkdf('sha256', $ikm, 32, $info, $salt) bit for bit --
@@ -436,6 +449,7 @@ static bool opdump_hkdf_sha256(
 
 /* Defined further down (needs the path-joining helpers below it). */
 static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[32]);
+static const char *opdump_current_container_path = NULL;
 
 /* Resolves the IKM (input keying material) used to derive BYTC2+ per-container
  * keys. If OPDUMP_LICENSE_KEY_FILE is set, license mode is what the caller
@@ -450,7 +464,10 @@ static bool opdump_resolve_ikm(unsigned char ikm[32])
     if (key_file && key_file[0]) {
         return opdump_license_resolve_ikm(key_file, ikm);
     }
-    return opdump_key_from_env(ikm);
+    if (opdump_key_from_env(ikm)) {
+        return true;
+    }
+    return opdump_vendor_key(ikm);
 }
 
 static uint32_t opdump_le32(const unsigned char *p)
@@ -902,10 +919,15 @@ static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[3
             derived_path = opdump_join_path(map_dir, "bytecode.license.json");
             free(map_dir);
             license_file = derived_path;
+        } else if (opdump_current_container_path && opdump_current_container_path[0]) {
+            char *container_dir = opdump_dirname_dup(opdump_current_container_path);
+            derived_path = opdump_join_path(container_dir, "bytecode.license.json");
+            free(container_dir);
+            license_file = derived_path;
         }
     }
     if (!license_file || !license_file[0]) {
-        php_error_docref(NULL, E_WARNING, "opdump: OPDUMP_LICENSE_KEY_FILE set but no OPDUMP_LICENSE_FILE and no OPDUMP_MAP to derive one from");
+        php_error_docref(NULL, E_WARNING, "opdump: OPDUMP_LICENSE_KEY_FILE set but no OPDUMP_LICENSE_FILE, OPDUMP_MAP, or adjacent bytecode.license.json to derive one from");
         free(derived_path);
         return false;
     }
@@ -916,6 +938,19 @@ static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[3
         free(derived_path);
         return false;
     }
+
+    char *machine_id = opdump_json_extract_string(json, "machine_id");
+    if (machine_id && machine_id[0]) {
+        const char *actual_machine_id = getenv("OPDUMP_MACHINE_ID");
+        if (!actual_machine_id || strcmp(machine_id, actual_machine_id) != 0) {
+            php_error_docref(NULL, E_WARNING, "opdump: license machine_id does not match this server");
+            free(machine_id);
+            free(json);
+            free(derived_path);
+            return false;
+        }
+    }
+    free(machine_id);
 
     char *wrapped_b64 = opdump_json_extract_string(json, "wrapped_dek");
     free(json);
@@ -1843,7 +1878,11 @@ static zend_op_array *opdump_read(const char *path)
     bool payload_owned = false;
 
     if (memcmp(blob, "BYTC", 4) == 0) {
-        if (!opdump_decrypt_bytc(blob, blob_len, &payload, &payload_len)) {
+        const char *previous_container_path = opdump_current_container_path;
+        opdump_current_container_path = path;
+        bool decrypted = opdump_decrypt_bytc(blob, blob_len, &payload, &payload_len);
+        opdump_current_container_path = previous_container_path;
+        if (!decrypted) {
             free(blob);
             return NULL;
         }

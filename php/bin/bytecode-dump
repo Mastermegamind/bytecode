@@ -38,7 +38,10 @@ Options:
   --out <dir>, -o <dir>         Output directory. Alternative to final positional argument.
   --key <hex>                   64-hex shared key. Same as BYTECODE_KEY.
   --opdump-key <hex>            64-hex legacy/shared key. Same as OPDUMP_KEY.
+  --vendor-key <hex>            64-hex vendor key compiled into your custom loader.
   --license-pubkey <path>       Encode in license mode with this RSA public key.
+  --machine-id <id>             License mode only: bind bytecode.license.json
+                                to OPDUMP_MACHINE_ID on the server.
   --php-bin <path>              PHP binary used to compile source. Same as PHP_BIN.
   --opdump-so <path>            Loader extension path. Same as OPDUMP_SO.
   -h, --help                    Show this help.
@@ -54,6 +57,9 @@ Environment:
                When set, one random DEK is generated for this whole run and
                RSA-OAEP-SHA256-wrapped into bytecode.license.json instead of
                using BYTECODE_KEY/OPDUMP_KEY directly.
+  BYTECODE_VENDOR_KEY
+               64 hex chars matching --with-opdump-vendor-secret at loader
+               build time; avoids server-side BYTECODE_KEY configuration.
 
 USAGE);
 }
@@ -295,7 +301,9 @@ $phpBinOption = null;
 $opdumpSoOption = null;
 $bytecodeKeyOption = null;
 $opdumpKeyOption = null;
+$vendorKeyOption = null;
 $licensePubkeyOption = null;
+$machineIdOption = null;
 while ($args) {
     $a = $args[0];
     if ($a === '--raw') {
@@ -364,12 +372,30 @@ while ($args) {
         array_shift($args);
         continue;
     }
+    if ($a === '--vendor-key') {
+        $vendorKeyOption = take_option_value($args, '--vendor-key');
+        continue;
+    }
+    if (str_starts_with($a, '--vendor-key=')) {
+        $vendorKeyOption = substr($a, strlen('--vendor-key='));
+        array_shift($args);
+        continue;
+    }
     if ($a === '--license-pubkey') {
         $licensePubkeyOption = take_option_value($args, '--license-pubkey');
         continue;
     }
     if (str_starts_with($a, '--license-pubkey=')) {
         $licensePubkeyOption = substr($a, strlen('--license-pubkey='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--machine-id') {
+        $machineIdOption = take_option_value($args, '--machine-id');
+        continue;
+    }
+    if (str_starts_with($a, '--machine-id=')) {
+        $machineIdOption = substr($a, strlen('--machine-id='));
         array_shift($args);
         continue;
     }
@@ -461,6 +487,10 @@ function php_version_id(string $phpBin): int
 $phpVersionId = php_version_id($phpBin);
 
 $licensePubkey = $licensePubkeyOption ?: (getenv('BYTECODE_LICENSE_PUBKEY') ?: null);
+$machineId = $machineIdOption ?: (getenv('BYTECODE_MACHINE_ID') ?: null);
+if (($machineId !== null && $machineId !== '') && ($licensePubkey === null || $licensePubkey === '')) {
+    fail('--machine-id requires --license-pubkey / BYTECODE_LICENSE_PUBKEY', 2);
+}
 $dekHex = null;
 if ($licensePubkey !== null && $licensePubkey !== '') {
     if (!is_file($licensePubkey)) {
@@ -474,9 +504,9 @@ if ($licensePubkey !== null && $licensePubkey !== '') {
 // and opdump_resolve_ikm() in php/src/opdump.c); used again below to sign
 // bytecode.manifest.json + bytecode.map so tampering with the map's source-to-
 // container wiring is detectable, not just tampering with a single container.
-$ikmHex = $dekHex ?? ($bytecodeKeyOption ?: $opdumpKeyOption ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '');
+$ikmHex = $dekHex ?? ($bytecodeKeyOption ?: $opdumpKeyOption ?: $vendorKeyOption ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: '');
 if (!$raw && $dekHex === null && !preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
-    fail('a 64-hex key is required; pass --key, set BYTECODE_KEY, or use --license-pubkey', 2);
+    fail('a 64-hex key is required; pass --key, --vendor-key, set BYTECODE_KEY/BYTECODE_VENDOR_KEY, or use --license-pubkey', 2);
 }
 
 $manifestFiles = [];
@@ -691,11 +721,16 @@ foreach ($sourceAbsList as $srcAbs) {
 }
 
 if (!$raw) {
+    $protectionMode = $dekHex !== null
+        ? (($machineId !== null && $machineId !== '') ? 'license-machine' : 'license')
+        : (($vendorKeyOption ?: getenv('BYTECODE_VENDOR_KEY') ?: '') !== '' ? 'vendor' : 'shared-key');
+
     $manifest = [
         'format' => 'bytecode-manifest-v1',
         'php_version_id' => $phpVersionId,
         'backend' => 'php-zend-opdump',
         'container' => 'BYTC2',
+        'protection_mode' => $protectionMode,
         'source_root' => str_replace('\\', '/', $relativeBase),
         'source_roots' => array_map(static fn (string $source): string => str_replace('\\', '/', $source), $sourceAbsList),
         'map' => 'bytecode.map',
@@ -738,6 +773,9 @@ if (!$raw) {
             'key_id' => bin2hex(random_bytes(8)),
             'wrapped_dek' => base64_encode($wrappedDek),
         ];
+        if ($machineId !== null && $machineId !== '') {
+            $license['machine_id'] = $machineId;
+        }
         file_put_contents(
             $outAbs . DIRECTORY_SEPARATOR . 'bytecode.license.json',
             json_encode($license, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"

@@ -3,7 +3,25 @@ PHP_ARG_ENABLE([opdump],
   [AS_HELP_STRING([--enable-opdump], [Enable opdump (Phase 0 bytecode dump/reload spike)])],
   [yes])
 
+PHP_ARG_WITH([opdump-vendor-secret],
+  [vendor secret hex compiled into the opdump loader],
+  [AS_HELP_STRING([--with-opdump-vendor-secret=HEX], [Compile a 64-hex vendor secret fallback into the loader])],
+  [no],
+  [no])
+
 if test "$PHP_OPDUMP" != "no"; then
+  if test "$PHP_OPDUMP_VENDOR_SECRET" != "no" && test -n "$PHP_OPDUMP_VENDOR_SECRET"; then
+    case "$PHP_OPDUMP_VENDOR_SECRET" in
+      *[!0123456789abcdefABCDEF]*)
+        AC_MSG_ERROR([--with-opdump-vendor-secret must be 64 hex characters])
+        ;;
+    esac
+    if test ${#PHP_OPDUMP_VENDOR_SECRET} -ne 64; then
+      AC_MSG_ERROR([--with-opdump-vendor-secret must be 64 hex characters])
+    fi
+    AC_DEFINE_UNQUOTED([OPDUMP_VENDOR_SECRET_HEX], ["$PHP_OPDUMP_VENDOR_SECRET"], [64-hex vendor secret compiled into the loader])
+  fi
+
   AC_PATH_PROG([PKG_CONFIG], [pkg-config])
   if test -n "$PKG_CONFIG" && $PKG_CONFIG --exists openssl; then
     OPDUMP_OPENSSL_CFLAGS=`$PKG_CONFIG --cflags openssl`

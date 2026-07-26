@@ -3,7 +3,8 @@
 
 if ($argc !== 3 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
     fwrite(STDERR, "Usage: bytecode-pack <raw-opd2-blob> <container-output>\n");
-    fwrite(STDERR, "\nEnvironment:\n  BYTECODE_DEK, BYTECODE_KEY, or OPDUMP_KEY  64 hex chars / 32 bytes\n");
+    fwrite(STDERR, "\nEnvironment:\n  BYTECODE_DEK, BYTECODE_KEY, OPDUMP_KEY, or BYTECODE_VENDOR_KEY\n");
+    fwrite(STDERR, "    64 hex chars / 32 bytes.\n");
     fwrite(STDERR, "    Treated as HKDF-SHA256 input keying material (IKM); the actual\n");
     fwrite(STDERR, "    AES-256-GCM key is derived per file from a random key_id salt.\n");
     fwrite(STDERR, "    BYTECODE_DEK (set internally by bytecode-dump in license mode)\n");
@@ -13,10 +14,10 @@ if ($argc !== 3 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
 
 $rawPath = $argv[1];
 $outPath = $argv[2];
-$hexKey = getenv('BYTECODE_DEK') ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '';
+$hexKey = getenv('BYTECODE_DEK') ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: '';
 
 if (!preg_match('/\\A[0-9a-fA-F]{64}\\z/', $hexKey)) {
-    fwrite(STDERR, "BYTECODE_DEK/BYTECODE_KEY/OPDUMP_KEY must be exactly 64 hex characters\n");
+    fwrite(STDERR, "BYTECODE_DEK/BYTECODE_KEY/OPDUMP_KEY/BYTECODE_VENDOR_KEY must be exactly 64 hex characters\n");
     exit(1);
 }
 

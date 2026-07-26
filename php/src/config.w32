@@ -10,9 +10,16 @@
 // root, or pass --with-opdump=<path-to-vcpkg-installed-triplet>.
 
 ARG_ENABLE("opdump", "Enable opdump (Phase 0 bytecode dump/reload spike)", "no");
+ARG_WITH("opdump-vendor-secret", "64-hex vendor secret compiled into the opdump loader", "no");
 
 if (PHP_OPDUMP != "no") {
 	var openssl_dir = PHP_OPDUMP == "yes" ? "" : PHP_OPDUMP;
+	if (PHP_OPDUMP_VENDOR_SECRET != "no" && PHP_OPDUMP_VENDOR_SECRET != "") {
+		if (!PHP_OPDUMP_VENDOR_SECRET.match(/^[0-9a-fA-F]{64}$/)) {
+			ERROR("--with-opdump-vendor-secret must be 64 hex characters");
+		}
+		AC_DEFINE("OPDUMP_VENDOR_SECRET_HEX", "\"" + PHP_OPDUMP_VENDOR_SECRET + "\"", "64-hex vendor secret compiled into the loader");
+	}
 
 	if (openssl_dir && CHECK_HEADER_ADD_INCLUDE("openssl/evp.h", "CFLAGS_OPDUMP", openssl_dir + "\\include")
 			&& (CHECK_LIB("libcrypto.lib", "opdump", openssl_dir + "\\lib")
