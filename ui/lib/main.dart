@@ -118,6 +118,8 @@ class _EncoderPageState extends State<EncoderPage> {
   final _configController = TextEditingController();
   final _licensePubkeyController = TextEditingController();
   final _licenseKeyDirController = TextEditingController();
+  final _vendorSignKeyController = TextEditingController();
+  final _vendorKeyDirController = TextEditingController();
   final _inspectPathController = TextEditingController();
   final _packageVersionController = TextEditingController(text: '1.0.0');
   final _excludeController = TextEditingController(
@@ -150,6 +152,8 @@ class _EncoderPageState extends State<EncoderPage> {
     _configController.dispose();
     _licensePubkeyController.dispose();
     _licenseKeyDirController.dispose();
+    _vendorSignKeyController.dispose();
+    _vendorKeyDirController.dispose();
     _inspectPathController.dispose();
     _packageVersionController.dispose();
     _excludeController.dispose();
@@ -345,6 +349,7 @@ class _EncoderPageState extends State<EncoderPage> {
     final output = _outputController.text.trim();
     final key = _keyController.text.trim();
     final licensePubkey = _licensePubkeyController.text.trim();
+    final vendorSignKey = _vendorSignKeyController.text.trim();
     if (_sources.isEmpty || output.isEmpty) {
       setState(() => _status = 'At least one source and output are required');
       return;
@@ -367,6 +372,9 @@ class _EncoderPageState extends State<EncoderPage> {
         env['BYTECODE_LICENSE_PUBKEY'] = licensePubkey;
       } else if (!_rawContainers) {
         env['BYTECODE_KEY'] = key;
+      }
+      if (!_rawContainers && vendorSignKey.isNotEmpty) {
+        env['BYTECODE_VENDOR_SIGN_KEY'] = vendorSignKey;
       }
 
       final exit = await _runStreaming(_phpBinary(), [
@@ -420,10 +428,20 @@ class _EncoderPageState extends State<EncoderPage> {
     await _runLocked(() async {
       _status = 'Verifying';
       setState(() {});
+      // When a vendor sign key is configured, hand bytecode-verify the sibling
+      // public key so it checks the Ed25519 seal signature, not just digests.
+      final env = <String, String>{};
+      final vendorSignKey = _vendorSignKeyController.text.trim();
+      if (vendorSignKey.isNotEmpty) {
+        env['BYTECODE_VENDOR_PUBKEY'] = vendorSignKey.replaceAll(
+          RegExp(r'vendor\.sign\.key\.pem$'),
+          'vendor.sign.pub.pem',
+        );
+      }
       final result = await Process.run(_phpBinary(), [
         _join(_root, 'php/bin/bytecode-verify'),
         _manifestPath,
-      ], workingDirectory: _root);
+      ], workingDirectory: _root, environment: env.isEmpty ? null : env);
       _append(result.stdout.toString());
       _append(result.stderr.toString());
       if (result.exitCode != 0) {
@@ -475,6 +493,30 @@ class _EncoderPageState extends State<EncoderPage> {
       }
       _licensePubkeyController.text = _join(output, 'license.pub.pem');
       _status = 'License keys generated';
+    });
+  }
+
+  Future<void> _generateVendorKeys() async {
+    final output = _vendorKeyDirController.text.trim();
+    if (output.isEmpty) {
+      setState(() => _status = 'Choose a vendor key output folder');
+      return;
+    }
+
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Generating vendor signing keys';
+      setState(() {});
+      // Streams the compile-in hex (--with-opdump-vendor-pubkey) into the log.
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-vendor-keygen'),
+        output,
+      ]);
+      if (exit != 0) {
+        throw StateError('vendor key generation exited with $exit');
+      }
+      _vendorSignKeyController.text = _join(output, 'vendor.sign.key.pem');
+      _status = 'Vendor signing keys generated';
     });
   }
 
@@ -640,6 +682,8 @@ class _EncoderPageState extends State<EncoderPage> {
               configController: _configController,
               licensePubkeyController: _licensePubkeyController,
               licenseKeyDirController: _licenseKeyDirController,
+              vendorSignKeyController: _vendorSignKeyController,
+              vendorKeyDirController: _vendorKeyDirController,
               inspectPathController: _inspectPathController,
               packageVersionController: _packageVersionController,
               excludeController: _excludeController,
@@ -655,6 +699,8 @@ class _EncoderPageState extends State<EncoderPage> {
               onPickConfig: () => _pickFile(_configController),
               onPickLicensePubkey: () => _pickFile(_licensePubkeyController),
               onPickLicenseKeyDir: () => _pickFolder(_licenseKeyDirController),
+              onPickVendorSignKey: () => _pickFile(_vendorSignKeyController),
+              onPickVendorKeyDir: () => _pickFolder(_vendorKeyDirController),
               onPickInspectPath: () => _pickFile(_inspectPathController),
               onAddFiles: _addFiles,
               onAddFolder: _addFolder,
@@ -662,6 +708,7 @@ class _EncoderPageState extends State<EncoderPage> {
               onClearSources: _clearSources,
               onGenerateKey: _generateKey,
               onGenerateLicenseKeys: _generateLicenseKeys,
+              onGenerateVendorKeys: _generateVendorKeys,
               onScan: _scanSources,
               onDump: _dump,
               onVerify: _verify,
@@ -869,6 +916,8 @@ class _Controls extends StatelessWidget {
     required this.configController,
     required this.licensePubkeyController,
     required this.licenseKeyDirController,
+    required this.vendorSignKeyController,
+    required this.vendorKeyDirController,
     required this.inspectPathController,
     required this.packageVersionController,
     required this.excludeController,
@@ -884,6 +933,8 @@ class _Controls extends StatelessWidget {
     required this.onPickConfig,
     required this.onPickLicensePubkey,
     required this.onPickLicenseKeyDir,
+    required this.onPickVendorSignKey,
+    required this.onPickVendorKeyDir,
     required this.onPickInspectPath,
     required this.onAddFiles,
     required this.onAddFolder,
@@ -891,6 +942,7 @@ class _Controls extends StatelessWidget {
     required this.onClearSources,
     required this.onGenerateKey,
     required this.onGenerateLicenseKeys,
+    required this.onGenerateVendorKeys,
     required this.onScan,
     required this.onDump,
     required this.onVerify,
@@ -915,6 +967,8 @@ class _Controls extends StatelessWidget {
   final TextEditingController configController;
   final TextEditingController licensePubkeyController;
   final TextEditingController licenseKeyDirController;
+  final TextEditingController vendorSignKeyController;
+  final TextEditingController vendorKeyDirController;
   final TextEditingController inspectPathController;
   final TextEditingController packageVersionController;
   final TextEditingController excludeController;
@@ -930,6 +984,8 @@ class _Controls extends StatelessWidget {
   final VoidCallback onPickConfig;
   final VoidCallback onPickLicensePubkey;
   final VoidCallback onPickLicenseKeyDir;
+  final VoidCallback onPickVendorSignKey;
+  final VoidCallback onPickVendorKeyDir;
   final VoidCallback onPickInspectPath;
   final VoidCallback onAddFiles;
   final VoidCallback onAddFolder;
@@ -937,6 +993,7 @@ class _Controls extends StatelessWidget {
   final VoidCallback onClearSources;
   final VoidCallback onGenerateKey;
   final VoidCallback onGenerateLicenseKeys;
+  final VoidCallback onGenerateVendorKeys;
   final VoidCallback onScan;
   final VoidCallback onDump;
   final VoidCallback onVerify;
@@ -1096,6 +1153,32 @@ class _Controls extends StatelessWidget {
                   tooltip: 'Generate license keys',
                   onPressed: busy ? null : onGenerateLicenseKeys,
                   icon: const Icon(Icons.key_outlined),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            _PathField(
+              label: 'Vendor sign key (Ed25519, seals builds)',
+              controller: vendorSignKeyController,
+              icon: Icons.gpp_good_outlined,
+              onPick: busy || rawContainers ? null : onPickVendorSignKey,
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
+                  child: _PathField(
+                    label: 'Vendor key folder',
+                    controller: vendorKeyDirController,
+                    icon: Icons.workspace_premium_outlined,
+                    onPick: busy ? null : onPickVendorKeyDir,
+                  ),
+                ),
+                const SizedBox(width: 10),
+                IconButton.filledTonal(
+                  tooltip: 'Generate vendor signing keys (prints compile-in hex to the log)',
+                  onPressed: busy ? null : onGenerateVendorKeys,
+                  icon: const Icon(Icons.enhanced_encryption_outlined),
                 ),
               ],
             ),

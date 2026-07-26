@@ -620,6 +620,8 @@ filled in after you run something).
 | **BYTECODE_KEY** field + sparkle icon (**Generate key**) | `bytecode-keygen`, and the `BYTECODE_KEY` env var for Dump/Verify. Disabled (greyed out) when **Raw** is selected, since raw mode needs no key. |
 | **License public key** field | `BYTECODE_LICENSE_PUBKEY` — set this (instead of a key) to dump in license mode; disabled under **Raw**. |
 | **License key folder** field + key icon (**Generate license keys**) | `bytecode-license-keygen <dir>` — writes `license.key.pem`/`license.pub.pem` into that folder and auto-fills **License public key** with the resulting `license.pub.pem`. |
+| **Vendor sign key** field | `BYTECODE_VENDOR_SIGN_KEY` — set this to write a `bytecode.seal.json` (Ed25519 vendor seal) alongside the build; disabled under **Raw**. When set, **Verify** also passes the sibling `vendor.sign.pub.pem` as `BYTECODE_VENDOR_PUBKEY` to check the seal signature. §3.7. |
+| **Vendor key folder** field + shield icon (**Generate vendor signing keys**) | `bytecode-vendor-keygen <dir>` — writes `vendor.sign.key.pem`/`vendor.sign.pub.pem`, auto-fills **Vendor sign key**, and streams the `--with-opdump-vendor-pubkey` compile-in hex into the log pane. |
 | **Exclude globs** field | Comma-separated list, split into repeated `--exclude` flags. Pre-filled with `.history/*, vendor/*, storage/*, node_modules/*`. |
 | **Scan** button | Runs `bytecode-scan` standalone (no dump) over the current source list. |
 | **Dump** button | Runs `bytecode-dump` with every option above, then loads the resulting manifest into the Artifacts table. |

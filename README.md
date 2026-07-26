@@ -125,6 +125,8 @@ workflow:
 - `bytecode-verify`: verify manifests, hashes, sizes, map entries, and
   signatures.
 - `bytecode-license-keygen`: generate RSA license keys.
+- `bytecode-vendor-keygen`: generate the vendor Ed25519 signing keypair used to
+  seal packages (tamper-proof licensing); prints the compile-in public-key hex.
 - `bytecode-scan`: preflight source scanner for dynamic PHP hazards.
 
 The scanner was inspired by Yakpro PO's practical PHP-obfuscation lessons. It
