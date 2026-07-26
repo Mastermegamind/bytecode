@@ -553,6 +553,14 @@ sudo php8.4 php/bin/bytecode-install-loader --php-version 8.4 --sapi cli,fpm
 `--dry-run` prints every command it would run without executing anything —
 use it first to see exactly what it's going to touch.
 
+The installer replaces the `.so` **atomically** (stages `<name>.new`, then
+renames it over the target) and then **restarts** the services for the `fpm`
+and `apache2` SAPIs you passed to `--sapi` (e.g. `php8.4-fpm`, `apache2`) so
+they load the new loader. This matters: overwriting the `.so` in place while a
+running php-fpm/apache still has it memory-mapped corrupts that process and
+segfaults its workers (a site-wide `503` until restart). Pass `--no-restart`
+to manage the restart yourself; `cli` never needs one.
+
 **Two gotchas specific to a system install, both confirmed while writing
 this guide:**
 

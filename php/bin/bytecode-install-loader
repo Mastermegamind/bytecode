@@ -20,10 +20,16 @@ Options:
   --ini-name <name>       Debian mods-available ini base name. Default: bytecode.
   --sapi <list>           Comma list for phpenmod. Default: cli. Example: cli,fpm,apache2
   --no-enable             Do not run phpenmod.
+  --no-restart            Do not restart php-fpm/apache2 after installing.
   --build-only            Build the loader but do not copy/write/enable system files.
   --no-sudo               Do not prefix privileged operations with sudo.
   --dry-run               Print commands without running them.
   -h, --help              Show this help.
+
+After installing, the fpm/apache2 SAPIs listed in --sapi are restarted so they
+load the new loader (the .so is replaced atomically, so a running service keeps
+serving on the old one until it is restarted -- overwriting it in place would
+corrupt the mapping of the live process). Use --no-restart to skip this.
 
 Examples:
   php8.4 php/bin/bytecode-install-loader --php-version 8.4
@@ -150,6 +156,7 @@ $opts = [
     'ini-name' => 'bytecode',
     'sapi' => 'cli',
     'enable' => true,
+    'restart' => true,
     'build-only' => false,
     'no-sudo' => false,
     'dry-run' => false,
@@ -166,6 +173,8 @@ while ($args) {
 
     if ($arg === '--no-enable') {
         $opts['enable'] = false;
+    } elseif ($arg === '--no-restart') {
+        $opts['restart'] = false;
     } elseif ($arg === '--build-only') {
         $opts['build-only'] = true;
     } elseif ($arg === '--no-sudo') {
@@ -245,7 +254,19 @@ $target = rtrim($targetDir, DIRECTORY_SEPARATOR) . DIRECTORY_SEPARATOR . (string
 $sudo = sudo_prefix((bool) $opts['no-sudo']);
 
 fwrite(STDOUT, PHP_EOL . "== Install Zend extension ==\n");
-foreach ([[...$sudo, 'mkdir', '-p', $targetDir], [...$sudo, 'cp', $built, $target], [...$sudo, 'chmod', '755', $target]] as $cmd) {
+// Replace the .so atomically: stage it next to the target, then rename over the
+// old one. rename(2) swaps the directory entry to a new inode, so a running
+// php-fpm/apache that still has the previous .so mmap'd keeps using that intact
+// file until it restarts. Overwriting in place (cp over the live file) instead
+// corrupts the running process's mapping and segfaults its workers on the next
+// compile -- which is exactly why a restart is needed below.
+$targetNew = $target . '.new';
+foreach ([
+    [...$sudo, 'mkdir', '-p', $targetDir],
+    [...$sudo, 'cp', $built, $targetNew],
+    [...$sudo, 'chmod', '755', $targetNew],
+    [...$sudo, 'mv', '-f', $targetNew, $target],
+] as $cmd) {
     $exit = run($cmd, null, [], true, $dryRun);
     if ($exit !== 0) {
         fail('install failed', $exit);
@@ -271,6 +292,41 @@ if (is_dir($modsAvailable) || $dryRun) {
 } else {
     fwrite(STDOUT, "No Debian mods-available dir found at {$modsAvailable}.\n");
     fwrite(STDOUT, "Add this line to your php.ini instead:\n{$iniLine}");
+}
+
+// Restart the SAPIs that run the loader so they load the freshly built .so.
+// The atomic replace above means the old workers keep serving on the previous
+// .so until now, so this is a clean cutover rather than a crash recovery -- but
+// without it, a running fpm/apache would keep running the old loader (and an
+// encoded file built for a new key would fail to decode). cli needs no restart.
+if ($opts['restart']) {
+    $sapis = array_filter(array_map('trim', explode(',', (string) $opts['sapi'])));
+    $services = [];
+    foreach ($sapis as $sapi) {
+        $service = match ($sapi) {
+            'fpm' => "php{$minor}-fpm",
+            'apache2' => 'apache2',
+            default => null, // cli (and anything else) has no long-lived service to restart
+        };
+        if ($service !== null) {
+            $services[$service] = true;
+        }
+    }
+    if ($services !== []) {
+        fwrite(STDOUT, PHP_EOL . "== Restart services (load the new loader) ==\n");
+        if (!command_exists('systemctl')) {
+            fwrite(STDOUT, "systemctl not found -- restart these manually: " . implode(', ', array_keys($services)) . "\n");
+        } else {
+            foreach (array_keys($services) as $service) {
+                $exit = run([...$sudo, 'systemctl', 'restart', $service], null, [], true, $dryRun);
+                if ($exit !== 0) {
+                    // Don't abort: the install itself succeeded; the operator can
+                    // restart by hand. Failing here would leave a confusing state.
+                    fwrite(STDERR, "warning: could not restart {$service} -- restart it manually so the new loader is used\n");
+                }
+            }
+        }
+    }
 }
 
 fwrite(STDOUT, PHP_EOL . "== Verify ==\n");
