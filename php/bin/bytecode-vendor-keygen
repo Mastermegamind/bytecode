@@ -1,0 +1,105 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Generates the vendor Ed25519 SIGNING keypair used to seal encoded packages.
+ *
+ *   <output-dir>/vendor.sign.key.pem   private key -- the vendor keeps this
+ *                                      secret and NEVER ships it. bytecode-dump
+ *                                      signs bytecode.seal.json with it.
+ *   <output-dir>/vendor.sign.pub.pem   public key -- the loader's trust anchor.
+ *
+ * The public key's raw 32 bytes are also printed as 64 hex chars so you can
+ * compile it into your custom loader:
+ *
+ *   ./configure --with-opdump-vendor-pubkey=<64hex> ...
+ *
+ * or drop the PEM on the server and point OPDUMP_VENDOR_PUBKEY_FILE at it.
+ *
+ * Ed25519 signing is a one-shot over the raw message with no prehash, which
+ * PHP's openssl_sign()/OPENSSL_ALGO_* cannot express, so this shells out to the
+ * openssl CLI -- the same reason bytecode-dump's RSA-OAEP-SHA256 wrap does.
+ */
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+function run(array $cmd, ?string $stdin = null): array
+{
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if ($proc === false) {
+        fail('failed to start: ' . implode(' ', $cmd));
+    }
+    if ($stdin !== null) {
+        fwrite($pipes[0], $stdin);
+    }
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($proc);
+    return [$exit, $stdout, $stderr];
+}
+
+if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-vendor-keygen <output-dir>\n");
+    fwrite(STDERR, "\nGenerates the vendor Ed25519 signing keypair for BYTC2 package sealing:\n");
+    fwrite(STDERR, "  <output-dir>/vendor.sign.key.pem  private key (chmod 600) -- keep secret,\n");
+    fwrite(STDERR, "                                    sign builds with BYTECODE_VENDOR_SIGN_KEY\n");
+    fwrite(STDERR, "  <output-dir>/vendor.sign.pub.pem  public key -- the loader trust anchor\n");
+    fwrite(STDERR, "\nAlso prints the 64-hex raw public key for --with-opdump-vendor-pubkey.\n");
+    exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
+}
+
+$outDir = rtrim($argv[1], DIRECTORY_SEPARATOR);
+if (!is_dir($outDir) && !@mkdir($outDir, 0777, true) && !is_dir($outDir)) {
+    fail("cannot create output directory: {$outDir}");
+}
+
+$privatePath = $outDir . DIRECTORY_SEPARATOR . 'vendor.sign.key.pem';
+$publicPath = $outDir . DIRECTORY_SEPARATOR . 'vendor.sign.pub.pem';
+
+if (file_exists($privatePath) || file_exists($publicPath)) {
+    fail("refusing to overwrite existing key material in {$outDir}");
+}
+
+[$exit, $privatePem, $stderr] = run(['openssl', 'genpkey', '-algorithm', 'ed25519']);
+if ($exit !== 0 || !str_contains($privatePem, 'PRIVATE KEY')) {
+    fail('openssl genpkey (ed25519) failed -- is the openssl CLI installed and Ed25519-capable?' . PHP_EOL . $stderr);
+}
+
+if (file_put_contents($privatePath, $privatePem) === false) {
+    fail("cannot write {$privatePath}");
+}
+chmod($privatePath, 0600);
+
+[$exit, $publicPem, $stderr] = run(['openssl', 'pkey', '-pubout'], $privatePem);
+if ($exit !== 0 || !str_contains($publicPem, 'PUBLIC KEY')) {
+    @unlink($privatePath);
+    fail('openssl pkey -pubout failed' . PHP_EOL . $stderr);
+}
+if (file_put_contents($publicPath, $publicPem) === false) {
+    @unlink($privatePath);
+    fail("cannot write {$publicPath}");
+}
+
+// Raw 32-byte public key for compile-in: the Ed25519 SubjectPublicKeyInfo DER
+// is a fixed 44 bytes -- a 12-byte algorithm-identifier prefix followed by the
+// 32-byte key -- so the raw key is the DER's last 32 bytes.
+[$exit, $publicDer, $stderr] = run(['openssl', 'pkey', '-pubout', '-outform', 'DER'], $privatePem);
+if ($exit !== 0 || strlen($publicDer) !== 44) {
+    fail('could not extract raw Ed25519 public key' . PHP_EOL . $stderr);
+}
+$rawHex = bin2hex(substr($publicDer, 12, 32));
+
+fwrite(STDOUT, "wrote {$privatePath} (KEEP SECRET -- sign builds via BYTECODE_VENDOR_SIGN_KEY)\n");
+fwrite(STDOUT, "wrote {$publicPath} (loader trust anchor -- OPDUMP_VENDOR_PUBKEY_FILE)\n");
+fwrite(STDOUT, "\nCompile this raw public key into your loader for the strongest anchor:\n");
+fwrite(STDOUT, "  ./configure --with-opdump-vendor-pubkey={$rawHex} ...\n");

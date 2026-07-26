@@ -39,9 +39,29 @@ Options:
   --key <hex>                   64-hex shared key. Same as BYTECODE_KEY.
   --opdump-key <hex>            64-hex legacy/shared key. Same as OPDUMP_KEY.
   --vendor-key <hex>            64-hex vendor key compiled into your custom loader.
+  --vendor-sign-key <path>      Ed25519 private key (bytecode-vendor-keygen) used
+                                to write bytecode.seal.json -- a vendor signature
+                                over manifest+map+license. A loader built/config-
+                                ured with the matching public key refuses any
+                                package whose files or license rules were altered.
   --license-pubkey <path>       Encode in license mode with this RSA public key.
   --machine-id <id>             License mode only: bind bytecode.license.json
                                 to OPDUMP_MACHINE_ID on the server.
+  --domains <csv>               License mode: allowed HTTP_HOST/SERVER_NAME values.
+  --ips <csv>                   License mode: allowed SERVER_ADDR values.
+  --hostnames <csv>             License mode: allowed system hostnames.
+  --fingerprints <csv>          License mode: allowed OPDUMP_MACHINE_FINGERPRINT values.
+  --expires-at <YYYY-MM-DD>     License mode: UTC expiry date.
+  --license-id <id>             License/customer tracking and revocation id.
+  --customer-id <id>            Customer id metadata.
+  --features <csv>              Feature flag metadata.
+  --watermark <text>            Encrypted/customer watermark metadata.
+  --activation-url <url>        Online activation endpoint metadata.
+  --activation-token <token>    Require matching OPDUMP_ACTIVATION_TOKEN.
+  --revocation-url <url>        Revocation endpoint metadata.
+  --unlock-policy <policy>      Metadata/enforcement policy name.
+  --strip-paths                 Store virtual filenames in bytecode metadata.
+  --virtual-root <prefix>       Prefix for --strip-paths. Default: bytecode://
   --php-bin <path>              PHP binary used to compile source. Same as PHP_BIN.
   --opdump-so <path>            Loader extension path. Same as OPDUMP_SO.
   -h, --help                    Show this help.
@@ -60,6 +80,10 @@ Environment:
   BYTECODE_VENDOR_KEY
                64 hex chars matching --with-opdump-vendor-secret at loader
                build time; avoids server-side BYTECODE_KEY configuration.
+  BYTECODE_VENDOR_SIGN_KEY
+               Path to the vendor Ed25519 private key (bytecode-vendor-keygen).
+               Same as --vendor-sign-key. When set, bytecode.seal.json is
+               written and the package is bound to your vendor public key.
 
 USAGE);
 }
@@ -284,6 +308,64 @@ function openssl_rsa_oaep_sha256_wrap(string $publicKeyPath, string $plaintext):
     return $stdout;
 }
 
+/**
+ * Ed25519-signs $message with the vendor private key via the openssl CLI.
+ * Ed25519 is a one-shot signature over the raw message (no prehash), which
+ * PHP's openssl_sign()/OPENSSL_ALGO_* cannot express -- so, like the RSA-OAEP
+ * wrap above, this shells out to `openssl pkeyutl -sign -rawin`. The loader
+ * verifies the resulting 64-byte signature with EVP_DigestVerify (Ed25519).
+ */
+function openssl_ed25519_sign(string $privateKeyPath, string $message): string
+{
+    // Ed25519 is a one-shot signature and `openssl pkeyutl -sign -rawin` needs a
+    // seekable input to size it -- a pipe fails with "unable to determine file
+    // size for oneshot operation" -- so the message goes through a temp file.
+    $msgTmp = tempnam(sys_get_temp_dir(), 'seal-msg');
+    if ($msgTmp === false || file_put_contents($msgTmp, $message) === false) {
+        fail('cannot create temporary file for Ed25519 sign');
+    }
+    $cmd = ['openssl', 'pkeyutl', '-sign', '-inkey', $privateKeyPath, '-rawin', '-in', $msgTmp];
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if ($proc === false) {
+        @unlink($msgTmp);
+        fail('failed to start openssl pkeyutl for Ed25519 sign');
+    }
+    fclose($pipes[0]);
+    $stdout = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    $stderr = stream_get_contents($pipes[2]);
+    fclose($pipes[2]);
+    $exit = proc_close($proc);
+    @unlink($msgTmp);
+
+    if ($exit !== 0 || strlen($stdout) !== 64) {
+        fwrite(STDERR, $stderr);
+        fail('openssl pkeyutl Ed25519 sign failed -- is the vendor sign key a valid Ed25519 PEM (see bytecode-vendor-keygen)?');
+    }
+    return $stdout;
+}
+
+/** Raw 32-byte Ed25519 public key derived from a private key PEM, as 64 hex chars. */
+function ed25519_pubkey_hex(string $privateKeyPath): string
+{
+    $cmd = ['openssl', 'pkey', '-in', $privateKeyPath, '-pubout', '-outform', 'DER'];
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = proc_open($cmd, $descriptors, $pipes);
+    if ($proc === false) {
+        fail('failed to start openssl pkey for Ed25519 public key extraction');
+    }
+    fclose($pipes[0]);
+    $der = stream_get_contents($pipes[1]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    $exit = proc_close($proc);
+    if ($exit !== 0 || strlen($der) !== 44) {
+        fail('could not derive Ed25519 public key from vendor sign key');
+    }
+    return bin2hex(substr($der, 12, 32));
+}
+
 $args = array_slice($argv, 1);
 if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
     usage();
@@ -302,8 +384,24 @@ $opdumpSoOption = null;
 $bytecodeKeyOption = null;
 $opdumpKeyOption = null;
 $vendorKeyOption = null;
+$vendorSignKeyOption = null;
 $licensePubkeyOption = null;
 $machineIdOption = null;
+$domainsOption = null;
+$ipsOption = null;
+$hostnamesOption = null;
+$fingerprintsOption = null;
+$expiresAtOption = null;
+$licenseIdOption = null;
+$customerIdOption = null;
+$featuresOption = null;
+$watermarkOption = null;
+$activationUrlOption = null;
+$activationTokenOption = null;
+$revocationUrlOption = null;
+$unlockPolicyOption = null;
+$stripPaths = false;
+$virtualRootOption = null;
 while ($args) {
     $a = $args[0];
     if ($a === '--raw') {
@@ -381,6 +479,15 @@ while ($args) {
         array_shift($args);
         continue;
     }
+    if ($a === '--vendor-sign-key') {
+        $vendorSignKeyOption = take_option_value($args, '--vendor-sign-key');
+        continue;
+    }
+    if (str_starts_with($a, '--vendor-sign-key=')) {
+        $vendorSignKeyOption = substr($a, strlen('--vendor-sign-key='));
+        array_shift($args);
+        continue;
+    }
     if ($a === '--license-pubkey') {
         $licensePubkeyOption = take_option_value($args, '--license-pubkey');
         continue;
@@ -396,6 +503,37 @@ while ($args) {
     }
     if (str_starts_with($a, '--machine-id=')) {
         $machineIdOption = substr($a, strlen('--machine-id='));
+        array_shift($args);
+        continue;
+    }
+    foreach ([
+        '--domains' => 'domainsOption',
+        '--ips' => 'ipsOption',
+        '--hostnames' => 'hostnamesOption',
+        '--fingerprints' => 'fingerprintsOption',
+        '--expires-at' => 'expiresAtOption',
+        '--license-id' => 'licenseIdOption',
+        '--customer-id' => 'customerIdOption',
+        '--features' => 'featuresOption',
+        '--watermark' => 'watermarkOption',
+        '--activation-url' => 'activationUrlOption',
+        '--activation-token' => 'activationTokenOption',
+        '--revocation-url' => 'revocationUrlOption',
+        '--unlock-policy' => 'unlockPolicyOption',
+        '--virtual-root' => 'virtualRootOption',
+    ] as $optName => $varName) {
+        if ($a === $optName) {
+            $$varName = take_option_value($args, $optName);
+            continue 2;
+        }
+        if (str_starts_with($a, $optName . '=')) {
+            $$varName = substr($a, strlen($optName) + 1);
+            array_shift($args);
+            continue 2;
+        }
+    }
+    if ($a === '--strip-paths') {
+        $stripPaths = true;
         array_shift($args);
         continue;
     }
@@ -487,9 +625,30 @@ function php_version_id(string $phpBin): int
 $phpVersionId = php_version_id($phpBin);
 
 $licensePubkey = $licensePubkeyOption ?: (getenv('BYTECODE_LICENSE_PUBKEY') ?: null);
+$vendorSignKey = $vendorSignKeyOption ?: (getenv('BYTECODE_VENDOR_SIGN_KEY') ?: null);
+if ($vendorSignKey !== null && $vendorSignKey !== '' && !is_file($vendorSignKey)) {
+    fail("vendor sign key does not exist: {$vendorSignKey}");
+}
 $machineId = $machineIdOption ?: (getenv('BYTECODE_MACHINE_ID') ?: null);
-if (($machineId !== null && $machineId !== '') && ($licensePubkey === null || $licensePubkey === '')) {
-    fail('--machine-id requires --license-pubkey / BYTECODE_LICENSE_PUBKEY', 2);
+$licenseFields = [
+    'machine_id' => $machineId,
+    'domains' => $domainsOption ?: getenv('BYTECODE_LICENSE_DOMAINS') ?: null,
+    'ips' => $ipsOption ?: getenv('BYTECODE_LICENSE_IPS') ?: null,
+    'hostnames' => $hostnamesOption ?: getenv('BYTECODE_LICENSE_HOSTNAMES') ?: null,
+    'fingerprints' => $fingerprintsOption ?: getenv('BYTECODE_LICENSE_FINGERPRINTS') ?: null,
+    'expires_at' => $expiresAtOption ?: getenv('BYTECODE_LICENSE_EXPIRES_AT') ?: null,
+    'license_id' => $licenseIdOption ?: getenv('BYTECODE_LICENSE_ID') ?: null,
+    'customer_id' => $customerIdOption ?: getenv('BYTECODE_CUSTOMER_ID') ?: null,
+    'features' => $featuresOption ?: getenv('BYTECODE_FEATURES') ?: null,
+    'watermark' => $watermarkOption ?: getenv('BYTECODE_WATERMARK') ?: null,
+    'activation_url' => $activationUrlOption ?: getenv('BYTECODE_ACTIVATION_URL') ?: null,
+    'activation_token' => $activationTokenOption ?: getenv('BYTECODE_ACTIVATION_TOKEN') ?: null,
+    'revocation_url' => $revocationUrlOption ?: getenv('BYTECODE_REVOCATION_URL') ?: null,
+    'unlock_policy' => $unlockPolicyOption ?: getenv('BYTECODE_UNLOCK_POLICY') ?: null,
+];
+$hasLicensePolicy = count(array_filter($licenseFields, static fn ($value): bool => $value !== null && $value !== '')) > 0;
+if ($hasLicensePolicy && ($licensePubkey === null || $licensePubkey === '')) {
+    fail('license policy options require --license-pubkey / BYTECODE_LICENSE_PUBKEY', 2);
 }
 $dekHex = null;
 if ($licensePubkey !== null && $licensePubkey !== '') {
@@ -603,6 +762,8 @@ function dump_one(
     string $packer,
     bool $raw,
     bool $obfuscate,
+    bool $stripPaths,
+    string $virtualRoot,
     int $phpVersionId,
     ?string $dekHex,
     string $ikmHex,
@@ -628,6 +789,9 @@ function dump_one(
     $dumpEnv = ['OPDUMP_MODE' => 'dump'];
     if ($obfuscate) {
         $dumpEnv['OPDUMP_OBFUSCATE'] = '1';
+    }
+    if ($stripPaths) {
+        $dumpEnv['OPDUMP_VIRTUAL_FILENAME'] = rtrim($virtualRoot, '/') . '/' . str_replace('\\', '/', $rel);
     }
 
     if ($raw) {
@@ -696,7 +860,7 @@ foreach ($sourceAbsList as $srcAbs) {
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
+        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
         continue;
     }
 
@@ -716,7 +880,7 @@ foreach ($sourceAbsList as $srcAbs) {
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
+        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
     }
 }
 
@@ -731,6 +895,17 @@ if (!$raw) {
         'backend' => 'php-zend-opdump',
         'container' => 'BYTC2',
         'protection_mode' => $protectionMode,
+        'metadata' => [
+            'paths_stripped' => $stripPaths,
+            'virtual_root' => $stripPaths ? ($virtualRootOption ?: 'bytecode://') : null,
+            'license_id' => $licenseFields['license_id'],
+            'customer_id' => $licenseFields['customer_id'],
+            'features' => $licenseFields['features'],
+            'watermark' => $licenseFields['watermark'],
+            'revocation_url' => $licenseFields['revocation_url'],
+            'activation_url' => $licenseFields['activation_url'],
+            'unlock_policy' => $licenseFields['unlock_policy'],
+        ],
         'source_root' => str_replace('\\', '/', $relativeBase),
         'source_roots' => array_map(static fn (string $source): string => str_replace('\\', '/', $source), $sourceAbsList),
         'map' => 'bytecode.map',
@@ -773,13 +948,58 @@ if (!$raw) {
             'key_id' => bin2hex(random_bytes(8)),
             'wrapped_dek' => base64_encode($wrappedDek),
         ];
-        if ($machineId !== null && $machineId !== '') {
-            $license['machine_id'] = $machineId;
+        foreach ($licenseFields as $key => $value) {
+            if ($value !== null && $value !== '') {
+                $license[$key] = $value;
+            }
         }
         file_put_contents(
             $outAbs . DIRECTORY_SEPARATOR . 'bytecode.license.json',
             json_encode($license, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
         );
         fwrite(STDOUT, "wrote {$outAbs}" . DIRECTORY_SEPARATOR . "bytecode.license.json (RSA-OAEP-SHA256-wrapped DEK)\n");
+    }
+
+    // Vendor seal: an Ed25519 signature, under the vendor's own private key,
+    // over the digests of manifest + map + license together. Unlike
+    // bytecode.manifest.sig (HMAC keyed by material the server also holds),
+    // only the vendor can produce this -- so the loader, verifying it against a
+    // vendor public key it trusts, can reject any package whose manifest, map,
+    // or license constraints (expiry/domains/machine_id/...) were altered after
+    // encoding. This is what makes the license bindings tamper-proof.
+    if ($vendorSignKey !== null && $vendorSignKey !== '') {
+        $manifestPath = $outAbs . DIRECTORY_SEPARATOR . 'bytecode.manifest.json';
+        $mapPath = $outAbs . DIRECTORY_SEPARATOR . 'bytecode.map';
+        $licensePath = $outAbs . DIRECTORY_SEPARATOR . 'bytecode.license.json';
+
+        $manifestSha = hash_file('sha256', $manifestPath);
+        $mapSha = hash_file('sha256', $mapPath);
+        $licenseSha = is_file($licensePath) ? hash_file('sha256', $licensePath) : null;
+
+        $message = "bytecode-seal-v1\n"
+            . "manifest:{$manifestSha}\n"
+            . "map:{$mapSha}\n"
+            . 'license:' . ($licenseSha ?? '-') . "\n";
+
+        $signature = openssl_ed25519_sign($vendorSignKey, $message);
+        $keyId = substr(hash('sha256', hex2bin(ed25519_pubkey_hex($vendorSignKey))), 0, 16);
+
+        $seal = [
+            'format' => 'bytecode-seal-v1',
+            'alg' => 'Ed25519',
+            'key_id' => $keyId,
+            'manifest_sha256' => $manifestSha,
+            'map_sha256' => $mapSha,
+        ];
+        if ($licenseSha !== null) {
+            $seal['license_sha256'] = $licenseSha;
+        }
+        $seal['signature'] = base64_encode($signature);
+
+        file_put_contents(
+            $outAbs . DIRECTORY_SEPARATOR . 'bytecode.seal.json',
+            json_encode($seal, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n"
+        );
+        fwrite(STDOUT, "wrote {$outAbs}" . DIRECTORY_SEPARATOR . "bytecode.seal.json (Ed25519 vendor seal, key_id {$keyId})\n");
     }
 }

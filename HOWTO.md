@@ -61,6 +61,15 @@ $ ls php/src/modules/opdump.so
 php/src/modules/opdump.so
 ```
 
+Two optional `configure` flags bake vendor material into your custom loader:
+
+- `--with-opdump-vendor-secret=<64hex>` — a fallback shared IKM, so encoded
+  files run without a server-side `BYTECODE_KEY`.
+- `--with-opdump-vendor-pubkey=<64hex>` — your Ed25519 seal trust anchor (from
+  `bytecode-vendor-keygen`). With it compiled in, the loader **requires** a
+  valid `bytecode.seal.json` on every package and fails closed otherwise. See
+  §3.7.
+
 macOS and other PHP minors: see [`README.md`](README.md#current-tools) for
 the Homebrew build shape and per-minor `phpize`/`php-config` binaries.
 
@@ -387,6 +396,69 @@ By default the loader looks for `bytecode.license.json` next to
 (needed for single-file `OPDUMP_MODE=load`, which has no map to infer a
 directory from).
 
+**Making the license rules tamper-proof — the vendor seal**
+
+License constraints (`--expires-at`, `--domains`, `--ips`, `--machine-id`,
+`--fingerprints`, …) live as plaintext in `bytecode.license.json`. On their
+own they are only as trustworthy as that file: in license mode the customer
+holds the RSA private key that unwraps the DEK, and `bytecode.manifest.sig`
+is an HMAC keyed by that same material — so a determined customer could edit
+`expires_at`, delete a `domains` rule, and re-sign the manifest. The **vendor
+seal** closes that gap with an Ed25519 signature only *you* can produce.
+
+**Once, by the vendor** — generate a signing keypair. Unlike the license
+keypair, the *private* half stays with you and the *public* half is the
+loader's trust anchor:
+
+```bash
+$ php8.4 php/bin/bytecode-vendor-keygen /tmp/demo/vendor
+wrote /tmp/demo/vendor/vendor.sign.key.pem (KEEP SECRET -- sign builds via BYTECODE_VENDOR_SIGN_KEY)
+wrote /tmp/demo/vendor/vendor.sign.pub.pem (loader trust anchor -- OPDUMP_VENDOR_PUBKEY_FILE)
+
+Compile this raw public key into your loader for the strongest anchor:
+  ./configure --with-opdump-vendor-pubkey=7fec2b2e...41ebd054 ...
+```
+
+**Encode with a seal** — add `BYTECODE_VENDOR_SIGN_KEY` (or `--vendor-sign-key`)
+to any encode. It writes `bytecode.seal.json` covering the manifest, map, and
+license together:
+
+```bash
+$ BYTECODE_LICENSE_PUBKEY=/tmp/demo/keys/license.pub.pem \
+    BYTECODE_VENDOR_SIGN_KEY=/tmp/demo/vendor/vendor.sign.key.pem PHP_BIN=php8.4 \
+    php8.4 php/bin/bytecode-dump --expires-at 2030-01-01 --domains app.client.com \
+      /tmp/demo/app /tmp/demo/out-license
+wrote /tmp/demo/out-license/bytecode.license.json (RSA-OAEP-SHA256-wrapped DEK)
+wrote /tmp/demo/out-license/bytecode.seal.json (Ed25519 vendor seal, key_id cafd3996...)
+```
+
+**Anchor the loader.** Give the loader your public key, two ways (compiled-in
+wins when both are present):
+
+- **Compiled in** (strongest — the anchor lives inside your custom `.so` and
+  can't be swapped on the server): build with
+  `./configure --with-opdump-vendor-pubkey=<64hex>` using the hex printed by
+  `bytecode-vendor-keygen`.
+- **Server file**: point `OPDUMP_VENDOR_PUBKEY_FILE` at `vendor.sign.pub.pem`.
+
+Once a loader has an anchor it **fails closed**: any package whose manifest,
+map, or license was altered after encoding — or that carries no seal at all —
+refuses to load.
+
+```bash
+# Customer edits expires_at 2030 -> 2099 and redeploys:
+$ sed -i 's/2030-01-01/2099-01-01/' /tmp/demo/out-license/bytecode.license.json
+$ OPDUMP_LICENSE_KEY_FILE=/tmp/demo/keys/license.key.pem \
+    OPDUMP_VENDOR_PUBKEY_FILE=/tmp/demo/vendor/vendor.sign.pub.pem \
+    OPDUMP_MODE=load-tree OPDUMP_MAP=/tmp/demo/out-license/bytecode.map \
+    php8.4 -n -d extension="$(pwd)/php/src/modules/opdump.so" -f /tmp/demo/app/index.php
+Warning: opdump: bytecode.license.json digest does not match seal ... -- refusing to load
+```
+
+Loaders **without** an anchor ignore the seal entirely, so existing builds and
+the shared-key/vendor-key workflows keep working unchanged. Verify a seal
+before shipping with `BYTECODE_VENDOR_PUBKEY=<pub.pem> bytecode-verify <dir>`.
+
 ### 3.8 Variable-name obfuscation
 
 `--obfuscate` renames non-parameter local variables to `_v0`, `_v1`, ... in
@@ -595,6 +667,7 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 | `opdump: BYTC authentication/decryption failed` | Wrong key, or the container was tampered with — GCM authentication fails closed by design, before any payload is parsed. |
 | `opdump: no key material available for BYTC2 load (checked license and BYTECODE_KEY/OPDUMP_KEY)` | In license mode: wrong `OPDUMP_LICENSE_KEY_FILE`, wrong passphrase, or `bytecode.license.json` not found at the expected path (see `OPDUMP_LICENSE_FILE` in §3.7). In shared-secret mode: `BYTECODE_KEY`/`OPDUMP_KEY` isn't set in the *loading* process's environment. |
 | `opdump: bytecode.manifest.sig mismatch ... refusing to trust bytecode.map` | Either `bytecode.manifest.json`/`bytecode.map` was edited after the build, or you're pointing at a manifest/map/sig set that doesn't all belong together. |
+| `opdump: ... digest does not match seal` / `no bytecode.seal.json ... refusing to load` | The loader has a vendor public-key anchor (`--with-opdump-vendor-pubkey` or `OPDUMP_VENDOR_PUBKEY_FILE`) so it requires a valid `bytecode.seal.json`. Re-encode with `--vendor-sign-key`, or a file was altered after sealing. Loaders with no anchor don't require a seal — see §3.7. |
 | `opdump: BYTC PHP_VERSION_ID ... does not match running ...` | The container was built for a different PHP minor than the one loading it. Only PHP 8.4 is fully proven right now (see `docs/PLAN.md`) — build and run with the same `php8.4`. |
 | Output looks correct even though you expected encoding to matter | If you loaded via `zend_extension=`/`extension=` with a **relative path** and it silently failed to load, PHP falls back to compiling the real source — see the gotcha in §3.10. Always use an absolute path, and confirm with `php -v` (for `zend_extension=`) that "Bytecode PHP Loader" is listed, or destroy the source file first the way §3.6 does, to get an unambiguous test. |
 | Env vars have no effect under PHP-FPM/Apache | `OPDUMP_MODE` etc. are real process environment variables read via `getenv()`, not `php.ini` settings — see the second gotcha in §3.10. |
@@ -611,6 +684,9 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 | `BYTECODE_KEY`, `OPDUMP_KEY` | `bytecode-pack`, `bytecode-dump`, `bytecode-verify`, `opdump.so` | Shared-secret IKM (64 hex chars), unless license mode is used. |
 | `BYTECODE_DEK` | `bytecode-pack` | Internal — set automatically by `bytecode-dump` in license mode, takes priority over `BYTECODE_KEY`. Don't set this by hand. |
 | `BYTECODE_LICENSE_PUBKEY` | `bytecode-dump` | Path to `license.pub.pem`; switches to license mode. |
+| `BYTECODE_VENDOR_SIGN_KEY` | `bytecode-dump` | Path to the vendor Ed25519 private key (`bytecode-vendor-keygen`); writes `bytecode.seal.json`. Same as `--vendor-sign-key`. |
+| `OPDUMP_VENDOR_PUBKEY_FILE` | `opdump.so`, `bytecode-verify` | Path to `vendor.sign.pub.pem`; the seal trust anchor when no key is compiled in (`--with-opdump-vendor-pubkey` wins over it). Present ⇒ loader fails closed on a missing/invalid seal. |
+| `BYTECODE_VENDOR_PUBKEY` | `bytecode-verify` | Path to `vendor.sign.pub.pem` for full Ed25519 seal verification (falls back to `OPDUMP_VENDOR_PUBKEY_FILE`). |
 | `OPDUMP_LICENSE_KEY_FILE` | `opdump.so` | Path to `license.key.pem`; switches the loader to license mode. |
 | `OPDUMP_LICENSE_KEY_PASSPHRASE` | `opdump.so` | Passphrase for an encrypted `license.key.pem`, if any. |
 | `OPDUMP_LICENSE_FILE` | `opdump.so` | Path to `bytecode.license.json`; default is alongside `OPDUMP_MAP`. |
@@ -631,7 +707,8 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 | `bytecode.manifest.json` | Per-file source/output/hash/size list, PHP version, container format, and (if `--scan`) embedded scan results. |
 | `bytecode.map` | `absolute-source-path<TAB>relative-container-path`, one per line — the loader's runtime lookup table. |
 | `bytecode.manifest.sig` | Hex HMAC-SHA256 over manifest + map, keyed by an HKDF derivation of your IKM/DEK. |
-| `bytecode.license.json` | Only in license mode: the RSA-OAEP-SHA256-wrapped DEK for this build. |
+| `bytecode.license.json` | Only in license mode: the RSA-OAEP-SHA256-wrapped DEK for this build, plus any license constraints. |
+| `bytecode.seal.json` | Only with `--vendor-sign-key`/`BYTECODE_VENDOR_SIGN_KEY`: an Ed25519 vendor signature over the SHA-256 digests of manifest + map + license, verified by a loader that has your public key. |
 
 ### Exit codes
 

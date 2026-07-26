@@ -17,6 +17,7 @@ TEST_SCRIPTS=(
   "$ROOT/php/tests/run-bytecode-config-scan.sh"
   "$ROOT/php/tests/run-load-tree.sh"
   "$ROOT/php/tests/run-phase1-container.sh"
+  "$ROOT/php/tests/run-rung10-vendor-seal.sh"
 )
 
 for version in $PHP_VERSIONS; do

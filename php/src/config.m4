@@ -9,6 +9,12 @@ PHP_ARG_WITH([opdump-vendor-secret],
   [no],
   [no])
 
+PHP_ARG_WITH([opdump-vendor-pubkey],
+  [vendor Ed25519 public key hex compiled into the opdump loader],
+  [AS_HELP_STRING([--with-opdump-vendor-pubkey=HEX], [Compile a 64-hex (32-byte raw) Ed25519 vendor public key into the loader; when set, packages must carry a valid bytecode.seal.json signed by the matching private key or they refuse to load])],
+  [no],
+  [no])
+
 if test "$PHP_OPDUMP" != "no"; then
   if test "$PHP_OPDUMP_VENDOR_SECRET" != "no" && test -n "$PHP_OPDUMP_VENDOR_SECRET"; then
     case "$PHP_OPDUMP_VENDOR_SECRET" in
@@ -20,6 +26,18 @@ if test "$PHP_OPDUMP" != "no"; then
       AC_MSG_ERROR([--with-opdump-vendor-secret must be 64 hex characters])
     fi
     AC_DEFINE_UNQUOTED([OPDUMP_VENDOR_SECRET_HEX], ["$PHP_OPDUMP_VENDOR_SECRET"], [64-hex vendor secret compiled into the loader])
+  fi
+
+  if test "$PHP_OPDUMP_VENDOR_PUBKEY" != "no" && test -n "$PHP_OPDUMP_VENDOR_PUBKEY"; then
+    case "$PHP_OPDUMP_VENDOR_PUBKEY" in
+      *[!0123456789abcdefABCDEF]*)
+        AC_MSG_ERROR([--with-opdump-vendor-pubkey must be 64 hex characters (32-byte raw Ed25519 public key)])
+        ;;
+    esac
+    if test ${#PHP_OPDUMP_VENDOR_PUBKEY} -ne 64; then
+      AC_MSG_ERROR([--with-opdump-vendor-pubkey must be 64 hex characters (32-byte raw Ed25519 public key)])
+    fi
+    AC_DEFINE_UNQUOTED([OPDUMP_VENDOR_PUBKEY_HEX], ["$PHP_OPDUMP_VENDOR_PUBKEY"], [64-hex raw Ed25519 vendor public key compiled into the loader])
   fi
 
   AC_PATH_PROG([PKG_CONFIG], [pkg-config])

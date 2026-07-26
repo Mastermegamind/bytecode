@@ -173,6 +173,79 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
             fail("{$sigPath}: signature mismatch (wrong key, or manifest/map tampered)");
         }
     }
+
+    // Vendor seal (bytecode.seal.json): structural digest check always; full
+    // Ed25519 signature check when a vendor public key PEM is provided via
+    // BYTECODE_VENDOR_PUBKEY or OPDUMP_VENDOR_PUBKEY_FILE -- the same anchor the
+    // loader trusts. This lets a build be verified end-to-end before shipping.
+    $sealPath = $baseDir . DIRECTORY_SEPARATOR . 'bytecode.seal.json';
+    if (is_file($sealPath)) {
+        $seal = json_decode(file_get_contents($sealPath), true);
+        if (!is_array($seal) || ($seal['format'] ?? '') !== 'bytecode-seal-v1' || ($seal['alg'] ?? '') !== 'Ed25519') {
+            fail("invalid bytecode.seal.json: {$sealPath}");
+        }
+        $manifestSha = hash_file('sha256', $manifestPath);
+        $mapSha = hash_file('sha256', $mapPath);
+        if (($seal['manifest_sha256'] ?? '') !== $manifestSha) {
+            fail("{$sealPath}: manifest_sha256 does not match bytecode.manifest.json");
+        }
+        if (($seal['map_sha256'] ?? '') !== $mapSha) {
+            fail("{$sealPath}: map_sha256 does not match bytecode.map");
+        }
+        $licensePath = $baseDir . DIRECTORY_SEPARATOR . 'bytecode.license.json';
+        $licenseSha = is_file($licensePath) ? hash_file('sha256', $licensePath) : null;
+        if ($licenseSha !== null) {
+            if (($seal['license_sha256'] ?? '') !== $licenseSha) {
+                fail("{$sealPath}: license_sha256 does not match bytecode.license.json");
+            }
+        } elseif (isset($seal['license_sha256'])) {
+            fail("{$sealPath}: seal covers a bytecode.license.json that is missing");
+        }
+
+        $pubKey = getenv('BYTECODE_VENDOR_PUBKEY') ?: getenv('OPDUMP_VENDOR_PUBKEY_FILE') ?: '';
+        if ($pubKey !== '') {
+            if (!is_file($pubKey)) {
+                fail("vendor public key does not exist: {$pubKey}");
+            }
+            $message = "bytecode-seal-v1\n"
+                . "manifest:{$manifestSha}\n"
+                . "map:{$mapSha}\n"
+                . 'license:' . ($licenseSha ?? '-') . "\n";
+            $signature = base64_decode((string) ($seal['signature'] ?? ''), true);
+            if ($signature === false || strlen($signature) !== 64) {
+                fail("{$sealPath}: malformed Ed25519 signature");
+            }
+            $msgTmp = tempnam(sys_get_temp_dir(), 'seal-msg');
+            $sigTmp = tempnam(sys_get_temp_dir(), 'seal-sig');
+            file_put_contents($msgTmp, $message);
+            file_put_contents($sigTmp, $signature);
+            $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+            $proc = proc_open(
+                ['openssl', 'pkeyutl', '-verify', '-pubin', '-inkey', $pubKey, '-rawin', '-in', $msgTmp, '-sigfile', $sigTmp],
+                $descriptors,
+                $pipes
+            );
+            $stdout = $stderr = '';
+            if (is_resource($proc)) {
+                fclose($pipes[0]);
+                $stdout = stream_get_contents($pipes[1]);
+                $stderr = stream_get_contents($pipes[2]);
+                fclose($pipes[1]);
+                fclose($pipes[2]);
+                $exit = proc_close($proc);
+            } else {
+                $exit = 1;
+            }
+            @unlink($msgTmp);
+            @unlink($sigTmp);
+            if ($exit !== 0 || !str_contains($stdout . $stderr, 'Signature Verified Successfully')) {
+                fail("{$sealPath}: Ed25519 seal signature is NOT valid for {$pubKey}");
+            }
+            echo "vendor seal: Ed25519 signature verified against {$pubKey}", PHP_EOL;
+        } else {
+            echo "vendor seal: digests match (set BYTECODE_VENDOR_PUBKEY to verify the Ed25519 signature)", PHP_EOL;
+        }
+    }
 } else {
     verify_container($target);
     $files[] = $target;

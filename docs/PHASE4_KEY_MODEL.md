@@ -78,6 +78,29 @@ encoded before this landed.
    decrypted op_array contents into a core file. All best-effort and POSIX-only
    (compiled out on Windows) -- see `opdump_disable_core_dumps()`/
    `opdump_lock_mem()` in `php/src/opdump.c`.
+6. **Vendor seal (Ed25519 asymmetric integrity).** The HMAC in (4) is keyed by
+   material the *server* also holds, so it stops a third party without the key
+   but not the license holder -- who in license mode possesses the RSA private
+   key that unwraps the DEK, and could therefore edit the plaintext constraints
+   in `bytecode.license.json` (which the HMAC never even covered) and re-HMAC
+   the manifest. `bytecode-vendor-keygen` mints a vendor Ed25519 keypair;
+   `bytecode-dump --vendor-sign-key`/`BYTECODE_VENDOR_SIGN_KEY` writes
+   `bytecode.seal.json` -- an Ed25519 signature over
+   `"bytecode-seal-v1\nmanifest:<sha256>\nmap:<sha256>\nlicense:<sha256|->\n"`.
+   The loader resolves a *public*-key trust anchor via
+   `opdump_vendor_pubkey()`: a key compiled in with
+   `--with-opdump-vendor-pubkey=<64hex>` (preferred; ships inside the custom
+   `.so`) wins, else a PEM at `OPDUMP_VENDOR_PUBKEY_FILE`. When an anchor
+   exists, `opdump_verify_vendor_seal()` re-hashes the three files, requires
+   each digest to equal the seal, and `EVP_DigestVerify`s the signature --
+   gated into both `opdump_load_tree_map()` (map trust) and
+   `opdump_license_resolve_ikm()` (constraint trust), **failing closed** on a
+   missing/tampered/unusable seal. Loaders with no anchor ignore the seal, so
+   shared-key/vendor-key/legacy license builds are unaffected. `bytecode-verify`
+   checks digests always and the full signature when given
+   `BYTECODE_VENDOR_PUBKEY`. Only this asymmetric layer makes the licensing
+   bindings (expiry/domain/IP/machine/fingerprint) actually binding against the
+   party running the code. Covered by `php/tests/run-rung10-vendor-seal.sh`.
 
 ## Deliberately Not Done
 
@@ -102,5 +125,13 @@ encoded before this landed.
 - How should OPcache participation interact with license expiry or key rotation?
 - Which diagnostics are safe to expose without helping an attacker distinguish
   wrong-key, wrong-version, and tamper cases?
-- License expiry/revocation policy isn't modeled yet -- `bytecode.license.json`
-  only carries a wrapped DEK, no expiry or revocation identifier.
+- License policy is now modeled and enforced: `bytecode.license.json` carries
+  expiry, domain/IP/hostname/fingerprint, machine-id, activation-token, and
+  revocation-id fields, checked by `opdump_license_check_constraints()`, and the
+  vendor seal (Implemented §6) makes them tamper-evident. Open follow-ons:
+  online-activation and revocation-list *fetch* are still file/env-driven
+  (`OPDUMP_REVOCATION_FILE`, `OPDUMP_ACTIVATION_TOKEN`) rather than networked;
+  seal key **rotation/expiry** (multiple accepted anchors, `key_id`-based
+  selection) is not modeled yet; and the seal covers the standard adjacent
+  `bytecode.license.json`, not a license file relocated via
+  `OPDUMP_LICENSE_FILE`.

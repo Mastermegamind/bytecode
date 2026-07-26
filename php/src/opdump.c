@@ -33,9 +33,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #ifdef _WIN32
 # include <direct.h>
 # include <windows.h>
+# define strcasecmp _stricmp
+# define strncasecmp _strnicmp
 # ifndef PATH_MAX
 #  define PATH_MAX MAX_PATH
 # endif
@@ -43,10 +46,16 @@
 #else
 # include <sys/resource.h>
 # include <sys/mman.h>
+# include <unistd.h>
+# include <strings.h>
 #endif
 
 #ifndef OPDUMP_VENDOR_SECRET_HEX
 # define OPDUMP_VENDOR_SECRET_HEX ""
+#endif
+
+#ifndef OPDUMP_VENDOR_PUBKEY_HEX
+# define OPDUMP_VENDOR_PUBKEY_HEX ""
 #endif
 
 #ifndef ZEND_HASH_MAP_FOREACH_PTR
@@ -643,11 +652,21 @@ static void opdump_map_add(char *source, char *encoded)
 
 /* Defined further down (needs opdump_read_text_file). */
 static bool opdump_verify_manifest_signature(const char *map_dir, const char *map_path);
+/* Vendor Ed25519 seal over manifest+map(+license). Returns true when the seal
+ * verifies OR when no vendor public-key trust anchor is configured (legacy,
+ * unenforced). Returns false only when an anchor IS configured and the seal is
+ * missing/tampered/unusable -- i.e. fail closed. Defined near the manifest
+ * signature check below (shares its file/crypto helpers). */
+static bool opdump_verify_vendor_seal(const char *dir);
 
 static bool opdump_load_tree_map(const char *path)
 {
     char *map_dir = opdump_dirname_dup(path);
     if (!opdump_verify_manifest_signature(map_dir, path)) {
+        free(map_dir);
+        return false;
+    }
+    if (!opdump_verify_vendor_seal(map_dir)) {
         free(map_dir);
         return false;
     }
@@ -776,6 +795,182 @@ static char *opdump_json_extract_string(const char *json, const char *key)
     memcpy(out, start, val_len);
     out[val_len] = '\0';
     return out;
+}
+
+static bool opdump_csv_match_one(const char *pattern, size_t pattern_len, const char *value)
+{
+    while (pattern_len > 0 && (*pattern == ' ' || *pattern == '\t')) {
+        pattern++;
+        pattern_len--;
+    }
+    while (pattern_len > 0 && (pattern[pattern_len - 1] == ' ' || pattern[pattern_len - 1] == '\t')) {
+        pattern_len--;
+    }
+    if (pattern_len == 0 || !value || !value[0]) {
+        return false;
+    }
+    if (pattern_len == 1 && pattern[0] == '*') {
+        return true;
+    }
+    if (pattern_len > 2 && pattern[0] == '*' && pattern[1] == '.') {
+        const char *suffix = pattern + 1;
+        size_t suffix_len = pattern_len - 1;
+        size_t value_len = strlen(value);
+        return value_len >= suffix_len && strcasecmp(value + value_len - suffix_len, suffix) == 0;
+    }
+    return strlen(value) == pattern_len && strncasecmp(pattern, value, pattern_len) == 0;
+}
+
+static bool opdump_csv_contains(const char *csv, const char *value)
+{
+    if (!csv || !csv[0]) {
+        return true;
+    }
+    const char *start = csv;
+    for (const char *p = csv;; p++) {
+        if (*p == ',' || *p == '\0') {
+            if (opdump_csv_match_one(start, (size_t)(p - start), value)) {
+                return true;
+            }
+            if (*p == '\0') {
+                return false;
+            }
+            start = p + 1;
+        }
+    }
+}
+
+static bool opdump_license_check_csv(const char *json, const char *key, const char *actual, const char *label)
+{
+    char *allowed = opdump_json_extract_string(json, key);
+    if (!allowed || !allowed[0]) {
+        free(allowed);
+        return true;
+    }
+    bool ok = opdump_csv_contains(allowed, actual);
+    if (!ok) {
+        php_error_docref(NULL, E_WARNING, "opdump: license %s does not allow this server", label);
+    }
+    free(allowed);
+    return ok;
+}
+
+static bool opdump_license_check_expiry(const char *json)
+{
+    char *expires = opdump_json_extract_string(json, "expires_at");
+    if (!expires || !expires[0]) {
+        free(expires);
+        return true;
+    }
+    time_t now = time(NULL);
+    struct tm tm_buf;
+#ifdef _WIN32
+    struct tm *tm_utc = gmtime(&now);
+    if (!tm_utc) {
+        free(expires);
+        return false;
+    }
+    tm_buf = *tm_utc;
+#else
+    if (!gmtime_r(&now, &tm_buf)) {
+        free(expires);
+        return false;
+    }
+#endif
+    char today[11];
+    strftime(today, sizeof(today), "%Y-%m-%d", &tm_buf);
+    bool ok = strlen(expires) == 10 && strcmp(today, expires) <= 0;
+    if (!ok) {
+        php_error_docref(NULL, E_WARNING, "opdump: license expired");
+    }
+    free(expires);
+    return ok;
+}
+
+static bool opdump_license_check_revocation(const char *json)
+{
+    char *license_id = opdump_json_extract_string(json, "license_id");
+    const char *revocation_file = getenv("OPDUMP_REVOCATION_FILE");
+    if (!license_id || !license_id[0] || !revocation_file || !revocation_file[0]) {
+        free(license_id);
+        return true;
+    }
+    char *revoked = opdump_read_text_file(revocation_file);
+    if (!revoked) {
+        free(license_id);
+        return true;
+    }
+    bool is_revoked = false;
+    char *line = revoked;
+    while (line && *line) {
+        char *next = strpbrk(line, "\r\n");
+        if (next) {
+            *next++ = '\0';
+            while (*next == '\r' || *next == '\n') next++;
+        }
+        if (strcmp(line, license_id) == 0) {
+            is_revoked = true;
+            break;
+        }
+        line = next;
+    }
+    if (is_revoked) {
+        php_error_docref(NULL, E_WARNING, "opdump: license_id is revoked");
+    }
+    free(revoked);
+    free(license_id);
+    return !is_revoked;
+}
+
+static bool opdump_license_check_activation(const char *json)
+{
+    char *required = opdump_json_extract_string(json, "activation_token");
+    if (!required || !required[0]) {
+        free(required);
+        return true;
+    }
+    const char *actual = getenv("OPDUMP_ACTIVATION_TOKEN");
+    bool ok = actual && strcmp(required, actual) == 0;
+    if (!ok) {
+        php_error_docref(NULL, E_WARNING, "opdump: activation token does not match");
+    }
+    free(required);
+    return ok;
+}
+
+static bool opdump_license_check_policy(const char *json)
+{
+    char *policy = opdump_json_extract_string(json, "unlock_policy");
+    if (!policy || !policy[0]) {
+        free(policy);
+        return true;
+    }
+    bool ok = true;
+    if (strcmp(policy, "vendor+license") == 0 && !opdump_vendor_key((unsigned char[32]){0})) {
+        php_error_docref(NULL, E_WARNING, "opdump: license requires a vendor-secret loader");
+        ok = false;
+    }
+    free(policy);
+    return ok;
+}
+
+static bool opdump_license_check_constraints(const char *json)
+{
+    const char *host = getenv("HTTP_HOST");
+    if (!host || !host[0]) host = getenv("SERVER_NAME");
+    const char *server_ip = getenv("SERVER_ADDR");
+    const char *fingerprint = getenv("OPDUMP_MACHINE_FINGERPRINT");
+    char hostname[256] = {0};
+    gethostname(hostname, sizeof(hostname) - 1);
+
+    return opdump_license_check_expiry(json)
+        && opdump_license_check_csv(json, "domains", host, "domain")
+        && opdump_license_check_csv(json, "ips", server_ip, "server IP")
+        && opdump_license_check_csv(json, "hostnames", hostname, "hostname")
+        && opdump_license_check_csv(json, "fingerprints", fingerprint, "fingerprint")
+        && opdump_license_check_activation(json)
+        && opdump_license_check_revocation(json)
+        && opdump_license_check_policy(json);
 }
 
 static int opdump_b64_val(char c)
@@ -939,6 +1134,29 @@ static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[3
         return false;
     }
 
+    /* Before trusting ANY license constraint (expiry, domains, machine_id, ...),
+     * require the vendor seal to verify when a vendor public key is configured.
+     * The constraint fields live in plaintext in bytecode.license.json, and in
+     * license mode the operator holds the RSA private key that unwraps the DEK
+     * -- so without a vendor signature they could simply edit expires_at or
+     * delete the domain/machine rules. The seal is what makes these binding. */
+    {
+        char *license_dir = opdump_dirname_dup(license_file);
+        bool sealed = opdump_verify_vendor_seal(license_dir);
+        free(license_dir);
+        if (!sealed) {
+            free(json);
+            free(derived_path);
+            return false;
+        }
+    }
+
+    if (!opdump_license_check_constraints(json)) {
+        free(json);
+        free(derived_path);
+        return false;
+    }
+
     char *machine_id = opdump_json_extract_string(json, "machine_id");
     if (machine_id && machine_id[0]) {
         const char *actual_machine_id = getenv("OPDUMP_MACHINE_ID");
@@ -983,6 +1201,239 @@ static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[3
     opdump_lock_mem(opdump_license_ikm_cache, sizeof(opdump_license_ikm_cache));
     memcpy(ikm, opdump_license_ikm_cache, 32);
     return true;
+}
+
+/* ---- vendor seal: Ed25519 signature over the whole package (Rung D) ----
+ *
+ * bytecode.manifest.sig (below) is an HMAC keyed by the same IKM that the
+ * running server already possesses -- it stops a THIRD party without the key
+ * from swapping map entries, but it does NOT stop the license holder, who in
+ * license mode holds the RSA private key that unwraps the DEK, from editing
+ * the plaintext constraints in bytecode.license.json (expiry, domains,
+ * machine_id, ...) and re-HMAC'ing the manifest. The vendor seal closes that
+ * gap: bytecode-dump signs sha256(manifest) + sha256(map) + sha256(license)
+ * with the vendor's Ed25519 PRIVATE key, and the loader verifies it against a
+ * PUBLIC key the vendor controls -- compiled into the loader
+ * (OPDUMP_VENDOR_PUBKEY_HEX, preferred) or, failing that, a PEM at
+ * OPDUMP_VENDOR_PUBKEY_FILE. When such an anchor exists, a missing or invalid
+ * seal fails closed. */
+
+static bool opdump_file_exists(const char *path)
+{
+    if (!path || !path[0]) {
+        return false;
+    }
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+/* SHA-256 of a file's bytes, written as 64 lowercase hex chars + NUL into out.
+ * Returns false if the file cannot be read or hashed. */
+static bool opdump_sha256_hex_file(const char *path, char out[65])
+{
+    if (!path || !path[0]) {
+        return false;
+    }
+    size_t len = 0;
+    unsigned char *raw = opdump_read_file_bytes(path, &len);
+    if (!raw) {
+        return false;
+    }
+    unsigned char digest[32];
+    unsigned int digest_len = 0;
+    bool ok = EVP_Digest(raw, len, digest, &digest_len, EVP_sha256(), NULL) == 1 && digest_len == 32;
+    OPENSSL_cleanse(raw, len);
+    free(raw);
+    if (!ok) {
+        return false;
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return true;
+}
+
+/* Resolves the vendor public-key trust anchor into *out.
+ * Returns: 1 anchor resolved (caller must EVP_PKEY_free *out);
+ *          0 no anchor configured (seal not enforced);
+ *         -1 anchor configured but unusable (fail closed). */
+static int opdump_vendor_pubkey(EVP_PKEY **out)
+{
+    *out = NULL;
+    const char *hex = OPDUMP_VENDOR_PUBKEY_HEX;
+    if (hex && hex[0]) {
+        unsigned char raw[32];
+        if (strlen(hex) != 64 || !opdump_hex_decode(hex, raw, 32)) {
+            php_error_docref(NULL, E_WARNING, "opdump: compiled-in vendor public key is not 64 hex chars");
+            return -1;
+        }
+        EVP_PKEY *pkey = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, raw, 32);
+        OPENSSL_cleanse(raw, sizeof(raw));
+        if (!pkey) {
+            php_error_docref(NULL, E_WARNING, "opdump: cannot build Ed25519 key from compiled-in vendor public key");
+            return -1;
+        }
+        *out = pkey;
+        return 1;
+    }
+    const char *file = getenv("OPDUMP_VENDOR_PUBKEY_FILE");
+    if (file && file[0]) {
+        FILE *f = fopen(file, "rb");
+        if (!f) {
+            php_error_docref(NULL, E_WARNING, "opdump: cannot open OPDUMP_VENDOR_PUBKEY_FILE %s", file);
+            return -1;
+        }
+        EVP_PKEY *pkey = PEM_read_PUBKEY(f, NULL, NULL, NULL);
+        fclose(f);
+        if (!pkey) {
+            php_error_docref(NULL, E_WARNING, "opdump: cannot parse Ed25519 public key PEM %s", file);
+            return -1;
+        }
+        *out = pkey;
+        return 1;
+    }
+    return 0;
+}
+
+static bool opdump_verify_vendor_seal(const char *dir)
+{
+    EVP_PKEY *pkey = NULL;
+    int anchor = opdump_vendor_pubkey(&pkey);
+    if (anchor == 0) {
+        return true; /* no trust anchor configured -- seal not enforced (legacy) */
+    }
+    if (anchor < 0) {
+        return false; /* anchor configured but unusable -- fail closed */
+    }
+
+    char *seal_path = opdump_join_path(dir, "bytecode.seal.json");
+    char *manifest_path = opdump_join_path(dir, "bytecode.manifest.json");
+    char *map_path = opdump_join_path(dir, "bytecode.map");
+    char *license_path = opdump_join_path(dir, "bytecode.license.json");
+    unsigned char *sig = NULL;
+    char *fmt = NULL, *alg = NULL, *sig_b64 = NULL;
+    char *seal_manifest = NULL, *seal_map = NULL, *seal_license = NULL;
+    char *seal = NULL;
+    bool ok = false;
+
+    /* Existence-check first so a legitimately missing seal fails closed with a
+     * clear diagnostic, rather than the generic read-error opdump_read_text_file
+     * would raise. */
+    if (!opdump_file_exists(seal_path)) {
+        php_error_docref(NULL, E_WARNING,
+            "opdump: vendor public key is configured but no bytecode.seal.json in %s -- refusing to load", dir);
+        goto cleanup;
+    }
+    if (!opdump_file_exists(manifest_path) || !opdump_file_exists(map_path)) {
+        php_error_docref(NULL, E_WARNING,
+            "opdump: sealed package is missing bytecode.manifest.json or bytecode.map in %s", dir);
+        goto cleanup;
+    }
+    seal = opdump_read_text_file(seal_path);
+    if (!seal) {
+        php_error_docref(NULL, E_WARNING, "opdump: cannot read bytecode.seal.json in %s", dir);
+        goto cleanup;
+    }
+
+    fmt = opdump_json_extract_string(seal, "format");
+    alg = opdump_json_extract_string(seal, "alg");
+    if (!fmt || strcmp(fmt, "bytecode-seal-v1") != 0 || !alg || strcmp(alg, "Ed25519") != 0) {
+        php_error_docref(NULL, E_WARNING, "opdump: unsupported or malformed bytecode.seal.json in %s", dir);
+        goto cleanup;
+    }
+
+    seal_manifest = opdump_json_extract_string(seal, "manifest_sha256");
+    seal_map = opdump_json_extract_string(seal, "map_sha256");
+    seal_license = opdump_json_extract_string(seal, "license_sha256"); /* optional */
+    sig_b64 = opdump_json_extract_string(seal, "signature");
+    if (!seal_manifest || !seal_map || !sig_b64) {
+        php_error_docref(NULL, E_WARNING, "opdump: bytecode.seal.json in %s is missing required fields", dir);
+        goto cleanup;
+    }
+
+    /* Bind the seal to the actual files on disk: recompute each digest and
+     * require it to equal what the seal claims. A tampered manifest/map/license
+     * changes its digest and is rejected here before the signature is checked. */
+    char actual_manifest[65], actual_map[65];
+    if (!opdump_sha256_hex_file(manifest_path, actual_manifest) ||
+        strcasecmp(actual_manifest, seal_manifest) != 0) {
+        php_error_docref(NULL, E_WARNING, "opdump: bytecode.manifest.json digest does not match seal in %s", dir);
+        goto cleanup;
+    }
+    if (!opdump_sha256_hex_file(map_path, actual_map) ||
+        strcasecmp(actual_map, seal_map) != 0) {
+        php_error_docref(NULL, E_WARNING, "opdump: bytecode.map digest does not match seal in %s", dir);
+        goto cleanup;
+    }
+
+    bool license_present = opdump_file_exists(license_path);
+    if (license_present) {
+        char actual_license[65];
+        if (!seal_license ||
+            !opdump_sha256_hex_file(license_path, actual_license) ||
+            strcasecmp(actual_license, seal_license) != 0) {
+            php_error_docref(NULL, E_WARNING, "opdump: bytecode.license.json digest does not match seal in %s", dir);
+            goto cleanup;
+        }
+    } else if (seal_license && seal_license[0]) {
+        /* Seal was issued over a license that has since been removed. */
+        php_error_docref(NULL, E_WARNING, "opdump: seal covers a bytecode.license.json that is missing in %s", dir);
+        goto cleanup;
+    }
+
+    /* Reconstruct the exact canonical message bytecode-dump signed. */
+    char msg[256];
+    int msg_len = snprintf(msg, sizeof(msg),
+        "bytecode-seal-v1\nmanifest:%s\nmap:%s\nlicense:%s\n",
+        seal_manifest, seal_map, (license_present && seal_license) ? seal_license : "-");
+    if (msg_len <= 0 || (size_t)msg_len >= sizeof(msg)) {
+        php_error_docref(NULL, E_WARNING, "opdump: seal message construction failed in %s", dir);
+        goto cleanup;
+    }
+
+    size_t sig_len = 0;
+    sig = opdump_base64_decode(sig_b64, &sig_len);
+    if (!sig || sig_len != 64) {
+        php_error_docref(NULL, E_WARNING, "opdump: malformed Ed25519 signature in bytecode.seal.json in %s", dir);
+        goto cleanup;
+    }
+
+    EVP_MD_CTX *mdctx = EVP_MD_CTX_new();
+    ok = mdctx
+        && EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, pkey) == 1
+        && EVP_DigestVerify(mdctx, sig, sig_len, (const unsigned char *) msg, (size_t) msg_len) == 1;
+    if (mdctx) {
+        EVP_MD_CTX_free(mdctx);
+    }
+    if (!ok) {
+        php_error_docref(NULL, E_WARNING,
+            "opdump: bytecode.seal.json signature is not valid for the vendor public key in %s -- refusing to load", dir);
+    }
+
+cleanup:
+    if (pkey) {
+        EVP_PKEY_free(pkey);
+    }
+    free(sig);
+    free(sig_b64);
+    free(seal_manifest);
+    free(seal_map);
+    free(seal_license);
+    free(fmt);
+    free(alg);
+    free(seal);
+    free(seal_path);
+    free(manifest_path);
+    free(map_path);
+    free(license_path);
+    return ok;
 }
 
 /* ---- manifest/map authentication (Rung C) ----
@@ -1326,7 +1777,12 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
     w_i32(f, op_array->last_var);
     w_i32(f, op_array->last_try_catch);
 
-    w_str(f, op_array->filename ? ZSTR_VAL(op_array->filename) : "", op_array->filename ? ZSTR_LEN(op_array->filename) : 0);
+    const char *virtual_filename = getenv("OPDUMP_VIRTUAL_FILENAME");
+    if (virtual_filename && virtual_filename[0]) {
+        w_str(f, virtual_filename, strlen(virtual_filename));
+    } else {
+        w_str(f, op_array->filename ? ZSTR_VAL(op_array->filename) : "", op_array->filename ? ZSTR_LEN(op_array->filename) : 0);
+    }
     w_u32(f, op_array->line_start);
     w_u32(f, op_array->line_end);
 
@@ -1476,7 +1932,13 @@ static void opdump_write_class_entry(FILE *f, zend_class_entry *ce)
     w_u32(f, ce->ce_flags);
     w_i32(f, ce->default_properties_count);
     w_i32(f, ce->default_static_members_count);
-    w_zstr(f, ce->info.user.filename);
+    const char *virtual_filename = getenv("OPDUMP_VIRTUAL_FILENAME");
+    if (virtual_filename && virtual_filename[0]) {
+        w_u8(f, 1);
+        w_str(f, virtual_filename, strlen(virtual_filename));
+    } else {
+        w_zstr(f, ce->info.user.filename);
+    }
     w_u32(f, ce->info.user.line_start);
     w_u32(f, ce->info.user.line_end);
 
