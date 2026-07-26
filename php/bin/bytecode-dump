@@ -15,7 +15,9 @@ declare(strict_types=1);
 function usage(): void
 {
     fwrite(STDERR, <<<'USAGE'
-Usage: bytecode-dump [--raw] [--obfuscate] [--scan] [--fail-on-scan-warning] [--config <bytecode.json>] [--exclude <glob>]... <source-file-or-dir>... <output-dir>
+Usage:
+  bytecode-dump [options] <source-file-or-dir>... <output-dir>
+  bytecode-dump [options] --out <output-dir> <source-file-or-dir>...
 
   --obfuscate  Rename non-parameter local variables to _v0, _v1, ... in the
                dumped bytecode. Off by default. Skipped per-function whenever
@@ -25,6 +27,21 @@ Usage: bytecode-dump [--raw] [--obfuscate] [--scan] [--fail-on-scan-warning] [--
                php/src/opdump.c.
   --scan       Run bytecode-scan before dumping and write scan diagnostics into
                bytecode.manifest.json.
+
+Options:
+  --raw                         Write raw .opd2 bytecode blobs instead of encrypted containers.
+  --obfuscate                   Enable safe local-variable obfuscation.
+  --scan                        Run bytecode-scan first and embed the scan report.
+  --fail-on-scan-warning        Fail if bytecode-scan reports warnings.
+  --config <bytecode.json>      Read default exclude/scanner options from config.
+  --exclude <glob>              Exclude paths. Repeatable. Also supports --exclude=<glob>.
+  --out <dir>, -o <dir>         Output directory. Alternative to final positional argument.
+  --key <hex>                   64-hex shared key. Same as BYTECODE_KEY.
+  --opdump-key <hex>            64-hex legacy/shared key. Same as OPDUMP_KEY.
+  --license-pubkey <path>       Encode in license mode with this RSA public key.
+  --php-bin <path>              PHP binary used to compile source. Same as PHP_BIN.
+  --opdump-so <path>            Loader extension path. Same as OPDUMP_SO.
+  -h, --help                    Show this help.
 
 Environment:
   PHP_BIN      PHP binary to use (default: php8.4)
@@ -45,6 +62,15 @@ function fail(string $message, int $code = 1): never
 {
     fwrite(STDERR, $message . PHP_EOL);
     exit($code);
+}
+
+function take_option_value(array &$args, string $option): string
+{
+    array_shift($args);
+    if (!$args) {
+        fail("{$option} requires a value", 2);
+    }
+    return array_shift($args);
 }
 
 function load_bytecode_config(?string $path): array
@@ -264,6 +290,12 @@ $scan = false;
 $failOnScanWarning = false;
 $configPath = null;
 $excludes = [];
+$out = null;
+$phpBinOption = null;
+$opdumpSoOption = null;
+$bytecodeKeyOption = null;
+$opdumpKeyOption = null;
+$licensePubkeyOption = null;
 while ($args) {
     $a = $args[0];
     if ($a === '--raw') {
@@ -288,11 +320,7 @@ while ($args) {
         continue;
     }
     if ($a === '--config') {
-        array_shift($args);
-        if (!$args) {
-            fail('--config requires a JSON config file', 2);
-        }
-        $configPath = array_shift($args);
+        $configPath = take_option_value($args, '--config');
         continue;
     }
     if (str_starts_with($a, '--config=')) {
@@ -301,15 +329,65 @@ while ($args) {
         continue;
     }
     if ($a === '--exclude') {
-        array_shift($args);
-        if (!$args) {
-            fail('--exclude requires a glob pattern', 2);
-        }
-        $excludes[] = array_shift($args);
+        $excludes[] = take_option_value($args, '--exclude');
         continue;
     }
     if (str_starts_with($a, '--exclude=')) {
         $excludes[] = substr($a, strlen('--exclude='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--out' || $a === '-o') {
+        $out = take_option_value($args, $a);
+        continue;
+    }
+    if (str_starts_with($a, '--out=')) {
+        $out = substr($a, strlen('--out='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--key') {
+        $bytecodeKeyOption = take_option_value($args, '--key');
+        continue;
+    }
+    if (str_starts_with($a, '--key=')) {
+        $bytecodeKeyOption = substr($a, strlen('--key='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--opdump-key') {
+        $opdumpKeyOption = take_option_value($args, '--opdump-key');
+        continue;
+    }
+    if (str_starts_with($a, '--opdump-key=')) {
+        $opdumpKeyOption = substr($a, strlen('--opdump-key='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--license-pubkey') {
+        $licensePubkeyOption = take_option_value($args, '--license-pubkey');
+        continue;
+    }
+    if (str_starts_with($a, '--license-pubkey=')) {
+        $licensePubkeyOption = substr($a, strlen('--license-pubkey='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--php-bin') {
+        $phpBinOption = take_option_value($args, '--php-bin');
+        continue;
+    }
+    if (str_starts_with($a, '--php-bin=')) {
+        $phpBinOption = substr($a, strlen('--php-bin='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--opdump-so') {
+        $opdumpSoOption = take_option_value($args, '--opdump-so');
+        continue;
+    }
+    if (str_starts_with($a, '--opdump-so=')) {
+        $opdumpSoOption = substr($a, strlen('--opdump-so='));
         array_shift($args);
         continue;
     }
@@ -324,11 +402,17 @@ while ($args) {
     break;
 }
 
-if (count($args) < 2) {
+if ($out === null && count($args) < 2) {
     usage();
     exit(2);
 }
-$out = array_pop($args);
+if ($out === null) {
+    $out = array_pop($args);
+}
+if ($args === []) {
+    usage();
+    exit(2);
+}
 $sources = $args;
 
 $config = load_bytecode_config($configPath);
@@ -342,9 +426,9 @@ if (($scannerConfig['fail_on_warning'] ?? false) === true) {
 }
 
 $scriptDir = __DIR__;
-$phpBin = getenv('PHP_BIN') ?: 'php8.4';
+$phpBin = $phpBinOption ?: (getenv('PHP_BIN') ?: 'php8.4');
 $defaultSoName = PHP_OS_FAMILY === 'Windows' ? 'opdump.dll' : 'opdump.so';
-$opdumpSo = getenv('OPDUMP_SO') ?: $scriptDir . '/../src/modules/' . $defaultSoName;
+$opdumpSo = $opdumpSoOption ?: (getenv('OPDUMP_SO') ?: $scriptDir . '/../src/modules/' . $defaultSoName);
 $packer = $scriptDir . '/bytecode-pack';
 $scanner = $scriptDir . '/bytecode-scan';
 
@@ -376,11 +460,11 @@ function php_version_id(string $phpBin): int
 
 $phpVersionId = php_version_id($phpBin);
 
-$licensePubkey = getenv('BYTECODE_LICENSE_PUBKEY') ?: null;
+$licensePubkey = $licensePubkeyOption ?: (getenv('BYTECODE_LICENSE_PUBKEY') ?: null);
 $dekHex = null;
 if ($licensePubkey !== null && $licensePubkey !== '') {
     if (!is_file($licensePubkey)) {
-        fail("BYTECODE_LICENSE_PUBKEY does not exist: {$licensePubkey}");
+        fail("license public key does not exist: {$licensePubkey}");
     }
     if (!$raw) {
         $dekHex = bin2hex(random_bytes(32));
@@ -390,7 +474,10 @@ if ($licensePubkey !== null && $licensePubkey !== '') {
 // and opdump_resolve_ikm() in php/src/opdump.c); used again below to sign
 // bytecode.manifest.json + bytecode.map so tampering with the map's source-to-
 // container wiring is detectable, not just tampering with a single container.
-$ikmHex = $dekHex ?? (getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '');
+$ikmHex = $dekHex ?? ($bytecodeKeyOption ?: $opdumpKeyOption ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '');
+if (!$raw && $dekHex === null && !preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
+    fail('a 64-hex key is required; pass --key, set BYTECODE_KEY, or use --license-pubkey', 2);
+}
 
 $manifestFiles = [];
 $mapLines = [];
@@ -488,6 +575,7 @@ function dump_one(
     bool $obfuscate,
     int $phpVersionId,
     ?string $dekHex,
+    string $ikmHex,
     array &$manifestFiles,
     array &$mapLines
 ): void {
@@ -539,10 +627,8 @@ function dump_one(
             fail("dump failed for {$file}");
         }
 
-        $exit = run_subprocess(
-            [$phpBin, $packer, $rawTmp, $dest],
-            $dekHex !== null ? ['BYTECODE_DEK' => $dekHex] : []
-        );
+        $packEnv = $dekHex !== null ? ['BYTECODE_DEK' => $dekHex] : ['BYTECODE_KEY' => $ikmHex];
+        $exit = run_subprocess([$phpBin, $packer, $rawTmp, $dest], $packEnv);
         unlink($rawTmp);
         if ($exit !== 0) {
             fail("pack failed for {$file}");
@@ -580,7 +666,7 @@ foreach ($sourceAbsList as $srcAbs) {
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $manifestFiles, $mapLines);
+        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
         continue;
     }
 
@@ -600,7 +686,7 @@ foreach ($sourceAbsList as $srcAbs) {
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $manifestFiles, $mapLines);
+        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
     }
 }
 

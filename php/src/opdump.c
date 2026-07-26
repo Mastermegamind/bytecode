@@ -1553,10 +1553,12 @@ static void opdump_write(zend_op_array *op_array, const char *path)
     opdump_write_file_classes(f, op_array->filename);
 
     fclose(f);
-    php_error_docref(NULL, E_NOTICE, "opdump: wrote %s (%u opcodes, %d literals, %u functions, %u classes)",
-        path, op_array->last, op_array->last_literal,
-        opdump_count_file_functions(op_array->filename),
-        opdump_count_file_classes(op_array->filename));
+    if (getenv("OPDUMP_DEBUG")) {
+        php_error_docref(NULL, E_NOTICE, "opdump: wrote %s (%u opcodes, %d literals, %u functions, %u classes)",
+            path, op_array->last, op_array->last_literal,
+            opdump_count_file_functions(op_array->filename),
+            opdump_count_file_classes(op_array->filename));
+    }
 }
 
 static zend_op_array *opdump_dump_compile_file(zend_file_handle *file_handle, int type)
@@ -1815,8 +1817,10 @@ static zend_op_array *opdump_read_raw_stream(FILE *f, const char *path)
         }
     } ZEND_HASH_FOREACH_END();
 
-    php_error_docref(NULL, E_NOTICE, "opdump: loaded %s (%u opcodes, %d literals, %u dynamic funcs, %u functions, %u classes) without parsing source",
-        path, op_array->last, op_array->last_literal, op_array->num_dynamic_func_defs, function_count, class_count);
+    if (getenv("OPDUMP_DEBUG")) {
+        php_error_docref(NULL, E_NOTICE, "opdump: loaded %s (%u opcodes, %d literals, %u dynamic funcs, %u functions, %u classes) without parsing source",
+            path, op_array->last, op_array->last_literal, op_array->num_dynamic_func_defs, function_count, class_count);
+    }
     return op_array;
 }
 
@@ -1892,6 +1896,37 @@ static zend_op_array *opdump_load_tree_compile_file(zend_file_handle *file_handl
     return opdump_orig_compile_file(file_handle, type);
 }
 
+static bool opdump_file_starts_with_loader_blob(const char *path)
+{
+    unsigned char magic[4];
+    FILE *f = fopen(path, "rb");
+    if (!f) {
+        return false;
+    }
+    size_t n = fread(magic, 1, sizeof(magic), f);
+    fclose(f);
+    return n == sizeof(magic)
+        && (memcmp(magic, "BYTC", sizeof(magic)) == 0 || memcmp(magic, OPDUMP_MAGIC, sizeof(magic)) == 0);
+}
+
+static zend_op_array *opdump_auto_compile_file(zend_file_handle *file_handle, int type)
+{
+    const char *filename = opdump_requested_filename(file_handle);
+    char resolved[PATH_MAX];
+    const char *path = filename;
+
+    if (filename && realpath(filename, resolved)) {
+        path = resolved;
+    }
+    if (path && opdump_file_starts_with_loader_blob(path)) {
+        if (getenv("OPDUMP_DEBUG")) {
+            fprintf(stderr, "[opdump debug] auto-load %s\n", path);
+        }
+        return opdump_read(path);
+    }
+    return opdump_orig_compile_file(file_handle, type);
+}
+
 static int opdump_startup_hooks(void)
 {
     if (opdump_hooks_started) {
@@ -1914,6 +1949,8 @@ static int opdump_startup_hooks(void)
         } else if (opdump_load_tree_map(map)) {
             zend_compile_file = opdump_load_tree_compile_file;
         }
+    } else {
+        zend_compile_file = opdump_auto_compile_file;
     }
     opdump_hooks_started = true;
     return SUCCESS;

@@ -123,6 +123,7 @@ function write_privileged_file(string $path, string $content, bool $noSudo, bool
         fail('failed to create temporary ini file');
     }
     file_put_contents($tmp, $content);
+    chmod($tmp, 0644);
     $cmd = [...sudo_prefix($noSudo), 'cp', $tmp, $path];
     $exit = run($cmd, null, [], true, $dryRun);
     @unlink($tmp);
