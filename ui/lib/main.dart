@@ -157,6 +157,7 @@ class _EncoderPageState extends State<EncoderPage> {
   bool _scanBeforeDump = true;
   bool _failOnScanWarning = false;
   bool _deployStartRunner = false;
+  String _workflow = 'encode-only';
   String? _status;
 
   @override
@@ -426,18 +427,21 @@ class _EncoderPageState extends State<EncoderPage> {
       setState(() {});
 
       final env = <String, String>{};
-      if (!_rawContainers && licensePubkey.isNotEmpty) {
+      final needsEncoding = _workflow != 'obfuscate-only';
+      if (needsEncoding && !_rawContainers && licensePubkey.isNotEmpty) {
         env['BYTECODE_LICENSE_PUBKEY'] = licensePubkey;
-      } else if (!_rawContainers) {
+      } else if (needsEncoding && !_rawContainers) {
         env['BYTECODE_VENDOR_KEY_FILE'] = _vendorSecretPath;
       }
-      if (!_rawContainers && vendorSignKey.isNotEmpty) {
+      if (needsEncoding && !_rawContainers && vendorSignKey.isNotEmpty) {
         env['BYTECODE_VENDOR_SIGN_KEY'] = vendorSignKey;
       }
 
       final exit = await _runStreaming(_phpBinary(), [
         _join(_root, 'php/bin/bytecode-dump'),
         if (_rawContainers) '--raw',
+        '--workflow',
+        _workflow,
         if (_dryRun) '--dry-run',
         if (_includeAssets && !_rawContainers) '--include-assets',
         if (_obfuscate) '--obfuscate',
@@ -464,6 +468,8 @@ class _EncoderPageState extends State<EncoderPage> {
 
       if (_dryRun) {
         _status = 'Dry run complete';
+      } else if (_workflow == 'obfuscate-only') {
+        _status = 'Obfuscation complete';
       } else {
         await _loadManifest();
         _status = 'Dump complete';
@@ -633,6 +639,8 @@ class _EncoderPageState extends State<EncoderPage> {
       'routes': _remoteRoutesController.text,
       'port': _remotePortController.text,
       'include_assets': _includeAssets,
+      'workflow': _workflow,
+      'bytecode_obfuscate': _obfuscate,
       'scan': _scanBeforeDump,
     };
     await file.writeAsString(const JsonEncoder.withIndent('  ').convert(data));
@@ -658,6 +666,8 @@ class _EncoderPageState extends State<EncoderPage> {
       _remoteRoutesController.text = data['routes'] as String? ?? '';
       _remotePortController.text = data['port'] as String? ?? '8095';
       _includeAssets = data['include_assets'] as bool? ?? _includeAssets;
+      _workflow = data['workflow'] as String? ?? _workflow;
+      _obfuscate = data['bytecode_obfuscate'] as bool? ?? _obfuscate;
       _scanBeforeDump = data['scan'] as bool? ?? _scanBeforeDump;
       _status = 'Project preset loaded';
     });
@@ -987,6 +997,7 @@ class _EncoderPageState extends State<EncoderPage> {
               dryRun: _dryRun,
               includeAssets: _includeAssets,
               obfuscate: _obfuscate,
+              workflow: _workflow,
               scanBeforeDump: _scanBeforeDump,
               failOnScanWarning: _failOnScanWarning,
               deployStartRunner: _deployStartRunner,
@@ -1026,12 +1037,17 @@ class _EncoderPageState extends State<EncoderPage> {
               onDeployStage: () => _deploy(cutover: false),
               onDeployCutover: () => _deploy(cutover: true),
               onDeployRollback: _deployRollback,
-              onRawContainersChanged: (value) =>
-                  setState(() => _rawContainers = value),
+              onRawContainersChanged: (value) => setState(() {
+                _rawContainers = value;
+                if (value) {
+                  _workflow = 'encode-only';
+                }
+              }),
               onDryRunChanged: (value) => setState(() => _dryRun = value),
               onIncludeAssetsChanged: (value) =>
                   setState(() => _includeAssets = value),
               onObfuscateChanged: (value) => setState(() => _obfuscate = value),
+              onWorkflowChanged: (value) => setState(() => _workflow = value),
               onScanBeforeDumpChanged: (value) =>
                   setState(() => _scanBeforeDump = value),
               onFailOnScanWarningChanged: (value) =>
@@ -1247,6 +1263,7 @@ class _Controls extends StatelessWidget {
     required this.dryRun,
     required this.includeAssets,
     required this.obfuscate,
+    required this.workflow,
     required this.scanBeforeDump,
     required this.failOnScanWarning,
     required this.deployStartRunner,
@@ -1290,6 +1307,7 @@ class _Controls extends StatelessWidget {
     required this.onDryRunChanged,
     required this.onIncludeAssetsChanged,
     required this.onObfuscateChanged,
+    required this.onWorkflowChanged,
     required this.onScanBeforeDumpChanged,
     required this.onFailOnScanWarningChanged,
     required this.onDeployStartRunnerChanged,
@@ -1321,6 +1339,7 @@ class _Controls extends StatelessWidget {
   final bool dryRun;
   final bool includeAssets;
   final bool obfuscate;
+  final String workflow;
   final bool scanBeforeDump;
   final bool failOnScanWarning;
   final bool deployStartRunner;
@@ -1364,6 +1383,7 @@ class _Controls extends StatelessWidget {
   final ValueChanged<bool> onDryRunChanged;
   final ValueChanged<bool> onIncludeAssetsChanged;
   final ValueChanged<bool> onObfuscateChanged;
+  final ValueChanged<String> onWorkflowChanged;
   final ValueChanged<bool> onScanBeforeDumpChanged;
   final ValueChanged<bool> onFailOnScanWarningChanged;
   final ValueChanged<bool> onDeployStartRunnerChanged;
@@ -1497,6 +1517,35 @@ class _Controls extends StatelessWidget {
                 DropdownMenuEntry(value: 'yii', label: 'yii'),
                 DropdownMenuEntry(value: 'cakephp', label: 'cakephp'),
                 DropdownMenuEntry(value: 'full-app', label: 'full-app'),
+              ],
+            ),
+            const SizedBox(height: 12),
+            DropdownMenu<String>(
+              key: ValueKey('workflow-$workflow-$rawContainers'),
+              initialSelection: workflow,
+              label: const Text('Workflow'),
+              leadingIcon: const Icon(Icons.route_outlined),
+              expandedInsets: EdgeInsets.zero,
+              enabled: !busy && !rawContainers,
+              onSelected: (value) {
+                if (value != null) {
+                  onWorkflowChanged(value);
+                }
+              },
+              dropdownMenuEntries: const [
+                DropdownMenuEntry(value: 'encode-only', label: 'encode-only'),
+                DropdownMenuEntry(
+                  value: 'obfuscate-only',
+                  label: 'obfuscate-only',
+                ),
+                DropdownMenuEntry(
+                  value: 'obfuscate-then-encode',
+                  label: 'obfuscate-then-encode',
+                ),
+                DropdownMenuEntry(
+                  value: 'encode-then-obfuscate',
+                  label: 'encode-then-obfuscate',
+                ),
               ],
             ),
             const SizedBox(height: 8),

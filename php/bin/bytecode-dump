@@ -35,6 +35,12 @@ Options:
   --raw                         Write raw .opd2 bytecode blobs instead of encrypted containers.
                                 PHP files only; asset containers are encrypted
                                 deployable output.
+  --workflow <mode>             encode-only, obfuscate-only,
+                                obfuscate-then-encode, encode-then-obfuscate.
+                                Default: encode-only.
+  --obfuscate-only              Alias for --workflow obfuscate-only.
+  --obfuscate-then-encode       Alias for --workflow obfuscate-then-encode.
+  --encode-then-obfuscate       Alias for --workflow encode-then-obfuscate.
   --dry-run                     Report what would be encoded/skipped without writing output.
   --report-json                 With --dry-run, print a JSON fail-closed report.
   --profile <name>              Apply include/exclude defaults. Built-ins:
@@ -314,6 +320,58 @@ function run_scan(
     return $decoded;
 }
 
+function run_obfuscate(
+    string $phpBin,
+    string $obfuscator,
+    array $sources,
+    string $out,
+    bool $includeAssets,
+    array $excludes,
+    bool $reportJson = false
+): void {
+    if (!is_file($obfuscator)) {
+        fail("bytecode obfuscator not found at {$obfuscator}");
+    }
+    $cmd = [$phpBin, $obfuscator];
+    if ($includeAssets) {
+        $cmd[] = '--include-assets';
+    }
+    if ($reportJson) {
+        $cmd[] = '--report-json';
+    }
+    foreach ($excludes as $exclude) {
+        $cmd[] = '--exclude';
+        $cmd[] = $exclude;
+    }
+    array_push($cmd, ...$sources);
+    $cmd[] = $out;
+    [$exit, $stdout, $stderr] = run_capture($cmd);
+    if ($stdout !== '') {
+        fwrite(STDOUT, $stdout);
+    }
+    if ($exit !== 0) {
+        if ($stderr !== '') {
+            fwrite(STDERR, $stderr);
+        }
+        fail('bytecode-obfuscate failed', $exit);
+    }
+}
+
+function remove_tree(string $path): void
+{
+    if (!is_dir($path)) {
+        return;
+    }
+    $it = new RecursiveIteratorIterator(
+        new RecursiveDirectoryIterator($path, FilesystemIterator::SKIP_DOTS),
+        RecursiveIteratorIterator::CHILD_FIRST
+    );
+    foreach ($it as $entry) {
+        $entry->isDir() ? @rmdir($entry->getPathname()) : @unlink($entry->getPathname());
+    }
+    @rmdir($path);
+}
+
 /**
  * RSA-OAEP-SHA256-wraps $plaintext with the given public key by shelling out
  * to the openssl CLI. PHP's openssl_public_encrypt() only supports OAEP with
@@ -466,6 +524,7 @@ $reportJson = false;
 $includeAssets = false;
 $includeAssetsExplicit = false;
 $obfuscate = false;
+$workflow = 'encode-only';
 $scan = false;
 $failOnScanWarning = false;
 $profile = null;
@@ -500,6 +559,30 @@ while ($args) {
     $a = $args[0];
     if ($a === '--raw') {
         $raw = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--workflow') {
+        $workflow = take_option_value($args, '--workflow');
+        continue;
+    }
+    if (str_starts_with($a, '--workflow=')) {
+        $workflow = substr($a, strlen('--workflow='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--obfuscate-only') {
+        $workflow = 'obfuscate-only';
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--obfuscate-first' || $a === '--obfuscate-then-encode') {
+        $workflow = 'obfuscate-then-encode';
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--encode-then-obfuscate') {
+        $workflow = 'encode-then-obfuscate';
         array_shift($args);
         continue;
     }
@@ -707,6 +790,13 @@ if ($args === []) {
 }
 $sources = $args;
 
+if (!in_array($workflow, ['encode-only', 'obfuscate-only', 'obfuscate-then-encode', 'encode-then-obfuscate'], true)) {
+    fail("--workflow must be one of: encode-only, obfuscate-only, obfuscate-then-encode, encode-then-obfuscate", 2);
+}
+if ($raw && $workflow !== 'encode-only') {
+    fail('--raw can only be used with --workflow encode-only', 2);
+}
+
 $config = load_bytecode_config($configPath);
 $scannerConfig = scanner_config($config);
 $profile = $profile ?: (($config['profile'] ?? null) ?: null);
@@ -786,11 +876,13 @@ $opdumpSo = $opdumpSoOption ?: (getenv('OPDUMP_SO') ?: $scriptDir . '/../src/mod
 $packer = $scriptDir . '/bytecode-pack';
 $assetPacker = $scriptDir . '/bytecode-pack-asset';
 $scanner = $scriptDir . '/bytecode-scan';
+$obfuscator = $scriptDir . '/bytecode-obfuscate';
 $repoRoot = dirname($scriptDir, 2);
 $defaultVendorKeyFile = $vendorKeyFileOption
     ?: (getenv('BYTECODE_VENDOR_KEY_FILE') ?: $repoRoot . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key');
+$needsEncoding = $workflow !== 'obfuscate-only';
 
-if (!$raw && !is_file($assetPacker)) {
+if ($workflow !== 'obfuscate-only' && !$raw && !is_file($assetPacker)) {
     fail("asset packer not found at {$assetPacker}");
 }
 if (!$dryRun && !is_dir($out) && !@mkdir($out, 0777, true) && !is_dir($out)) {
@@ -846,7 +938,7 @@ if ($hasLicensePolicy && ($licensePubkey === null || $licensePubkey === '') && (
     fail('machine/license policy options require either --license-pubkey or --vendor-sign-key so the policy is cryptographically bound', 2);
 }
 $dekHex = null;
-if ($licensePubkey !== null && $licensePubkey !== '') {
+if ($needsEncoding && $licensePubkey !== null && $licensePubkey !== '') {
     if (!is_file($licensePubkey)) {
         fail("license public key does not exist: {$licensePubkey}");
     }
@@ -859,16 +951,23 @@ if ($licensePubkey !== null && $licensePubkey !== '') {
 // bytecode.manifest.json + bytecode.map so tampering with the map's source-to-
 // container wiring is detectable, not just tampering with a single container.
 $envOrOptionKey = $bytecodeKeyOption ?: $opdumpKeyOption ?: $vendorKeyOption ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: '';
-$defaultVendorKey = (!$dryRun && !$raw && $dekHex === null && $envOrOptionKey === '')
+$defaultVendorKey = ($needsEncoding && !$dryRun && !$raw && $dekHex === null && $envOrOptionKey === '')
     ? read_or_create_key_file($defaultVendorKeyFile)
     : '';
 $ikmHex = $dekHex ?? ($envOrOptionKey ?: $defaultVendorKey);
-if (!$dryRun && !$raw && $dekHex === null && !preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
+if ($needsEncoding && !$dryRun && !$raw && $dekHex === null && !preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
     fail('a 64-hex key is required; pass --key, --vendor-key, set BYTECODE_KEY/BYTECODE_VENDOR_KEY, configure build/vendor-secret.key, or use --license-pubkey', 2);
 }
 
 $manifestFiles = [];
 $mapLines = [];
+$restorePath = null;
+$restoreContent = null;
+register_shutdown_function(static function () use (&$restorePath, &$restoreContent): void {
+    if ($restorePath !== null && $restoreContent !== null) {
+        @file_put_contents($restorePath, $restoreContent);
+    }
+});
 
 function source_kind(string $path): ?string
 {
@@ -1055,6 +1154,8 @@ if ($dryRun) {
         'profile' => $profile,
         'include_assets' => $includeAssets,
         'raw' => $raw,
+        'workflow' => $workflow,
+        'bytecode_obfuscate' => $obfuscate,
         'source_root' => str_replace('\\', '/', $relativeBase),
         'output_root' => str_replace('\\', '/', $outAbs),
         'planned_count' => count($entries),
@@ -1085,6 +1186,18 @@ if ($dryRun) {
     exit(0);
 }
 
+if ($workflow === 'obfuscate-only') {
+    run_obfuscate($phpBin, $obfuscator, $sourceAbsList, $outAbs, $includeAssets, $excludes, $reportJson);
+    exit(0);
+}
+
+$sourceRewriteDir = null;
+if ($workflow === 'obfuscate-then-encode') {
+    $sourceRewriteDir = $outAbs . DIRECTORY_SEPARATOR . '.bytecode-obfuscated-input';
+    remove_tree($sourceRewriteDir);
+    run_obfuscate($phpBin, $obfuscator, $sourceAbsList, $sourceRewriteDir, $includeAssets, $excludes, false);
+}
+
 function dump_one(
     string $file,
     string $rel,
@@ -1100,7 +1213,8 @@ function dump_one(
     ?string $dekHex,
     string $ikmHex,
     array &$manifestFiles,
-    array &$mapLines
+    array &$mapLines,
+    ?string $mapSourceAbs = null
 ): void {
     static $seenOutputs = [];
 
@@ -1127,6 +1241,9 @@ function dump_one(
     $dumpEnv = ['OPDUMP_MODE' => 'dump'];
     if ($obfuscate) {
         $dumpEnv['OPDUMP_OBFUSCATE'] = '1';
+    }
+    if ($mapSourceAbs !== null && str_replace('\\', '/', $mapSourceAbs) !== str_replace('\\', '/', $sourceAbs)) {
+        $dumpEnv['OPDUMP_VIRTUAL_FILENAME'] = str_replace('\\', '/', $mapSourceAbs);
     }
     if ($stripPaths) {
         $dumpEnv['OPDUMP_VIRTUAL_FILENAME'] = rtrim($virtualRoot, '/') . '/' . str_replace('\\', '/', $rel);
@@ -1180,10 +1297,11 @@ function dump_one(
             'size' => $size,
         ];
 
-        if (str_contains($sourceAbs, "\t") || str_contains($relBytc, "\t")) {
-            fail("paths containing tabs are not supported by bytecode.map: {$sourceAbs}");
+        $mapSourceAbs = $mapSourceAbs ?: $sourceAbs;
+        if (str_contains($mapSourceAbs, "\t") || str_contains($relBytc, "\t")) {
+            fail("paths containing tabs are not supported by bytecode.map: {$mapSourceAbs}");
         }
-        $mapLines[] = str_replace('\\', '/', $sourceAbs) . "\t" . $relBytc;
+        $mapLines[] = str_replace('\\', '/', $mapSourceAbs) . "\t" . $relBytc;
     }
 
     fwrite(STDOUT, "{$file} -> {$dest}\n");
@@ -1236,50 +1354,38 @@ function dump_asset_one(
     fwrite(STDOUT, "{$file} -> {$dest}\n");
 }
 
-foreach ($sourceAbsList as $srcAbs) {
-    if (is_file($srcAbs)) {
-        $kind = source_kind($srcAbs);
-        if ($kind === null || ($kind === 'asset' && !$includeAssets)) {
-            fail("source file is not supported by this dump: {$srcAbs}" . ($kind === 'asset' ? " (pass --include-assets to encode assets)" : ""));
-        }
-        $rel = $multiSource ? to_rel($relativeBase, $srcAbs) : basename($srcAbs);
-        if (is_excluded($rel, $excludes)) {
-            continue;
-        }
-        if ($kind === 'php') {
-            dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
-        } elseif ($raw) {
-            fail("--raw only supports PHP bytecode output; cannot raw-dump asset {$srcAbs}", 2);
+foreach ($plannedFiles as [$originalFile, $rel, $kind]) {
+    $file = $sourceRewriteDir !== null ? $sourceRewriteDir . DIRECTORY_SEPARATOR . str_replace('/', DIRECTORY_SEPARATOR, $rel) : $originalFile;
+    if ($kind === 'php') {
+        if ($sourceRewriteDir !== null) {
+            $restorePath = $originalFile;
+            $restoreContent = file_get_contents($originalFile);
+            $replacement = file_get_contents($file);
+            if ($restoreContent === false || $replacement === false) {
+                fail("cannot prepare obfuscated source overlay for {$originalFile}");
+            }
+            if (file_put_contents($originalFile, $replacement) === false) {
+                fail("cannot write obfuscated source overlay for {$originalFile}");
+            }
+            dump_one($originalFile, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines, $originalFile);
+            file_put_contents($originalFile, $restoreContent);
+            $restorePath = null;
+            $restoreContent = null;
         } else {
-            dump_asset_one($srcAbs, $rel, $outAbs, $phpBin, $assetPacker, $dekHex, $ikmHex, $phpVersionId, $manifestFiles);
+            dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines, $originalFile);
         }
-        continue;
+    } elseif ($raw) {
+        fail("--raw only supports PHP bytecode output; cannot raw-dump asset {$originalFile}", 2);
+    } else {
+        dump_asset_one($file, $rel, $outAbs, $phpBin, $assetPacker, $dekHex, $ikmHex, $phpVersionId, $manifestFiles);
     }
+}
 
-    $files = [];
-    $iterator = new RecursiveIteratorIterator(
-        new RecursiveDirectoryIterator($srcAbs, FilesystemIterator::SKIP_DOTS)
-    );
-    foreach ($iterator as $fileInfo) {
-        if ($fileInfo->isFile() && is_supported_source($fileInfo->getPathname(), $includeAssets)) {
-            $files[] = $fileInfo->getPathname();
-        }
-    }
-    sort($files);
-
-    foreach ($files as $file) {
-        $rel = to_rel($multiSource ? $relativeBase : $srcAbs, $file);
-        if (is_excluded($rel, $excludes)) {
-            continue;
-        }
-        if (source_kind($file) === 'php') {
-            dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
-        } elseif ($raw) {
-            continue;
-        } else {
-            dump_asset_one($file, $rel, $outAbs, $phpBin, $assetPacker, $dekHex, $ikmHex, $phpVersionId, $manifestFiles);
-        }
-    }
+if ($workflow === 'encode-then-obfuscate') {
+    run_obfuscate($phpBin, $obfuscator, $sourceAbsList, $outAbs . DIRECTORY_SEPARATOR . 'bytecode.obfuscated-source', $includeAssets, $excludes, false);
+}
+if ($sourceRewriteDir !== null) {
+    remove_tree($sourceRewriteDir);
 }
 
 if (!$raw) {
@@ -1301,6 +1407,8 @@ if (!$raw) {
             'app_id' => basename($relativeBase),
             'profile' => $profile,
             'include_assets' => $includeAssets,
+            'workflow' => $workflow,
+            'bytecode_obfuscate' => $obfuscate,
             'paths_stripped' => $stripPaths,
             'virtual_root' => $stripPaths ? ($virtualRootOption ?: 'bytecode://') : null,
             'license_id' => $licenseFields['license_id'],

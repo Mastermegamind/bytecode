@@ -11,6 +11,7 @@ $tests = [
     'run-load-tree.sh',
     'run-asset-containers.sh',
     'run-vendor-secret-default.sh',
+    'run-source-obfuscate-workflows.sh',
     'run-rung11-inheritance-props.sh',
     'run-rung12-class-shapes.sh',
     'run-rung13-authorized-machine-seal.sh',

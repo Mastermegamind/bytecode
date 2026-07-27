@@ -646,23 +646,35 @@ Loaders **without** an anchor ignore the seal entirely, so existing builds and
 the shared-key/vendor-key workflows keep working unchanged. Verify a seal
 before shipping with `BYTECODE_VENDOR_PUBKEY=<pub.pem> bytecode-verify <dir>`.
 
-### 3.8 Variable-name obfuscation
+### 3.8 Obfuscation workflows
 
-`--obfuscate` renames non-parameter local variables to `_v0`, `_v1`, ... in
-the dumped bytecode. It's safe because compiled opcodes reference locals by
-integer slot index, not name — the rename is pure metadata with zero effect
-on control flow. It's automatically skipped, per function, whenever
-`compact()`/`extract()`/`get_defined_vars()`/`$$name`/dynamic call dispatch
-is detected in that function, so it never risks changing behavior (running
-`bytecode-scan` first tells you *why* a given function got skipped).
+`bytecode-dump` can run as four workflows:
 
 ```bash
-BYTECODE_KEY="$KEY" php8.4 php/bin/bytecode-dump --obfuscate /tmp/demo/app /tmp/demo/out
+php8.4 php/bin/bytecode-dump --workflow encode-only /tmp/demo/app /tmp/demo/out
+php8.4 php/bin/bytecode-dump --workflow obfuscate-only /tmp/demo/app /tmp/demo/obf
+php8.4 php/bin/bytecode-dump --workflow obfuscate-then-encode /tmp/demo/app /tmp/demo/out
+php8.4 php/bin/bytecode-dump --workflow encode-then-obfuscate /tmp/demo/app /tmp/demo/out
 ```
 
-Off by default — it's a real, if small, observable change (e.g. what
-`debug_backtrace()` reports for a local's name), so it shouldn't silently
-change output for anyone not opting in.
+`obfuscate-only` writes readable but obfuscated PHP source and a
+`bytecode.obfuscate.json` report. `obfuscate-then-encode` first rewrites a
+temporary source copy, then encodes that through the original source paths so
+`__DIR__`, relative includes, PSR-style autoloading, MVC controllers, and PDO
+type hints keep working. `encode-then-obfuscate` writes the normal encoded
+package plus a sidecar `bytecode.obfuscated-source/` source copy for review or
+escrow; encrypted containers themselves are not rewritten after encryption.
+
+The source obfuscator preserves public/API shape: namespaces, class names,
+function names, method names, properties, constants, parameters, superglobals,
+and globals. It renames only safe local variables inside function/method bodies.
+If a body uses `compact()`, `extract()`, `get_defined_vars()`, `global`,
+`static`, nested closures, or variable variables, that body is skipped
+fail-closed.
+
+The older `--obfuscate` flag still exists as an additional bytecode-level
+local-variable metadata pass during encoding. It is off by default and separate
+from `--workflow`.
 
 ### 3.9 The `bytecode.json` config file
 
@@ -813,7 +825,8 @@ filled in after you run something).
 | **Bytecode root** | The repo root containing `php/bin/*` — auto-detected (bundled root in a packaged build, else the app's working directory). Change it if you're pointing the GUI at a different checkout. |
 | **Output folder** | The `<output-dir>` argument to `bytecode-dump`/where the manifest is read from for Verify. |
 | **PHP version** field + wrench icon (**Build loader**) + download icon (**Install Zend loader**) | `bytecode-install-loader --php-version <ver> --build-only` / (without `--build-only`) — §3.10. |
-| **Raw / Assets / Obfuscate / Scan / Fail warnings** chips | `--raw` / `--include-assets` / `--obfuscate` / `--scan` (Scan is **on by default** in the GUI) / `--fail-on-scan-warning`. **Assets** is off by default and disabled while **Raw** is selected. |
+| **Raw / Assets / Obfuscate / Scan / Fail warnings** chips | `--raw` / `--include-assets` / bytecode-level `--obfuscate` / `--scan` (Scan is **on by default** in the GUI) / `--fail-on-scan-warning`. **Assets** is off by default and disabled while **Raw** is selected. |
+| **Workflow** menu | `--workflow encode-only|obfuscate-only|obfuscate-then-encode|encode-then-obfuscate`. Disabled while **Raw** is selected. |
 | **Add Files** / **Add Folder** | Builds up the `<source-file-or-dir>...` argument list — shown in the source list below with a remove (×) per entry and a **Clear** to empty it. |
 | **bytecode.json** field | `--config <path>` — §3.9. |
 | **Vendor secret key file** field + sparkle icon (**Regenerate vendor secret**) | `build/vendor-secret.key`, passed as `BYTECODE_VENDOR_KEY_FILE` for Dump. The file is auto-created by the CLI if missing; the sparkle icon runs `bytecode-keygen --vendor-secret --force`. Disabled when **Raw** is selected, since raw mode needs no key. |

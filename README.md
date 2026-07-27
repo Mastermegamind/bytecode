@@ -456,19 +456,29 @@ php8.4 -n -d extension=php/src/modules/opdump.so -f app/index.php
 
 ## Obfuscation
 
-The primary protection model is encrypted bytecode containers, not source
-rewriting. There is also an optional, conservative variable-name obfuscation
-mode:
+The primary protection model is encrypted bytecode containers, but the CLI and
+GUI also support a conservative source obfuscation stage. Choose the workflow
+that matches the build you want:
 
 ```bash
-BYTECODE_KEY="$KEY" php/bin/bytecode-dump --obfuscate app /tmp/bytecode-out
+php8.4 php/bin/bytecode-dump --workflow encode-only app /tmp/bytecode-out
+php8.4 php/bin/bytecode-dump --workflow obfuscate-only app /tmp/obfuscated-src
+php8.4 php/bin/bytecode-dump --workflow obfuscate-then-encode app /tmp/bytecode-out
+php8.4 php/bin/bytecode-dump --workflow encode-then-obfuscate app /tmp/bytecode-out
 ```
 
-This renames non-parameter local variables to `_v0`, `_v1`, and so on inside
-the dumped bytecode. It is skipped per function when PHP constructs such as
-`compact()`, `extract()`, `get_defined_vars()`, or variable variables could
-depend on the original local name. Parameters are preserved because named
-arguments and Reflection depend on them.
+The source obfuscator preserves namespaces, class names, function names, method
+names, properties, constants, parameters, superglobals, globals, and framework
+entry points. It only renames safe function/method local variables, so OOP,
+PSR-style autoloading, MVC controllers, and PDO type hints keep their public
+shape. Bodies using `compact()`, `extract()`, `get_defined_vars()`, `global`,
+`static`, nested closures, or variable variables are skipped rather than
+rewritten.
+
+The older `--obfuscate` flag is still available as an extra bytecode-level
+local-variable metadata pass during encoding. It is separate from
+`--workflow`; use it only when you want that additional compiled-bytecode
+rename layer.
 
 Class names, method names, property names, function names, and public symbols
 are currently preserved. More aggressive symbol rewriting needs application
