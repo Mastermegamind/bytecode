@@ -1,9 +1,75 @@
 #!/usr/bin/env php
 <?php
 
-if ($argc > 1 && in_array($argv[1], ['-h', '--help'], true)) {
-    fwrite(STDERR, "Usage: bytecode-keygen\n\nPrints a 32-byte key as 64 hex characters.\n");
+declare(strict_types=1);
+
+function usage(): void
+{
+    fwrite(STDERR, <<<'USAGE'
+Usage:
+  bytecode-keygen
+  bytecode-keygen --out <path> [--force]
+  bytecode-keygen --vendor-secret [--force]
+
+Prints a 32-byte key as 64 hex characters, or writes one to a key file.
+--vendor-secret writes build/vendor-secret.key under the repository root.
+
+USAGE);
+}
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+$args = array_slice($argv, 1);
+if (in_array($args[0] ?? '', ['-h', '--help'], true)) {
+    usage();
     exit(0);
 }
 
-echo bin2hex(random_bytes(32)), PHP_EOL;
+$out = null;
+$force = false;
+while ($args) {
+    $arg = array_shift($args);
+    if ($arg === '--force') {
+        $force = true;
+        continue;
+    }
+    if ($arg === '--vendor-secret') {
+        $out = dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key';
+        continue;
+    }
+    if ($arg === '--out') {
+        if (!$args) {
+            fail('--out requires a path', 2);
+        }
+        $out = array_shift($args);
+        continue;
+    }
+    if (str_starts_with($arg, '--out=')) {
+        $out = substr($arg, strlen('--out='));
+        continue;
+    }
+    usage();
+    exit(2);
+}
+
+$key = bin2hex(random_bytes(32));
+if ($out === null || $out === '') {
+    echo $key, PHP_EOL;
+    exit(0);
+}
+
+if (is_file($out) && !$force) {
+    fail("key file already exists: {$out} (pass --force to regenerate)", 2);
+}
+if (!is_dir(dirname($out)) && !@mkdir(dirname($out), 0770, true) && !is_dir(dirname($out))) {
+    fail("cannot create key directory: " . dirname($out));
+}
+if (file_put_contents($out, $key . PHP_EOL) === false) {
+    fail("cannot write key file: {$out}");
+}
+@chmod($out, 0600);
+echo $out, PHP_EOL;

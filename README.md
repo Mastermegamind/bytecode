@@ -93,17 +93,23 @@ minor versions, the loader contains compatibility branches for 8.1 through 8.5.
 
 ### 2. Container Format
 
-The CLI tools wrap raw Zend blobs into encrypted `BYTC2`-format containers.
-The output file keeps the source's own filename and extension (e.g.
-`index.php` in → `index.php` out, encrypted) so it's a drop-in replacement —
-it's identified by content, not by a special extension. (`--raw` debug
-output is the exception, written as `<name>.opd2`.)
+The CLI tools wrap raw Zend blobs and protected assets into encrypted
+`BYTC2`-format containers. The output file keeps the source's own filename and
+extension (e.g. `index.php` in → `index.php` out, encrypted) so it's a drop-in
+replacement — it's identified by content, not by a special extension. (`--raw`
+debug output is the exception, written as `<name>.opd2`.) PHP files are stored
+as Zend opcode dumps (`php-zend-opdump`/`OPD2`). When `bytecode-dump` is run
+with `--include-assets`, `.html`, `.htm`, `.css`, `.js`, `.mjs`, and `.twig`
+files are stored as encrypted raw assets (`bytecode-asset`/`RAW1`) for serving
+through `php/runtime/bytecode-assets.php`.
 
 `BYTC2` provides:
 
 - AES-256-GCM authenticated encryption for each container payload.
 - HKDF-SHA256 key derivation from `BYTECODE_KEY` or `OPDUMP_KEY`, so the
-  environment value is input keying material rather than the raw AES key.
+  environment value is input keying material rather than the raw AES key. For
+  normal local encoding, `bytecode-dump` defaults to `build/vendor-secret.key`
+  and auto-creates that file when it is missing.
 - A manifest signature over `bytecode.manifest.json` and `bytecode.map`, so a
   deployment cannot silently rewrite the source-to-container map.
 - Optional license mode where a per-build data encryption key is RSA-wrapped
@@ -117,10 +123,13 @@ compatibility.
 The command-line tools under [`php/bin`](php/bin) provide the user-facing
 workflow:
 
-- `bytecode-keygen`: generate a random shared key.
+- `bytecode-keygen`: generate a random shared key, or regenerate the default
+  `build/vendor-secret.key` with `--vendor-secret --force`.
 - `bytecode-dump`: walk files/directories, dump bytecode, pack encoded
   containers, and write the manifest/map.
 - `bytecode-pack`: pack one raw dump into a container.
+- `bytecode-pack-asset`: pack one HTML/CSS/JS/Twig asset into an encrypted
+  raw-asset container.
 - `bytecode-info`: inspect a container header and metadata.
 - `bytecode-verify`: verify manifests, hashes, sizes, map entries, and
   signatures.
@@ -128,6 +137,12 @@ workflow:
 - `bytecode-vendor-keygen`: generate the vendor Ed25519 signing keypair used to
   seal packages (tamper-proof licensing); prints the compile-in public-key hex.
 - `bytecode-scan`: preflight source scanner for dynamic PHP hazards.
+
+Twig templates can be protected two ways. For normal Twig rendering, compile the
+Twig cache to PHP and encode that cache as PHP bytecode. If you include raw
+`.twig` files in a dump with `--include-assets`, they are protected as encrypted
+assets; the runtime helper can decrypt and stream them, but they are not Zend
+bytecode until Twig compiles them.
 
 The scanner was inspired by Yakpro PO's practical PHP-obfuscation lessons. It
 does not replace bytecode encoding; it warns about constructs that affect safe

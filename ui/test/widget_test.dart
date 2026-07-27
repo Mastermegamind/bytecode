@@ -9,7 +9,7 @@ void main() {
     expect(find.text('Add Files'), findsOneWidget);
     expect(find.text('Add Folder'), findsOneWidget);
     expect(find.text('Output folder'), findsOneWidget);
-    expect(find.text('BYTECODE_KEY'), findsOneWidget);
+    expect(find.text('Vendor secret key file'), findsOneWidget);
     expect(find.text('Dump'), findsOneWidget);
     expect(find.text('Verify'), findsOneWidget);
   });

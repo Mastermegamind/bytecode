@@ -24,6 +24,7 @@
 #include "zend_extensions.h"
 #include "zend_vm.h"
 #include "zend_string.h"
+#include "zend_inheritance.h"
 #include <openssl/evp.h>
 #include <openssl/hmac.h>
 #include <openssl/pem.h>
@@ -222,7 +223,9 @@ typedef enum {
     OPDUMP_LIT_LONG  = 3,
     OPDUMP_LIT_DOUBLE = 4,
     OPDUMP_LIT_STRING = 5,
-    OPDUMP_LIT_UNDEF = 6
+    OPDUMP_LIT_UNDEF = 6,
+    OPDUMP_LIT_ARRAY = 7,
+    OPDUMP_LIT_AST = 8
 } opdump_lit_tag;
 
 static void w_u8(FILE *f, uint8_t v)   { fwrite(&v, 1, 1, f); }
@@ -416,10 +419,32 @@ static bool opdump_key_from_env(unsigned char key[32])
 
 static bool opdump_vendor_key(unsigned char key[32])
 {
-    const char *hex = OPDUMP_VENDOR_SECRET_HEX;
+    const char *hex = getenv("BYTECODE_VENDOR_KEY");
+    if (hex && hex[0]) {
+        return strlen(hex) == 64 && opdump_hex_decode(hex, key, 32);
+    }
+
+    const char *file = getenv("BYTECODE_VENDOR_KEY_FILE");
+    if (file && file[0]) {
+        FILE *f = fopen(file, "rb");
+        if (!f) {
+            return false;
+        }
+        char buf[80];
+        size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+        buf[n] = '\0';
+        while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' ' || buf[n - 1] == '\t')) {
+            buf[--n] = '\0';
+        }
+        return n == 64 && opdump_hex_decode(buf, key, 32);
+    }
+
+    hex = OPDUMP_VENDOR_SECRET_HEX;
     if (!hex || !hex[0] || strlen(hex) != 64) {
         return false;
     }
+
     return opdump_hex_decode(hex, key, 32);
 }
 
@@ -1648,6 +1673,16 @@ static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned c
 
 /* ---- dump ---- */
 
+/* Maximum constant-expression AST depth we will (de)serialize, to bound both
+ * output size and load-time recursion on a hostile container. */
+#define OPDUMP_MAX_AST_DEPTH 256
+
+static void opdump_write_array(FILE *f, HashTable *ht);
+static void opdump_read_array(FILE *f, zval *zv);
+static void opdump_write_ast(FILE *f, zend_ast *ast, int depth);
+static zend_ast *opdump_read_ast(FILE *f, int depth);
+static void opdump_free_ast(zend_ast *ast);
+
 static void opdump_write_literal(FILE *f, zval *zv)
 {
     switch (Z_TYPE_P(zv)) {
@@ -1658,11 +1693,24 @@ static void opdump_write_literal(FILE *f, zval *zv)
         case IS_LONG:  w_u8(f, OPDUMP_LIT_LONG); w_u32(f, (uint32_t)Z_LVAL_P(zv)); w_u32(f, (uint32_t)(((zend_long)Z_LVAL_P(zv)) >> 32)); break;
         case IS_DOUBLE: w_u8(f, OPDUMP_LIT_DOUBLE); w_dbl(f, Z_DVAL_P(zv)); break;
         case IS_STRING: w_u8(f, OPDUMP_LIT_STRING); w_str(f, Z_STRVAL_P(zv), Z_STRLEN_P(zv)); break;
+        case IS_ARRAY:  w_u8(f, OPDUMP_LIT_ARRAY); opdump_write_array(f, Z_ARRVAL_P(zv)); break;
+        case IS_CONSTANT_AST: w_u8(f, OPDUMP_LIT_AST); opdump_write_ast(f, Z_ASTVAL_P(zv), 0); break;
         default:
-            php_error_docref(NULL, E_WARNING,
-                "opdump: literal type %d not supported yet (Phase 0 scope), writing NULL placeholder",
-                Z_TYPE_P(zv));
-            w_u8(f, OPDUMP_LIT_NULL);
+            /* Fail closed: a value shape we cannot faithfully round-trip must
+             * abort the dump, never be silently replaced with NULL -- a silent
+             * substitution would ship subtly wrong behaviour to production. Set
+             * OPDUMP_ALLOW_LOSSY=1 to opt into the old placeholder behaviour for
+             * throwaway experiments only. */
+            if (getenv("OPDUMP_ALLOW_LOSSY")) {
+                php_error_docref(NULL, E_WARNING,
+                    "opdump: unsupported literal type %d -- writing NULL placeholder (OPDUMP_ALLOW_LOSSY)",
+                    Z_TYPE_P(zv));
+                w_u8(f, OPDUMP_LIT_NULL);
+            } else {
+                php_error_docref(NULL, E_ERROR,
+                    "opdump: unsupported value type %d in a compiled literal/constant; refusing to emit a lossy container (set OPDUMP_ALLOW_LOSSY=1 to override)",
+                    Z_TYPE_P(zv));
+            }
     }
 }
 
@@ -1692,9 +1740,192 @@ static void opdump_read_literal(FILE *f, zval *zv)
             ZVAL_STR(zv, zs);
             break;
         }
+        case OPDUMP_LIT_ARRAY: opdump_read_array(f, zv); break;
+        case OPDUMP_LIT_AST: {
+            zend_ast *tmp = opdump_read_ast(f, 0);
+            if (tmp) {
+                /* zend_ast_copy consolidates the temporary tree into a single
+                 * refcounted zend_ast_ref -- exactly the shape a persistent
+                 * constant/default-value AST needs -- deep-copying (addref'ing)
+                 * every embedded zval, so we then release our temporary tree. */
+                zend_ast_ref *ref = zend_ast_copy(tmp);
+                opdump_free_ast(tmp);
+                ZVAL_AST(zv, ref);
+            } else {
+                ZVAL_NULL(zv);
+            }
+            break;
+        }
         default:
             ZVAL_NULL(zv);
     }
+}
+
+/* ---- array + constant-AST value (de)serialization ----
+ *
+ * op_array literals, class-constant values, and property/static-member
+ * defaults are ordinary zvals, but for anything richer than a scalar they are
+ * either an IS_ARRAY (a constant array operand) or, far more often, an
+ * IS_CONSTANT_AST: a deferred expression (`const A = [1, 2]`, `= self::X | 4`,
+ * `= PHP_INT_MAX`, `new Foo()`) that PHP evaluates lazily the first time the
+ * owning constant/property is read. Both can nest arbitrarily, so both codecs
+ * recurse back through opdump_{write,read}_literal. */
+static void opdump_write_array(FILE *f, HashTable *ht)
+{
+    uint32_t n = ht ? zend_hash_num_elements(ht) : 0;
+    w_u32(f, n);
+    if (!n) {
+        return;
+    }
+    zend_ulong num_key;
+    zend_string *str_key;
+    zval *val;
+    ZEND_HASH_FOREACH_KEY_VAL(ht, num_key, str_key, val) {
+        if (str_key) {
+            w_u8(f, 1);
+            w_zstr(f, str_key);
+        } else {
+            w_u8(f, 0);
+            w_u32(f, (uint32_t) num_key);
+            w_u32(f, (uint32_t) (((uint64_t) num_key) >> 32));
+        }
+        ZVAL_DEREF(val);
+        opdump_write_literal(f, val);
+    } ZEND_HASH_FOREACH_END();
+}
+
+static void opdump_read_array(FILE *f, zval *zv)
+{
+    uint32_t n = r_u32(f);
+    opdump_guard_u32(n, OPDUMP_MAX_LITERALS, "array element");
+    zend_array *arr = zend_new_array(n);
+    for (uint32_t i = 0; i < n; i++) {
+        uint8_t is_str = r_u8(f);
+        zval tmp;
+        if (is_str) {
+            zend_string *k = r_zstr(f, false);
+            opdump_read_literal(f, &tmp);
+            zend_hash_update(arr, k, &tmp);
+            zend_string_release(k);
+        } else {
+            uint32_t lo = r_u32(f);
+            uint32_t hi = r_u32(f);
+            zend_ulong k = ((zend_ulong) hi << 32) | lo;
+            opdump_read_literal(f, &tmp);
+            zend_hash_index_update(arr, k, &tmp);
+        }
+    }
+    ZVAL_ARR(zv, arr);
+}
+
+/* zend_ast kinds encode their own shape: ZEND_AST_ZVAL/ZEND_AST_CONSTANT carry
+ * a zval, list kinds carry a runtime child count, and every other kind's fixed
+ * child count is (kind >> ZEND_AST_NUM_CHILDREN_SHIFT). That lets one generic
+ * walker cover every node that can appear in a constant expression without
+ * enumerating opcodes. */
+static void opdump_write_ast(FILE *f, zend_ast *ast, int depth)
+{
+    if (!ast || depth > OPDUMP_MAX_AST_DEPTH) {
+        w_u8(f, 0);
+        return;
+    }
+    w_u8(f, 1);
+    w_u32(f, (uint32_t) ast->kind);
+    w_u32(f, (uint32_t) ast->attr);
+
+    if (ast->kind == ZEND_AST_ZVAL || ast->kind == ZEND_AST_CONSTANT) {
+        zval *zv = zend_ast_get_zval(ast);
+        w_u32(f, Z_LINENO_P(zv));
+        opdump_write_literal(f, zv);
+    } else if (zend_ast_is_list(ast)) {
+        zend_ast_list *list = zend_ast_get_list(ast);
+        w_u32(f, list->lineno);
+        w_u32(f, list->children);
+        for (uint32_t i = 0; i < list->children; i++) {
+            opdump_write_ast(f, list->child[i], depth + 1);
+        }
+    } else {
+        w_u32(f, ast->lineno);
+        uint32_t children = zend_ast_get_num_children(ast);
+        w_u32(f, children);
+        for (uint32_t i = 0; i < children; i++) {
+            opdump_write_ast(f, ast->child[i], depth + 1);
+        }
+    }
+}
+
+static zend_ast *opdump_read_ast(FILE *f, int depth)
+{
+    if (!r_u8(f)) {
+        return NULL;
+    }
+    if (depth > OPDUMP_MAX_AST_DEPTH) {
+        php_error_docref(NULL, E_ERROR, "opdump: constant-expression AST nesting too deep");
+        return NULL;
+    }
+    uint32_t kind = r_u32(f);
+    uint32_t attr = r_u32(f);
+
+    if (kind == ZEND_AST_ZVAL || kind == ZEND_AST_CONSTANT) {
+        uint32_t lineno = r_u32(f);
+        zend_ast_zval *node = (zend_ast_zval *) emalloc(sizeof(zend_ast_zval));
+        node->kind = (zend_ast_kind) kind;
+        node->attr = (zend_ast_attr) attr;
+        opdump_read_literal(f, &node->val);
+        Z_LINENO(node->val) = lineno;
+        return (zend_ast *) node;
+    }
+
+    if (kind & (1 << ZEND_AST_IS_LIST_SHIFT)) {
+        uint32_t lineno = r_u32(f);
+        uint32_t children = r_u32(f);
+        opdump_guard_u32(children, OPDUMP_MAX_LITERALS, "AST list child");
+        zend_ast_list *node = (zend_ast_list *) emalloc(sizeof(zend_ast_list) + (children ? children - 1 : 0) * sizeof(zend_ast *));
+        node->kind = (zend_ast_kind) kind;
+        node->attr = (zend_ast_attr) attr;
+        node->lineno = lineno;
+        node->children = children;
+        for (uint32_t i = 0; i < children; i++) {
+            node->child[i] = opdump_read_ast(f, depth + 1);
+        }
+        return (zend_ast *) node;
+    }
+
+    uint32_t lineno = r_u32(f);
+    uint32_t children = r_u32(f);
+    opdump_guard_u32(children, OPDUMP_MAX_LITERALS, "AST child");
+    zend_ast *node = (zend_ast *) emalloc(sizeof(zend_ast) + (children ? children - 1 : 0) * sizeof(zend_ast *));
+    node->kind = (zend_ast_kind) kind;
+    node->attr = (zend_ast_attr) attr;
+    node->lineno = lineno;
+    for (uint32_t i = 0; i < children; i++) {
+        node->child[i] = opdump_read_ast(f, depth + 1);
+    }
+    return node;
+}
+
+/* Frees the temporary tree built by opdump_read_ast after zend_ast_copy has
+ * taken its own refcounted copy. Mirrors opdump_read_ast's shape decisions and
+ * drops the one zval reference each ZVAL/CONSTANT leaf holds. */
+static void opdump_free_ast(zend_ast *ast)
+{
+    if (!ast) {
+        return;
+    }
+    if (ast->kind == ZEND_AST_ZVAL || ast->kind == ZEND_AST_CONSTANT) {
+        zval_ptr_dtor_nogc(zend_ast_get_zval(ast));
+    } else if (zend_ast_is_list(ast)) {
+        zend_ast_list *list = zend_ast_get_list(ast);
+        for (uint32_t i = 0; i < list->children; i++) {
+            opdump_free_ast(list->child[i]);
+        }
+    } else {
+        uint32_t children = zend_ast_get_num_children(ast);
+        for (uint32_t i = 0; i < children; i++) {
+            opdump_free_ast(ast->child[i]);
+        }
+    }
+    efree(ast);
 }
 
 /* ---- safe variable-name obfuscation (Rung E) ----
@@ -1838,6 +2069,23 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
     for (uint32_t i = 0; i < op_array->num_dynamic_func_defs; i++) {
         opdump_write_op_array(f, op_array->dynamic_func_defs[i]);
     }
+
+    /* `static $v = <initial>;` inside a function/method. The initial values live
+     * in op_array->static_variables keyed by variable name and can be arrays or
+     * constant-AST, so they route through opdump_write_literal like any other
+     * value. Without this, static locals silently come back as NULL. */
+    if (op_array->static_variables) {
+        w_u32(f, zend_hash_num_elements(op_array->static_variables));
+        zend_string *sv_key;
+        zval *sv_val;
+        ZEND_HASH_MAP_FOREACH_STR_KEY_VAL(op_array->static_variables, sv_key, sv_val) {
+            w_zstr(f, sv_key);
+            ZVAL_DEREF(sv_val);
+            opdump_write_literal(f, sv_val);
+        } ZEND_HASH_FOREACH_END();
+    } else {
+        w_u32(f, 0);
+    }
 }
 
 static bool opdump_function_belongs_to_file(zend_function *func, zend_string *filename)
@@ -1917,6 +2165,7 @@ static zend_property_info *opdump_read_property_info(FILE *f, zend_class_entry *
     prop->doc_comment = r_zstr(f, true);
     prop->type = opdump_read_type(f);
     prop->ce = ce;
+    prop->prototype = prop;
     return prop;
 }
 
@@ -1950,7 +2199,8 @@ static void opdump_write_class_entry(FILE *f, zend_class_entry *ce)
         prop_count++;
     } ZEND_HASH_FOREACH_END();
     w_u32(f, prop_count);
-    ZEND_HASH_MAP_FOREACH_PTR(&ce->properties_info, prop) {
+    ZEND_HASH_MAP_FOREACH_STR_KEY_PTR(&ce->properties_info, key, prop) {
+        w_zstr(f, key);
         opdump_write_property_info(f, prop);
     } ZEND_HASH_FOREACH_END();
 
@@ -1964,6 +2214,108 @@ static void opdump_write_class_entry(FILE *f, zend_class_entry *ce)
         if (func->type == ZEND_USER_FUNCTION) {
             w_zstr(f, key);
             opdump_write_op_array(f, &func->op_array);
+        }
+    } ZEND_HASH_FOREACH_END();
+
+    /* --- class constants (own only; inherited ones arrive via linking) ---
+     * A constant's value is an ordinary zval that may be a scalar, an array,
+     * or an unevaluated IS_CONSTANT_AST (e.g. `const B = self::A | 4`); the
+     * visibility/final bits live in its u2 constant_flags. Without this a
+     * `Foo::BAR` fetch finds nothing and fails at runtime. */
+    zend_class_constant *cc;
+    zend_string *cc_key;
+    uint32_t const_count = 0;
+    ZEND_HASH_MAP_FOREACH_STR_KEY_PTR(&ce->constants_table, cc_key, cc) {
+        (void) cc_key;
+        if (cc->ce == ce) {
+            if ((ZEND_CLASS_CONST_FLAGS(cc) & ZEND_CLASS_CONST_IS_CASE) || Z_TYPE(cc->value) == IS_OBJECT) {
+                php_error_docref(NULL, E_ERROR, "opdump: enum cases are not yet supported by the loader (%s)", ZSTR_VAL(ce->name));
+            }
+            const_count++;
+        }
+    } ZEND_HASH_FOREACH_END();
+    w_u32(f, const_count);
+    ZEND_HASH_MAP_FOREACH_STR_KEY_PTR(&ce->constants_table, cc_key, cc) {
+        if (cc->ce != ce) {
+            continue;
+        }
+        w_zstr(f, cc_key);
+        w_u32(f, (uint32_t) Z_CONSTANT_FLAGS(cc->value));
+        opdump_write_literal(f, &cc->value);
+    } ZEND_HASH_FOREACH_END();
+
+    /* --- static property defaults --- (default_static_members_count was
+     * written above). Values may again be arrays or constant-AST. */
+    for (int i = 0; i < ce->default_static_members_count; i++) {
+        zval *sv = &ce->default_static_members_table[i];
+        ZVAL_DEREF(sv);
+        opdump_write_literal(f, sv);
+    }
+
+    /* --- inheritance link targets ---
+     * Serialize the names of the parent, interfaces, and traits so that a class
+     * whose relatives live in other (autoloaded) files can be linked at load
+     * time by its DECLARE_CLASS_DELAYED opcode. When the class was already
+     * linked at compile time (a same-file parent), its union holds resolved CE
+     * pointers instead of names, so read them from there. */
+    bool ce_linked = (ce->ce_flags & ZEND_ACC_LINKED) != 0;
+    if (ce_linked) {
+        w_zstr(f, ce->parent ? ce->parent->name : NULL);
+    } else {
+        w_zstr(f, ce->parent_name);
+    }
+    w_u32(f, ce->num_interfaces);
+    for (uint32_t i = 0; i < ce->num_interfaces; i++) {
+        if (ce_linked) {
+            zend_string *nm = ce->interfaces[i]->name;
+            zend_string *lc = zend_string_tolower(nm);
+            w_zstr(f, nm);
+            w_zstr(f, lc);
+            zend_string_release(lc);
+        } else {
+            w_zstr(f, ce->interface_names[i].name);
+            w_zstr(f, ce->interface_names[i].lc_name);
+        }
+    }
+    if (!ce_linked && ce->num_traits > 0) {
+        if (ce->trait_aliases || ce->trait_precedences) {
+            php_error_docref(NULL, E_ERROR, "opdump: trait adaptations (use ... { ... }) on %s are not yet supported by the loader", ZSTR_VAL(ce->name));
+        }
+        w_u32(f, ce->num_traits);
+        for (uint32_t i = 0; i < ce->num_traits; i++) {
+            w_zstr(f, ce->trait_names[i].name);
+            w_zstr(f, ce->trait_names[i].lc_name);
+        }
+    } else {
+        w_u32(f, 0);
+    }
+}
+
+/* Rebuild ce->properties_info_table, the offset-indexed lookup the runtime
+ * uses for object property access (and that inheritance touches while merging
+ * a parent). The compiler normally builds this at class-declaration time via
+ * zend_build_properties_info_table(), but that symbol is not exported from the
+ * PHP binary, so we reconstruct an equivalent here. Slots left NULL (e.g. for
+ * a linked class's inherited properties) are fine -- the engine falls back to
+ * its slow per-slot lookup for those. */
+static void opdump_build_properties_info_table(zend_class_entry *ce)
+{
+    if (ce->default_properties_count == 0) {
+        ce->properties_info_table = NULL;
+        return;
+    }
+    size_t bytes = sizeof(zend_property_info *) * (size_t) ce->default_properties_count;
+    zend_property_info **table = (zend_property_info **) emalloc(bytes);
+    memset(table, 0, bytes);
+    ce->properties_info_table = table;
+
+    zend_property_info *prop;
+    ZEND_HASH_MAP_FOREACH_PTR(&ce->properties_info, prop) {
+        if (!(prop->flags & ZEND_ACC_STATIC)) {
+            uint32_t num = OBJ_PROP_TO_NUM(prop->offset);
+            if (num < (uint32_t) ce->default_properties_count) {
+                table[num] = prop;
+            }
         }
     } ZEND_HASH_FOREACH_END();
 }
@@ -2001,8 +2353,10 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     uint32_t prop_count = r_u32(f);
     opdump_guard_u32(prop_count, OPDUMP_MAX_CLASS_PROPERTIES, "class property");
     for (uint32_t i = 0; i < prop_count; i++) {
+        zend_string *prop_key = r_zstr(f, true);
         zend_property_info *prop = opdump_read_property_info(f, ce);
-        zend_hash_add_ptr(&ce->properties_info, prop->name, prop);
+        zend_hash_add_ptr(&ce->properties_info, prop_key, prop);
+        zend_string_release(prop_key);
     }
 
     uint32_t method_count = r_u32(f);
@@ -2017,6 +2371,102 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
         zend_hash_add_ptr(&ce->function_table, key, method);
         zend_string_release(key);
     }
+
+    /* class constants */
+    uint32_t const_count = r_u32(f);
+    opdump_guard_u32(const_count, OPDUMP_MAX_CLASS_METHODS, "class constant");
+    for (uint32_t i = 0; i < const_count; i++) {
+        zend_string *cname = r_zstr(f, true);
+        uint32_t cflags = r_u32(f);
+        zend_class_constant *cc = (zend_class_constant *) emalloc(sizeof(zend_class_constant));
+        memset(cc, 0, sizeof(zend_class_constant));
+        opdump_read_literal(f, &cc->value);
+        Z_CONSTANT_FLAGS(cc->value) = cflags;
+        cc->ce = ce;
+        cc->type = (zend_type) ZEND_TYPE_INIT_NONE(0);
+        zend_hash_add_ptr(&ce->constants_table, cname, cc);
+        zend_string_release(cname);
+    }
+
+    /* static property defaults + the MAP_PTR slot the runtime reads through */
+    if (ce->default_static_members_count > 0) {
+        ce->default_static_members_table = (zval *) ecalloc(ce->default_static_members_count, sizeof(zval));
+        for (int i = 0; i < ce->default_static_members_count; i++) {
+            opdump_read_literal(f, &ce->default_static_members_table[i]);
+        }
+        ZEND_MAP_PTR_NEW(ce->static_members_table);
+    } else {
+        ZEND_MAP_PTR_INIT(ce->static_members_table, NULL);
+    }
+
+    /* inheritance link targets (parent, interfaces, traits) */
+    zend_string *parent_name = r_zstr(f, true);
+    uint32_t num_ifaces = r_u32(f);
+    opdump_guard_u32(num_ifaces, OPDUMP_MAX_CLASS_METHODS, "class interface");
+    zend_class_name *iface_names = NULL;
+    if (num_ifaces > 0) {
+        iface_names = (zend_class_name *) emalloc(sizeof(zend_class_name) * num_ifaces);
+        for (uint32_t i = 0; i < num_ifaces; i++) {
+            iface_names[i].name = r_zstr(f, true);
+            iface_names[i].lc_name = r_zstr(f, true);
+        }
+    }
+    uint32_t num_tr = r_u32(f);
+    opdump_guard_u32(num_tr, OPDUMP_MAX_CLASS_METHODS, "class trait");
+    zend_class_name *tr_names = NULL;
+    if (num_tr > 0) {
+        tr_names = (zend_class_name *) emalloc(sizeof(zend_class_name) * num_tr);
+        for (uint32_t i = 0; i < num_tr; i++) {
+            tr_names[i].name = r_zstr(f, true);
+            tr_names[i].lc_name = r_zstr(f, true);
+        }
+    }
+
+    /* Only an unlinked class still needs linking: install the recovered names
+     * into the union fields the linker consumes. An already-linked class was
+     * captured with its inheritance flattened in, so we keep that and drop the
+     * recorded names. */
+    if (!(ce->ce_flags & ZEND_ACC_LINKED)) {
+        if (parent_name) {
+            ce->parent_name = parent_name;
+            parent_name = NULL;
+        }
+        if (num_ifaces > 0) {
+            ce->num_interfaces = num_ifaces;
+            ce->interface_names = iface_names;
+            iface_names = NULL;
+        }
+        if (num_tr > 0) {
+            ce->num_traits = num_tr;
+            ce->trait_names = tr_names;
+            tr_names = NULL;
+        }
+    }
+    if (parent_name) {
+        zend_string_release(parent_name);
+    }
+    if (iface_names) {
+        for (uint32_t i = 0; i < num_ifaces; i++) {
+            zend_string_release(iface_names[i].name);
+            zend_string_release(iface_names[i].lc_name);
+        }
+        efree(iface_names);
+    }
+    if (tr_names) {
+        for (uint32_t i = 0; i < num_tr; i++) {
+            zend_string_release(tr_names[i].name);
+            zend_string_release(tr_names[i].lc_name);
+        }
+        efree(tr_names);
+    }
+
+    /* Rebuild the offset->property_info lookup table the runtime uses for
+     * object property access and that inheritance reads while merging a parent
+     * -- the compiler builds this at class-declaration time, so a loaded class
+     * must too or property access (and delayed linking) dereferences NULL. For
+     * an unlinked class this covers its own properties; the linker rebuilds it
+     * to include inherited ones when DECLARE_CLASS_DELAYED fires. */
+    opdump_build_properties_info_table(ce);
 
     return ce;
 }
@@ -2228,6 +2678,33 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         }
     }
 
+    /* Rebuild the `static $v = ...` initializer table and point the op_array's
+     * MAP_PTR slot at it, exactly as the compiler leaves a freshly-parsed
+     * op_array: ZEND_BIND_STATIC reads static_variables_ptr at runtime and
+     * duplicates this template into per-invocation storage on first use. */
+    uint32_t static_var_count = r_u32(f);
+    opdump_guard_u32(static_var_count, OPDUMP_MAX_LITERALS, "static variable");
+    if (static_var_count > 0) {
+        HashTable *statics;
+        ALLOC_HASHTABLE(statics);
+        zend_hash_init(statics, static_var_count, NULL, ZVAL_PTR_DTOR, 0);
+        for (uint32_t i = 0; i < static_var_count; i++) {
+            zend_string *sv_key = r_zstr(f, false);
+            zval sv_val;
+            opdump_read_literal(f, &sv_val);
+            zend_hash_update(statics, sv_key, &sv_val);
+            zend_string_release(sv_key);
+        }
+        op_array->static_variables = statics;
+    } else {
+        op_array->static_variables = NULL;
+    }
+#if PHP_VERSION_ID < 80200
+    ZEND_MAP_PTR_INIT(op_array->static_variables_ptr, &op_array->static_variables);
+#else
+    ZEND_MAP_PTR_INIT(op_array->static_variables_ptr, op_array->static_variables);
+#endif
+
     opdump_init_run_time_cache(op_array);
 
     if (getenv("OPDUMP_DEBUG")) {
@@ -2293,12 +2770,23 @@ static zend_op_array *opdump_read_raw_stream(FILE *f, const char *path)
         zend_class_entry *ce = opdump_read_class_entry(f);
         zend_hash_add_ptr(EG(class_table), key, ce);
         zend_string *lcname = zend_string_tolower(ce->name);
-        if (!zend_string_equals(lcname, key)) {
+        /* A class whose parent/interfaces were not yet known when its file was
+         * compiled is stored under a "delayed early binding" key -- a synthetic
+         * name with a leading NUL byte -- and the file's op_array carries a
+         * DECLARE_CLASS_DELAYED opcode that links it (autoloading the parent)
+         * and installs it under its real lowercased name at runtime. If we also
+         * pre-registered it under that real name here, the later delayed bind
+         * would see the name already taken and abort with "Cannot redeclare
+         * class" (or leave it unlinked so parent methods look missing). So only
+         * alias to the lowercased name for normal (non-delayed) keys; delayed
+         * ones get aliased for us when their DECLARE_CLASS_DELAYED runs. */
+        bool delayed_binding_key = ZSTR_LEN(key) > 0 && ZSTR_VAL(key)[0] == '\0';
+        if (!delayed_binding_key && !zend_string_equals(lcname, key)) {
             zend_hash_add_ptr(EG(class_table), lcname, ce);
         }
         if (getenv("OPDUMP_DEBUG")) {
-            fprintf(stderr, "[opdump debug] registered class key=\"%s\" lc=\"%s\" name=\"%s\"\n",
-                ZSTR_VAL(key), ZSTR_VAL(lcname), ZSTR_VAL(ce->name));
+            fprintf(stderr, "[opdump debug] registered class key=\"%s\" lc=\"%s\" name=\"%s\" delayed=%d\n",
+                ZSTR_VAL(key), ZSTR_VAL(lcname), ZSTR_VAL(ce->name), (int) delayed_binding_key);
             fprintf(stderr, "[opdump debug] class table has lc? %s\n",
                 zend_hash_exists(EG(class_table), lcname) ? "yes" : "no");
         }

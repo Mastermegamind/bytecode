@@ -132,6 +132,7 @@ class _EncoderPageState extends State<EncoderPage> {
 
   bool _busy = false;
   bool _rawContainers = false;
+  bool _includeAssets = false;
   bool _obfuscate = false;
   bool _scanBeforeDump = true;
   bool _failOnScanWarning = false;
@@ -141,6 +142,13 @@ class _EncoderPageState extends State<EncoderPage> {
   void initState() {
     super.initState();
     _rootController = TextEditingController(text: _defaultRepoRoot());
+    _keyController.text = _vendorSecretPath;
+    _rootController.addListener(() {
+      final path = _vendorSecretPath;
+      if (_keyController.text != path) {
+        _keyController.text = path;
+      }
+    });
   }
 
   @override
@@ -245,6 +253,8 @@ class _EncoderPageState extends State<EncoderPage> {
   }
 
   String get _root => _rootController.text.trim();
+  String get _vendorSecretPath =>
+      _join(_join(_root, 'build'), 'vendor-secret.key');
   String get _manifestPath =>
       _join(_outputController.text.trim(), 'bytecode.manifest.json');
 
@@ -252,6 +262,16 @@ class _EncoderPageState extends State<EncoderPage> {
     final path = await getDirectoryPath();
     if (path != null) {
       setState(() => controller.text = path);
+    }
+  }
+
+  Future<void> _pickRoot() async {
+    final path = await getDirectoryPath();
+    if (path != null) {
+      setState(() {
+        _rootController.text = path;
+        _keyController.text = _vendorSecretPath;
+      });
     }
   }
 
@@ -300,13 +320,15 @@ class _EncoderPageState extends State<EncoderPage> {
     await _runLocked(() async {
       final result = await Process.run(_phpBinary(), [
         _join(_root, 'php/bin/bytecode-keygen'),
+        '--vendor-secret',
+        '--force',
       ], workingDirectory: _root);
       if (result.exitCode != 0) {
         _append(result.stderr.toString());
-        throw StateError('key generation failed');
+        throw StateError('vendor secret regeneration failed');
       }
       _keyController.text = result.stdout.toString().trim();
-      _status = 'Key generated';
+      _status = 'Vendor secret regenerated';
     });
   }
 
@@ -347,17 +369,10 @@ class _EncoderPageState extends State<EncoderPage> {
 
   Future<void> _dump() async {
     final output = _outputController.text.trim();
-    final key = _keyController.text.trim();
     final licensePubkey = _licensePubkeyController.text.trim();
     final vendorSignKey = _vendorSignKeyController.text.trim();
     if (_sources.isEmpty || output.isEmpty) {
       setState(() => _status = 'At least one source and output are required');
-      return;
-    }
-    if (!_rawContainers &&
-        licensePubkey.isEmpty &&
-        !RegExp(r'\A[0-9a-fA-F]{64}\z').hasMatch(key)) {
-      setState(() => _status = 'Key must be 64 hex characters');
       return;
     }
 
@@ -371,7 +386,7 @@ class _EncoderPageState extends State<EncoderPage> {
       if (!_rawContainers && licensePubkey.isNotEmpty) {
         env['BYTECODE_LICENSE_PUBKEY'] = licensePubkey;
       } else if (!_rawContainers) {
-        env['BYTECODE_KEY'] = key;
+        env['BYTECODE_VENDOR_KEY_FILE'] = _vendorSecretPath;
       }
       if (!_rawContainers && vendorSignKey.isNotEmpty) {
         env['BYTECODE_VENDOR_SIGN_KEY'] = vendorSignKey;
@@ -380,6 +395,7 @@ class _EncoderPageState extends State<EncoderPage> {
       final exit = await _runStreaming(_phpBinary(), [
         _join(_root, 'php/bin/bytecode-dump'),
         if (_rawContainers) '--raw',
+        if (_includeAssets && !_rawContainers) '--include-assets',
         if (_obfuscate) '--obfuscate',
         if (_scanBeforeDump) '--scan',
         if (_failOnScanWarning) '--fail-on-scan-warning',
@@ -438,10 +454,12 @@ class _EncoderPageState extends State<EncoderPage> {
           'vendor.sign.pub.pem',
         );
       }
-      final result = await Process.run(_phpBinary(), [
-        _join(_root, 'php/bin/bytecode-verify'),
-        _manifestPath,
-      ], workingDirectory: _root, environment: env.isEmpty ? null : env);
+      final result = await Process.run(
+        _phpBinary(),
+        [_join(_root, 'php/bin/bytecode-verify'), _manifestPath],
+        workingDirectory: _root,
+        environment: env.isEmpty ? null : env,
+      );
       _append(result.stdout.toString());
       _append(result.stderr.toString());
       if (result.exitCode != 0) {
@@ -691,10 +709,11 @@ class _EncoderPageState extends State<EncoderPage> {
               busy: _busy,
               status: _status,
               rawContainers: _rawContainers,
+              includeAssets: _includeAssets,
               obfuscate: _obfuscate,
               scanBeforeDump: _scanBeforeDump,
               failOnScanWarning: _failOnScanWarning,
-              onPickRoot: () => _pickFolder(_rootController),
+              onPickRoot: _pickRoot,
               onPickOutput: () => _pickFolder(_outputController),
               onPickConfig: () => _pickFile(_configController),
               onPickLicensePubkey: () => _pickFile(_licensePubkeyController),
@@ -722,6 +741,8 @@ class _EncoderPageState extends State<EncoderPage> {
               onBuildWindowsMsi: () => _buildDesktopPackage('Windows MSI'),
               onRawContainersChanged: (value) =>
                   setState(() => _rawContainers = value),
+              onIncludeAssetsChanged: (value) =>
+                  setState(() => _includeAssets = value),
               onObfuscateChanged: (value) => setState(() => _obfuscate = value),
               onScanBeforeDumpChanged: (value) =>
                   setState(() => _scanBeforeDump = value),
@@ -925,6 +946,7 @@ class _Controls extends StatelessWidget {
     required this.busy,
     required this.status,
     required this.rawContainers,
+    required this.includeAssets,
     required this.obfuscate,
     required this.scanBeforeDump,
     required this.failOnScanWarning,
@@ -955,6 +977,7 @@ class _Controls extends StatelessWidget {
     required this.onBuildWindowsZip,
     required this.onBuildWindowsMsi,
     required this.onRawContainersChanged,
+    required this.onIncludeAssetsChanged,
     required this.onObfuscateChanged,
     required this.onScanBeforeDumpChanged,
     required this.onFailOnScanWarningChanged,
@@ -976,6 +999,7 @@ class _Controls extends StatelessWidget {
   final bool busy;
   final String? status;
   final bool rawContainers;
+  final bool includeAssets;
   final bool obfuscate;
   final bool scanBeforeDump;
   final bool failOnScanWarning;
@@ -1006,6 +1030,7 @@ class _Controls extends StatelessWidget {
   final VoidCallback onBuildWindowsZip;
   final VoidCallback onBuildWindowsMsi;
   final ValueChanged<bool> onRawContainersChanged;
+  final ValueChanged<bool> onIncludeAssetsChanged;
   final ValueChanged<bool> onObfuscateChanged;
   final ValueChanged<bool> onScanBeforeDumpChanged;
   final ValueChanged<bool> onFailOnScanWarningChanged;
@@ -1070,11 +1095,13 @@ class _Controls extends StatelessWidget {
             const SizedBox(height: 16),
             _OptionGrid(
               rawContainers: rawContainers,
+              includeAssets: includeAssets,
               obfuscate: obfuscate,
               scanBeforeDump: scanBeforeDump,
               failOnScanWarning: failOnScanWarning,
               busy: busy,
               onRawContainersChanged: onRawContainersChanged,
+              onIncludeAssetsChanged: onIncludeAssetsChanged,
               onObfuscateChanged: onObfuscateChanged,
               onScanBeforeDumpChanged: onScanBeforeDumpChanged,
               onFailOnScanWarningChanged: onFailOnScanWarningChanged,
@@ -1116,15 +1143,15 @@ class _Controls extends StatelessWidget {
             const SizedBox(height: 16),
             TextField(
               controller: keyController,
-              obscureText: !rawContainers,
+              readOnly: true,
               enabled: !rawContainers,
               decoration: InputDecoration(
                 labelText: rawContainers
-                    ? 'BYTECODE_KEY disabled'
-                    : 'BYTECODE_KEY',
+                    ? 'Vendor secret disabled'
+                    : 'Vendor secret key file',
                 prefixIcon: const Icon(Icons.key),
                 suffixIcon: IconButton(
-                  tooltip: 'Generate key',
+                  tooltip: 'Regenerate vendor secret',
                   onPressed: busy || rawContainers ? null : onGenerateKey,
                   icon: const Icon(Icons.auto_awesome),
                 ),
@@ -1176,7 +1203,8 @@ class _Controls extends StatelessWidget {
                 ),
                 const SizedBox(width: 10),
                 IconButton.filledTonal(
-                  tooltip: 'Generate vendor signing keys (prints compile-in hex to the log)',
+                  tooltip:
+                      'Generate vendor signing keys (prints compile-in hex to the log)',
                   onPressed: busy ? null : onGenerateVendorKeys,
                   icon: const Icon(Icons.enhanced_encryption_outlined),
                 ),
@@ -1272,22 +1300,26 @@ class _Controls extends StatelessWidget {
 class _OptionGrid extends StatelessWidget {
   const _OptionGrid({
     required this.rawContainers,
+    required this.includeAssets,
     required this.obfuscate,
     required this.scanBeforeDump,
     required this.failOnScanWarning,
     required this.busy,
     required this.onRawContainersChanged,
+    required this.onIncludeAssetsChanged,
     required this.onObfuscateChanged,
     required this.onScanBeforeDumpChanged,
     required this.onFailOnScanWarningChanged,
   });
 
   final bool rawContainers;
+  final bool includeAssets;
   final bool obfuscate;
   final bool scanBeforeDump;
   final bool failOnScanWarning;
   final bool busy;
   final ValueChanged<bool> onRawContainersChanged;
+  final ValueChanged<bool> onIncludeAssetsChanged;
   final ValueChanged<bool> onObfuscateChanged;
   final ValueChanged<bool> onScanBeforeDumpChanged;
   final ValueChanged<bool> onFailOnScanWarningChanged;
@@ -1304,6 +1336,13 @@ class _OptionGrid extends StatelessWidget {
           selected: rawContainers,
           busy: busy,
           onChanged: onRawContainersChanged,
+        ),
+        _OptionChip(
+          icon: Icons.web_asset,
+          label: 'Assets',
+          selected: includeAssets && !rawContainers,
+          busy: busy || rawContainers,
+          onChanged: onIncludeAssetsChanged,
         ),
         _OptionChip(
           icon: Icons.shuffle,

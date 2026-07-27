@@ -78,7 +78,9 @@ function verify_container(string $path): array
     if ($container['phpVersionId'] !== PHP_VERSION_ID) {
         fail("{$path}: PHP_VERSION_ID {$container['phpVersionId']} does not match " . PHP_VERSION_ID);
     }
-    if ($container['backendId'] !== 'php-zend-opdump' || $container['backendFormat'] !== 'OPD2') {
+    $isPhp = $container['backendId'] === 'php-zend-opdump' && $container['backendFormat'] === 'OPD2';
+    $isAsset = $container['backendId'] === 'bytecode-asset' && $container['backendFormat'] === 'RAW1';
+    if (!$isPhp && !$isAsset) {
         fail("{$path}: unsupported backend {$container['backendId']}/{$container['backendFormat']}");
     }
     if ($container['version'] === 2 && $container['cipherId'] !== 1) {
@@ -89,6 +91,8 @@ function verify_container(string $path): array
     }
     return [
         'path' => $path,
+        'backend' => $container['backendId'],
+        'backend_format' => $container['backendFormat'],
         'sha256' => hash('sha256', $container['bytes']),
         'size' => strlen($container['bytes']),
     ];
@@ -139,11 +143,19 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
     }
     foreach ($manifest['files'] ?? [] as $entry) {
         $output = $entry['output'] ?? '';
-        if (!isset($mapOutputs[$output])) {
+        $backend = $entry['backend'] ?? 'php-zend-opdump';
+        if ($backend === 'php-zend-opdump' && !isset($mapOutputs[$output])) {
             fail("{$mapPath}: missing output for manifest entry {$output}");
         }
         $path = $baseDir . DIRECTORY_SEPARATOR . $output;
         $result = verify_container($path);
+        if (($entry['backend'] ?? '') !== '' && $entry['backend'] !== $result['backend']) {
+            fail("{$path}: manifest backend mismatch");
+        }
+        $expectedFormat = $entry['backend_format'] ?? ($backend === 'php-zend-opdump' ? 'OPD2' : '');
+        if ($expectedFormat !== '' && $expectedFormat !== $result['backend_format']) {
+            fail("{$path}: manifest backend_format mismatch");
+        }
         if (($entry['sha256'] ?? '') !== $result['sha256']) {
             fail("{$path}: manifest sha256 mismatch");
         }
@@ -165,7 +177,9 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
     // BYTECODE_KEY/OPDUMP_KEY -- license-mode (RSA-wrapped DEK) builds can
     // only get a structural check here without also implementing an RSA
     // unwrap in this tool, so this stays a hex-shape check in that case.
-    $ikmHex = getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: '';
+    $vendorKeyFile = getenv('BYTECODE_VENDOR_KEY_FILE') ?: dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key';
+    $fileKey = is_file($vendorKeyFile) ? trim((string) file_get_contents($vendorKeyFile)) : '';
+    $ikmHex = getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: $fileKey;
     if (preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
         $sigKey = hash_hkdf('sha256', hex2bin($ikmHex), 32, 'bytecode-manifest-auth', '');
         $expected = hash_hmac('sha256', file_get_contents($manifestPath) . "\0" . file_get_contents($mapPath), $sigKey);

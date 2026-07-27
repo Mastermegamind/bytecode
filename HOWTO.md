@@ -34,12 +34,13 @@ it — none of it is hypothetical.
 | Term | Meaning |
 |---|---|
 | **`opdump`** | The Zend extension (`php/src/opdump.c`) that hooks PHP's compile step. In `dump` mode it serializes a compiled `zend_op_array` to disk instead of executing it; in `load`/`load-tree` mode it reconstructs one from disk *without ever parsing PHP source text*. |
-| **Container** (`BYTC2`) | One encoded file: an AES-256-GCM-encrypted blob holding one source file's compiled bytecode. **The output file keeps the source's own extension** (`index.php` in → `index.php` out, encrypted) — it's identified by content (the `BYTC` magic bytes), not by a special file extension, so it can be a drop-in replacement for the original file. (`--raw` debug output is the one exception: it's written as `<name>.opd2`, since it's never meant to be deployed.) |
+| **Container** (`BYTC2`) | One encoded file: an AES-256-GCM-encrypted blob. PHP files hold compiled Zend bytecode (`php-zend-opdump`/`OPD2`); when `--include-assets` is enabled, `.html`, `.htm`, `.css`, `.js`, `.mjs`, and `.twig` files hold encrypted raw asset bytes (`bytecode-asset`/`RAW1`). **The output file keeps the source's own extension** (`index.php` in → `index.php` out, encrypted) — it's identified by content (the `BYTC` magic bytes), not by a special file extension, so it can be a drop-in replacement for the original file. (`--raw` debug output is the one exception: it's written as `<name>.opd2`, since it's never meant to be deployed.) |
 | **`bytecode.manifest.json`** | Written once per `bytecode-dump` run. Lists every encoded file, its hash, size, and (if `--scan` was used) scan warnings. |
 | **`bytecode.map`** | Tab-separated `absolute-source-path → relative-container-path` file. This is what the loader reads at runtime to know which container to load instead of a given source request. |
 | **`bytecode.manifest.sig`** | HMAC-SHA256 over the manifest + map together, so editing the map to repoint a source path at a different container is detected and refused. |
 | **`bytecode.license.json`** | Only written in license mode: an RSA-OAEP-SHA256-wrapped copy of the build's data-encryption key (DEK). |
-| **Shared-secret mode** | You generate one `BYTECODE_KEY` and use it both to encode and to run. Simplest option, good for self-hosted single-operator use. |
+| **Vendor-secret key file** | Default shared key material at `build/vendor-secret.key`. Encoding auto-creates it when missing. Regenerate deliberately with `php/bin/bytecode-keygen --vendor-secret --force`. |
+| **Shared-secret mode** | You can still provide `BYTECODE_KEY`/`OPDUMP_KEY`, but normal encoding defaults to the vendor-secret key file. |
 | **License mode** | An RSA keypair replaces the shared secret: you (the vendor) encode with the customer's public key; they run with their own private key. You never see or transmit their private key, and they never see a raw shared secret. |
 
 ## 2. Build the extension
@@ -180,12 +181,14 @@ Warning codes you can see: `variable-variable`, `dynamic-class`,
 ### 3.3 Encode a project
 
 `bytecode-dump` walks a file or directory tree and writes one encoded
-container per `.php` file — keeping the source's own filename and extension,
-so it's a drop-in replacement — plus `bytecode.manifest.json`, `bytecode.map`,
-and `bytecode.manifest.sig`.
+container per supported PHP file, keeping the source's own filename and
+extension, so it's a drop-in replacement. Pass `--include-assets` to also
+encode `.html`, `.htm`, `.css`, `.js`, `.mjs`, and `.twig` files. PHP files are
+true Zend bytecode containers and are listed in `bytecode.map`; asset files are
+encrypted raw containers and are listed in `bytecode.manifest.json`.
 
 ```bash
-$ BYTECODE_KEY="$KEY" PHP_BIN=php8.4 php8.4 php/bin/bytecode-dump /tmp/demo/app /tmp/demo/out
+$ BYTECODE_KEY="$KEY" PHP_BIN=php8.4 php8.4 php/bin/bytecode-dump --include-assets /tmp/demo/app /tmp/demo/out
 /tmp/demo/app/index.php -> /tmp/demo/out/index.php
 /tmp/demo/app/risky.php -> /tmp/demo/out/risky.php
 
@@ -198,8 +201,18 @@ bytecode.manifest.json  bytecode.manifest.sig  bytecode.map  index.php  risky.ph
 contents.
 
 `PHP_BIN` picks which `php` binary compiles the source (default `php8.4`).
-`BYTECODE_KEY` (or `OPDUMP_KEY`) is required unless you pass `--raw` or use
-[license mode](#37-license-mode-rsa-wrapped-keys).
+For normal encrypted builds, `bytecode-dump` uses `build/vendor-secret.key` by
+default and creates it automatically if it is missing. Set
+`BYTECODE_VENDOR_KEY_FILE` or pass `--vendor-key-file <path>` to use a
+different key file. `BYTECODE_KEY`/`OPDUMP_KEY` can still override this, and
+[license mode](#37-license-mode-rsa-wrapped-keys) replaces shared key material
+entirely.
+
+To rotate the default vendor secret:
+
+```bash
+php8.4 php/bin/bytecode-keygen --vendor-secret --force
+```
 
 **Always encode into a separate output directory, never back into the
 source tree.** Since the encoded output keeps the exact same filename as its
@@ -292,6 +305,23 @@ sha256: 8d03e93cbab2fb9ea1322d263175a520d9238852dd0aa9dcb1d3faddce311420
 
 Useful for confirming which PHP version a build targets, or spot-checking a
 container's size/hash without needing the key.
+
+### 3.5.1 Serve encoded assets
+
+Browser assets cannot execute as Zend bytecode. They must be decrypted and
+streamed by PHP so the browser receives normal CSS/JS/HTML bytes:
+
+```php
+<?php
+require __DIR__ . '/php/runtime/bytecode-assets.php';
+
+bytecode_asset_serve(__DIR__ . '/encoded/assets/app.css');
+```
+
+Use your web server rewrite/router to send protected asset URLs to a PHP entry
+point like this. The helper uses the same `BYTECODE_KEY`/`OPDUMP_KEY`/
+`BYTECODE_VENDOR_KEY` material as the loader, and can also unwrap
+`bytecode.license.json` when `OPDUMP_LICENSE_KEY_FILE` is set.
 
 ### 3.6 Run the encoded tree
 
@@ -487,6 +517,9 @@ both read it — pass `--config <path>` explicitly, or drop a
 ```json
 {
   "exclude": ["vendor/*", "storage/*", ".git/*", "node_modules/*"],
+  "assets": {
+    "include": false
+  },
   "scanner": {
     "enabled": true,
     "fail_on_warning": false,
@@ -498,6 +531,7 @@ both read it — pass `--config <path>` explicitly, or drop a
 | Field | Type | Effect |
 |---|---|---|
 | `exclude` | `string[]` | Glob patterns, merged with any `--exclude` flags. |
+| `assets.include` | `bool` | Same as passing `--include-assets` to `bytecode-dump`. |
 | `scanner.enabled` | `bool` | Same as passing `--scan` to `bytecode-dump`. |
 | `scanner.fail_on_warning` | `bool` | Same as `--fail-on-scan-warning` / `bytecode-scan --fail-on-warning`. |
 | `scanner.ignore_codes` | `string[]` | Warning codes (see [§3.2](#32-scan-source-for-risky-dynamic-constructs)) to silently drop from the report. |
@@ -622,10 +656,10 @@ filled in after you run something).
 | **Bytecode root** | The repo root containing `php/bin/*` — auto-detected (bundled root in a packaged build, else the app's working directory). Change it if you're pointing the GUI at a different checkout. |
 | **Output folder** | The `<output-dir>` argument to `bytecode-dump`/where the manifest is read from for Verify. |
 | **PHP version** field + wrench icon (**Build loader**) + download icon (**Install Zend loader**) | `bytecode-install-loader --php-version <ver> --build-only` / (without `--build-only`) — §3.10. |
-| **Raw / Obfuscate / Scan / Fail warnings** chips | `--raw` / `--obfuscate` / `--scan` (Scan is **on by default** in the GUI) / `--fail-on-scan-warning`. |
+| **Raw / Assets / Obfuscate / Scan / Fail warnings** chips | `--raw` / `--include-assets` / `--obfuscate` / `--scan` (Scan is **on by default** in the GUI) / `--fail-on-scan-warning`. **Assets** is off by default and disabled while **Raw** is selected. |
 | **Add Files** / **Add Folder** | Builds up the `<source-file-or-dir>...` argument list — shown in the source list below with a remove (×) per entry and a **Clear** to empty it. |
 | **bytecode.json** field | `--config <path>` — §3.9. |
-| **BYTECODE_KEY** field + sparkle icon (**Generate key**) | `bytecode-keygen`, and the `BYTECODE_KEY` env var for Dump/Verify. Disabled (greyed out) when **Raw** is selected, since raw mode needs no key. |
+| **Vendor secret key file** field + sparkle icon (**Regenerate vendor secret**) | `build/vendor-secret.key`, passed as `BYTECODE_VENDOR_KEY_FILE` for Dump. The file is auto-created by the CLI if missing; the sparkle icon runs `bytecode-keygen --vendor-secret --force`. Disabled when **Raw** is selected, since raw mode needs no key. |
 | **License public key** field | `BYTECODE_LICENSE_PUBKEY` — set this (instead of a key) to dump in license mode; disabled under **Raw**. |
 | **License key folder** field + key icon (**Generate license keys**) | `bytecode-license-keygen <dir>` — writes `license.key.pem`/`license.pub.pem` into that folder and auto-fills **License public key** with the resulting `license.pub.pem`. |
 | **Vendor sign key** field | `BYTECODE_VENDOR_SIGN_KEY` — set this to write a `bytecode.seal.json` (Ed25519 vendor seal) alongside the build; disabled under **Raw**. When set, **Verify** also passes the sibling `vendor.sign.pub.pem` as `BYTECODE_VENDOR_PUBKEY` to check the seal signature. §3.7. |
@@ -655,9 +689,9 @@ filled in after you run something).
 2. **Add Folder** → pick your project's source directory.
 3. Leave **Scan** checked, click **Scan** once by itself first if you want
    to review warnings before committing to a build.
-4. Click the sparkle icon next to **BYTECODE_KEY** to generate a key (or
-   paste one you already have; or fill in **License public key** instead
-   for license mode).
+4. Use the default **Vendor secret key file** (`build/vendor-secret.key`), or
+   click the sparkle icon to regenerate it before encoding. Fill in **License
+   public key** instead for license mode.
 5. Set **Output folder** to wherever you want the build written.
 6. Click **Dump**. Watch the log pane; when it finishes, the manifest table
    populates and **Inspect container** auto-fills with the first file.
@@ -673,7 +707,7 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 | Symptom | Likely cause |
 |---|---|
 | `opdump extension not found at ...` | `php/src/modules/opdump.so` isn't built — see §2, or set `OPDUMP_SO` to its actual path. |
-| `BYTECODE_KEY/OPDUMP_KEY must be 64 hex chars` | Key isn't set, or has stray whitespace/quotes. Regenerate with `bytecode-keygen` and double-check `echo -n "$KEY" \| wc -c` is 64. |
+| `BYTECODE_KEY/OPDUMP_KEY must be 64 hex chars` | Runtime key material is missing or malformed. For default vendor-secret builds, load with a loader compiled with the same vendor secret, or provide the key through `BYTECODE_VENDOR_KEY`. |
 | `opdump: BYTC authentication/decryption failed` | Wrong key, or the container was tampered with — GCM authentication fails closed by design, before any payload is parsed. |
 | `opdump: no key material available for BYTC2 load (checked license and BYTECODE_KEY/OPDUMP_KEY)` | In license mode: wrong `OPDUMP_LICENSE_KEY_FILE`, wrong passphrase, or `bytecode.license.json` not found at the expected path (see `OPDUMP_LICENSE_FILE` in §3.7). In shared-secret mode: `BYTECODE_KEY`/`OPDUMP_KEY` isn't set in the *loading* process's environment. |
 | `opdump: bytecode.manifest.sig mismatch ... refusing to trust bytecode.map` | Either `bytecode.manifest.json`/`bytecode.map` was edited after the build, or you're pointing at a manifest/map/sig set that doesn't all belong together. |
@@ -691,8 +725,9 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 |---|---|---|
 | `PHP_BIN` | `bytecode-dump` | PHP binary to compile source with (default `php8.4`). |
 | `OPDUMP_SO` | `bytecode-dump` | Path to `opdump.so`/`opdump.dll` (default `../src/modules/<name>` relative to `php/bin/`). |
-| `BYTECODE_KEY`, `OPDUMP_KEY` | `bytecode-pack`, `bytecode-dump`, `bytecode-verify`, `opdump.so` | Shared-secret IKM (64 hex chars), unless license mode is used. |
-| `BYTECODE_DEK` | `bytecode-pack` | Internal — set automatically by `bytecode-dump` in license mode, takes priority over `BYTECODE_KEY`. Don't set this by hand. |
+| `BYTECODE_KEY`, `OPDUMP_KEY` | `bytecode-pack`, `bytecode-dump`, `bytecode-verify`, `opdump.so` | Optional shared-secret IKM override (64 hex chars), unless license mode is used. |
+| `BYTECODE_VENDOR_KEY_FILE` | `bytecode-dump`, `bytecode-pack`, `bytecode-pack-asset`, `bytecode-verify`, asset runtime | Path to a 64-hex vendor-secret key file. Defaults to `build/vendor-secret.key`; encoding creates it automatically when missing. |
+| `BYTECODE_DEK` | `bytecode-pack` | Internal — set automatically by `bytecode-dump` in license mode, takes priority over `BYTECODE_KEY` and the vendor-secret key file. Don't set this by hand. |
 | `BYTECODE_LICENSE_PUBKEY` | `bytecode-dump` | Path to `license.pub.pem`; switches to license mode. |
 | `BYTECODE_VENDOR_SIGN_KEY` | `bytecode-dump` | Path to the vendor Ed25519 private key (`bytecode-vendor-keygen`); writes `bytecode.seal.json`. Same as `--vendor-sign-key`. |
 | `OPDUMP_VENDOR_PUBKEY_FILE` | `opdump.so`, `bytecode-verify` | Path to `vendor.sign.pub.pem`; the seal trust anchor when no key is compiled in (`--with-opdump-vendor-pubkey` wins over it). Present ⇒ loader fails closed on a missing/invalid seal. |
@@ -713,7 +748,7 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 
 | File | Contents |
 |---|---|
-| `<name>.php` | One encrypted container per source file, at the same relative path and filename the source had (`--raw` writes `<name>.php.opd2` instead). |
+| `<name>.<ext>` | One encrypted container per included source file, at the same relative path and filename the source had. PHP files contain Zend bytecode; HTML/CSS/JS/Twig files contain encrypted raw asset bytes only when `--include-assets` is enabled. (`--raw` writes PHP debug blobs as `<name>.php.opd2` instead.) |
 | `bytecode.manifest.json` | Per-file source/output/hash/size list, PHP version, container format, and (if `--scan`) embedded scan results. |
 | `bytecode.map` | `absolute-source-path<TAB>relative-container-path`, one per line — the loader's runtime lookup table. |
 | `bytecode.manifest.sig` | Hex HMAC-SHA256 over manifest + map, keyed by an HKDF derivation of your IKM/DEK. |

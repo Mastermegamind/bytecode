@@ -1,18 +1,16 @@
 #!/usr/bin/env php
 <?php
 
+declare(strict_types=1);
+
 if ($argc !== 3 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
-    fwrite(STDERR, "Usage: bytecode-pack <raw-opd2-blob> <container-output>\n");
+    fwrite(STDERR, "Usage: bytecode-pack-asset <asset-input> <container-output>\n");
     fwrite(STDERR, "\nEnvironment:\n  BYTECODE_DEK, BYTECODE_KEY, OPDUMP_KEY, or BYTECODE_VENDOR_KEY\n");
-    fwrite(STDERR, "    64 hex chars / 32 bytes.\n");
-    fwrite(STDERR, "    Treated as HKDF-SHA256 input keying material (IKM); the actual\n");
-    fwrite(STDERR, "    AES-256-GCM key is derived per file from a random key_id salt.\n");
-    fwrite(STDERR, "    BYTECODE_DEK (set internally by bytecode-dump in license mode)\n");
-    fwrite(STDERR, "    takes priority over BYTECODE_KEY/OPDUMP_KEY.\n");
+    fwrite(STDERR, "    64 hex chars / 32 bytes. Treated as HKDF-SHA256 input keying material.\n");
     exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
 }
 
-$rawPath = $argv[1];
+$assetPath = $argv[1];
 $outPath = $argv[2];
 $vendorKeyFile = getenv('BYTECODE_VENDOR_KEY_FILE') ?: dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key';
 if (!is_file($vendorKeyFile) && !getenv('BYTECODE_DEK') && !getenv('BYTECODE_KEY') && !getenv('OPDUMP_KEY') && !getenv('BYTECODE_VENDOR_KEY')) {
@@ -26,18 +24,14 @@ if (!is_file($vendorKeyFile) && !getenv('BYTECODE_DEK') && !getenv('BYTECODE_KEY
 $fileKey = is_file($vendorKeyFile) ? trim((string) file_get_contents($vendorKeyFile)) : '';
 $hexKey = getenv('BYTECODE_DEK') ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: $fileKey;
 
-if (!preg_match('/\\A[0-9a-fA-F]{64}\\z/', $hexKey)) {
+if (!preg_match('/\A[0-9a-fA-F]{64}\z/', $hexKey)) {
     fwrite(STDERR, "BYTECODE_DEK/BYTECODE_KEY/OPDUMP_KEY/BYTECODE_VENDOR_KEY must be exactly 64 hex characters\n");
     exit(1);
 }
 
-$raw = file_get_contents($rawPath);
-if ($raw === false) {
-    fwrite(STDERR, "cannot read raw blob: {$rawPath}\n");
-    exit(1);
-}
-if (substr($raw, 0, 4) !== 'OPD2') {
-    fwrite(STDERR, "raw blob is not OPD2: {$rawPath}\n");
+$plain = file_get_contents($assetPath);
+if ($plain === false) {
+    fwrite(STDERR, "cannot read asset: {$assetPath}\n");
     exit(1);
 }
 
@@ -46,8 +40,8 @@ $keyId = random_bytes(16);
 $key = hash_hkdf('sha256', $ikm, 32, 'bytecode-v2', $keyId);
 $nonce = random_bytes(12);
 $cipherId = 1; // AES-256-GCM
-$backendId = 'php-zend-opdump';
-$backendFormat = 'OPD2';
+$backendId = 'bytecode-asset';
+$backendFormat = 'RAW1';
 $phpVersionId = PHP_VERSION_ID;
 
 $header = 'BYTC'
@@ -60,7 +54,7 @@ $header = 'BYTC'
 
 $tag = '';
 $ciphertext = openssl_encrypt(
-    $raw,
+    $plain,
     'aes-256-gcm',
     $key,
     OPENSSL_RAW_DATA,

@@ -5,7 +5,8 @@ declare(strict_types=1);
 
 /*
  * Phase 1 tree dumper: walk PHP source and emit encrypted BYTC2 containers.
- * Uses lint mode (-l) so PHP compiles each file without executing it.
+ * Uses lint mode (-l) so PHP compiles each file without executing it. Static
+ * assets use the same BYTC2 envelope with a raw-asset backend.
  *
  * Rewritten from the original Bash version so this tool runs the same way
  * on Linux, macOS, and Windows -- it only depends on the PHP CLI itself
@@ -30,6 +31,10 @@ Usage:
 
 Options:
   --raw                         Write raw .opd2 bytecode blobs instead of encrypted containers.
+                                PHP files only; asset containers are encrypted
+                                deployable output.
+  --include-assets              Also encode .html/.htm/.css/.js/.mjs/.twig files
+                                as encrypted raw asset containers. Off by default.
   --obfuscate                   Enable safe local-variable obfuscation.
   --scan                        Run bytecode-scan first and embed the scan report.
   --fail-on-scan-warning        Fail if bytecode-scan reports warnings.
@@ -39,6 +44,9 @@ Options:
   --key <hex>                   64-hex shared key. Same as BYTECODE_KEY.
   --opdump-key <hex>            64-hex legacy/shared key. Same as OPDUMP_KEY.
   --vendor-key <hex>            64-hex vendor key compiled into your custom loader.
+  --vendor-key-file <path>      64-hex vendor key file. Defaults to
+                                build/vendor-secret.key and is auto-created
+                                when missing.
   --vendor-sign-key <path>      Ed25519 private key (bytecode-vendor-keygen) used
                                 to write bytecode.seal.json -- a vendor signature
                                 over manifest+map+license. A loader built/config-
@@ -80,6 +88,8 @@ Environment:
   BYTECODE_VENDOR_KEY
                64 hex chars matching --with-opdump-vendor-secret at loader
                build time; avoids server-side BYTECODE_KEY configuration.
+  BYTECODE_VENDOR_KEY_FILE
+               Path to the default vendor-secret key file.
   BYTECODE_VENDOR_SIGN_KEY
                Path to the vendor Ed25519 private key (bytecode-vendor-keygen).
                Same as --vendor-sign-key. When set, bytecode.seal.json is
@@ -133,6 +143,29 @@ function config_list(array $config, string $key): array
         fail("bytecode.json field '{$key}' must be an array", 2);
     }
     return array_values(array_filter($value, static fn (mixed $item): bool => is_string($item) && $item !== ''));
+}
+
+function read_or_create_key_file(string $path): string
+{
+    if (is_file($path)) {
+        $key = trim((string) file_get_contents($path));
+        if (!preg_match('/\A[0-9a-fA-F]{64}\z/', $key)) {
+            fail("vendor key file must contain exactly 64 hex characters: {$path}");
+        }
+        return $key;
+    }
+
+    $dir = dirname($path);
+    if (!is_dir($dir) && !@mkdir($dir, 0770, true) && !is_dir($dir)) {
+        fail("cannot create vendor key directory: {$dir}");
+    }
+    $key = bin2hex(random_bytes(32));
+    if (file_put_contents($path, $key . PHP_EOL) === false) {
+        fail("cannot write vendor key file: {$path}");
+    }
+    @chmod($path, 0600);
+    fwrite(STDERR, "generated vendor key file: {$path}\n");
+    return $key;
 }
 
 function scanner_config(array $config): array
@@ -373,6 +406,7 @@ if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
 }
 
 $raw = false;
+$includeAssets = false;
 $obfuscate = false;
 $scan = false;
 $failOnScanWarning = false;
@@ -384,6 +418,7 @@ $opdumpSoOption = null;
 $bytecodeKeyOption = null;
 $opdumpKeyOption = null;
 $vendorKeyOption = null;
+$vendorKeyFileOption = null;
 $vendorSignKeyOption = null;
 $licensePubkeyOption = null;
 $machineIdOption = null;
@@ -406,6 +441,11 @@ while ($args) {
     $a = $args[0];
     if ($a === '--raw') {
         $raw = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--include-assets') {
+        $includeAssets = true;
         array_shift($args);
         continue;
     }
@@ -476,6 +516,15 @@ while ($args) {
     }
     if (str_starts_with($a, '--vendor-key=')) {
         $vendorKeyOption = substr($a, strlen('--vendor-key='));
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--vendor-key-file') {
+        $vendorKeyFileOption = take_option_value($args, '--vendor-key-file');
+        continue;
+    }
+    if (str_starts_with($a, '--vendor-key-file=')) {
+        $vendorKeyFileOption = substr($a, strlen('--vendor-key-file='));
         array_shift($args);
         continue;
     }
@@ -582,6 +631,9 @@ $sources = $args;
 $config = load_bytecode_config($configPath);
 $scannerConfig = scanner_config($config);
 $excludes = array_values(array_unique([...config_list($config, 'exclude'), ...$excludes]));
+if (($config['assets']['include'] ?? false) === true || ($config['include_assets'] ?? false) === true) {
+    $includeAssets = true;
+}
 if (($scannerConfig['enabled'] ?? false) === true) {
     $scan = true;
 }
@@ -594,10 +646,14 @@ $phpBin = $phpBinOption ?: (getenv('PHP_BIN') ?: 'php8.4');
 $defaultSoName = PHP_OS_FAMILY === 'Windows' ? 'opdump.dll' : 'opdump.so';
 $opdumpSo = $opdumpSoOption ?: (getenv('OPDUMP_SO') ?: $scriptDir . '/../src/modules/' . $defaultSoName);
 $packer = $scriptDir . '/bytecode-pack';
+$assetPacker = $scriptDir . '/bytecode-pack-asset';
 $scanner = $scriptDir . '/bytecode-scan';
+$repoRoot = dirname($scriptDir, 2);
+$defaultVendorKeyFile = $vendorKeyFileOption
+    ?: (getenv('BYTECODE_VENDOR_KEY_FILE') ?: $repoRoot . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key');
 
-if (!is_file($opdumpSo)) {
-    fail("opdump extension not found at {$opdumpSo}; build php/src first");
+if (!$raw && !is_file($assetPacker)) {
+    fail("asset packer not found at {$assetPacker}");
 }
 if (!is_dir($out) && !@mkdir($out, 0777, true) && !is_dir($out)) {
     fail("cannot create output directory: {$out}");
@@ -663,13 +719,32 @@ if ($licensePubkey !== null && $licensePubkey !== '') {
 // and opdump_resolve_ikm() in php/src/opdump.c); used again below to sign
 // bytecode.manifest.json + bytecode.map so tampering with the map's source-to-
 // container wiring is detectable, not just tampering with a single container.
-$ikmHex = $dekHex ?? ($bytecodeKeyOption ?: $opdumpKeyOption ?: $vendorKeyOption ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: '');
+$envOrOptionKey = $bytecodeKeyOption ?: $opdumpKeyOption ?: $vendorKeyOption ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: '';
+$defaultVendorKey = (!$raw && $dekHex === null && $envOrOptionKey === '')
+    ? read_or_create_key_file($defaultVendorKeyFile)
+    : '';
+$ikmHex = $dekHex ?? ($envOrOptionKey ?: $defaultVendorKey);
 if (!$raw && $dekHex === null && !preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
-    fail('a 64-hex key is required; pass --key, --vendor-key, set BYTECODE_KEY/BYTECODE_VENDOR_KEY, or use --license-pubkey', 2);
+    fail('a 64-hex key is required; pass --key, --vendor-key, set BYTECODE_KEY/BYTECODE_VENDOR_KEY, configure build/vendor-secret.key, or use --license-pubkey', 2);
 }
 
 $manifestFiles = [];
 $mapLines = [];
+
+function source_kind(string $path): ?string
+{
+    return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
+        'php' => 'php',
+        'html', 'htm', 'css', 'js', 'mjs', 'twig' => 'asset',
+        default => null,
+    };
+}
+
+function is_supported_source(string $path, bool $includeAssets): bool
+{
+    $kind = source_kind($path);
+    return $kind === 'php' || ($includeAssets && $kind === 'asset');
+}
 
 function path_parts(string $path): array
 {
@@ -776,6 +851,12 @@ function dump_one(
     if ($sourceAbs === false) {
         fail("cannot resolve source file: {$file}");
     }
+    if (!is_file($opdumpSo)) {
+        fail("opdump extension not found at {$opdumpSo}; build php/src first");
+    }
+    if (!is_file($packer)) {
+        fail("bytecode packer not found at {$packer}");
+    }
 
     // Encoded output keeps the source's own .php extension (a drop-in
     // replacement for the original file, same path shape); only --raw debug
@@ -851,16 +932,75 @@ function dump_one(
     fwrite(STDOUT, "{$file} -> {$dest}\n");
 }
 
+function dump_asset_one(
+    string $file,
+    string $rel,
+    string $outAbs,
+    string $phpBin,
+    string $assetPacker,
+    ?string $dekHex,
+    string $ikmHex,
+    int $phpVersionId,
+    array &$manifestFiles
+): void {
+    static $seenOutputs = [];
+
+    $sourceAbs = realpath($file);
+    if ($sourceAbs === false) {
+        fail("cannot resolve source asset: {$file}");
+    }
+
+    $relativeOutput = $rel;
+    if (isset($seenOutputs[$relativeOutput])) {
+        fail("duplicate output path {$relativeOutput} from {$file} and {$seenOutputs[$relativeOutput]}");
+    }
+    $seenOutputs[$relativeOutput] = $file;
+
+    $dest = $outAbs . DIRECTORY_SEPARATOR . $relativeOutput;
+    @mkdir(dirname($dest), 0777, true);
+    $packEnv = $dekHex !== null ? ['BYTECODE_DEK' => $dekHex] : ['BYTECODE_KEY' => $ikmHex];
+    $exit = run_subprocess([$phpBin, $assetPacker, $sourceAbs, $dest], $packEnv);
+    if ($exit !== 0) {
+        fail("asset pack failed for {$file}");
+    }
+
+    $manifestFiles[] = [
+        'source' => $rel,
+        'output' => $relativeOutput,
+        'php_version_id' => $phpVersionId,
+        'backend' => 'bytecode-asset',
+        'backend_format' => 'RAW1',
+        'container' => 'BYTC2',
+        'content_type' => match (strtolower(pathinfo($file, PATHINFO_EXTENSION))) {
+            'css' => 'text/css; charset=utf-8',
+            'js', 'mjs' => 'text/javascript; charset=utf-8',
+            'html', 'htm', 'twig' => 'text/html; charset=utf-8',
+            default => 'application/octet-stream',
+        },
+        'sha256' => hash_file('sha256', $dest),
+        'size' => filesize($dest),
+    ];
+
+    fwrite(STDOUT, "{$file} -> {$dest}\n");
+}
+
 foreach ($sourceAbsList as $srcAbs) {
     if (is_file($srcAbs)) {
-        if (!str_ends_with($srcAbs, '.php')) {
-            fail("source file is not a .php file: {$srcAbs}");
+        $kind = source_kind($srcAbs);
+        if ($kind === null || ($kind === 'asset' && !$includeAssets)) {
+            fail("source file is not supported by this dump: {$srcAbs}" . ($kind === 'asset' ? " (pass --include-assets to encode assets)" : ""));
         }
         $rel = $multiSource ? to_rel($relativeBase, $srcAbs) : basename($srcAbs);
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
+        if ($kind === 'php') {
+            dump_one($srcAbs, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
+        } elseif ($raw) {
+            fail("--raw only supports PHP bytecode output; cannot raw-dump asset {$srcAbs}", 2);
+        } else {
+            dump_asset_one($srcAbs, $rel, $outAbs, $phpBin, $assetPacker, $dekHex, $ikmHex, $phpVersionId, $manifestFiles);
+        }
         continue;
     }
 
@@ -869,7 +1009,7 @@ foreach ($sourceAbsList as $srcAbs) {
         new RecursiveDirectoryIterator($srcAbs, FilesystemIterator::SKIP_DOTS)
     );
     foreach ($iterator as $fileInfo) {
-        if ($fileInfo->isFile() && $fileInfo->getExtension() === 'php') {
+        if ($fileInfo->isFile() && is_supported_source($fileInfo->getPathname(), $includeAssets)) {
             $files[] = $fileInfo->getPathname();
         }
     }
@@ -880,14 +1020,20 @@ foreach ($sourceAbsList as $srcAbs) {
         if (is_excluded($rel, $excludes)) {
             continue;
         }
-        dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
+        if (source_kind($file) === 'php') {
+            dump_one($file, $rel, $outAbs, $phpBin, $opdumpSo, $packer, $raw, $obfuscate, $stripPaths, $virtualRootOption ?: 'bytecode://', $phpVersionId, $dekHex, $ikmHex, $manifestFiles, $mapLines);
+        } elseif ($raw) {
+            continue;
+        } else {
+            dump_asset_one($file, $rel, $outAbs, $phpBin, $assetPacker, $dekHex, $ikmHex, $phpVersionId, $manifestFiles);
+        }
     }
 }
 
 if (!$raw) {
     $protectionMode = $dekHex !== null
         ? (($machineId !== null && $machineId !== '') ? 'license-machine' : 'license')
-        : (($vendorKeyOption ?: getenv('BYTECODE_VENDOR_KEY') ?: '') !== '' ? 'vendor' : 'shared-key');
+        : (($vendorKeyOption ?: getenv('BYTECODE_VENDOR_KEY') ?: $defaultVendorKey) !== '' ? 'vendor' : 'shared-key');
 
     $manifest = [
         'format' => 'bytecode-manifest-v1',
@@ -905,6 +1051,7 @@ if (!$raw) {
             'revocation_url' => $licenseFields['revocation_url'],
             'activation_url' => $licenseFields['activation_url'],
             'unlock_policy' => $licenseFields['unlock_policy'],
+            'vendor_key_file' => $defaultVendorKey !== '' ? str_replace('\\', '/', $defaultVendorKeyFile) : null,
         ],
         'source_root' => str_replace('\\', '/', $relativeBase),
         'source_roots' => array_map(static fn (string $source): string => str_replace('\\', '/', $source), $sourceAbsList),
