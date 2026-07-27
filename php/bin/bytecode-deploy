@@ -1,0 +1,240 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+function usage(): void
+{
+    fwrite(STDERR, <<<'USAGE'
+Usage:
+  bytecode-deploy <user@host:/remote/app> --stage <remote-stage-dir> [options]
+
+Options:
+  --local-root <dir>       Local source app to deploy. Default: current dir.
+  --bytecode-root <dir>    Remote bytecode repo. Default: /var/www/bytecode.
+  --include-assets         Encode html/css/js/mjs/twig assets too.
+  --profile <name>         Forward a bytecode-dump profile.
+  --exclude <glob>         Forward exclude rules. Repeatable.
+  --machine-id <id>        Forward --machine-id to bytecode-dump and set
+                           OPDUMP_MACHINE_ID for --start-runner.
+  --hostnames <csv>        Forward --hostnames signed policy.
+  --fingerprints <csv>     Forward --fingerprints signed policy.
+  --expires-at <date>      Forward --expires-at signed policy.
+  --vendor-sign-key <path> Forward --vendor-sign-key for bytecode.seal.json.
+  --verify-routes <csv>    Curl routes on a staged server when one is already running.
+  --port <port>            Route verification port. Default: 8095.
+  --start-runner           Auto-start a staged runner when RoadRunner, Laravel,
+                           or public/index.php can be detected.
+  --cutover                Replace the remote app with the staged copy after verify.
+  --rollback               Restore the latest /remote/app.bytecode-backups/* copy.
+
+This helper stages by default. Cutover creates timestamped backups first.
+
+USAGE);
+}
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+function run(array $cmd): void
+{
+    fwrite(STDOUT, '$ ' . implode(' ', array_map('escapeshellarg', $cmd)) . PHP_EOL);
+    $p = proc_open($cmd, [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    $exit = is_resource($p) ? proc_close($p) : 127;
+    if ($exit !== 0) {
+        fail('command failed with exit ' . $exit, $exit);
+    }
+}
+
+$args = array_slice($argv, 1);
+if (!$args || in_array($args[0], ['-h', '--help'], true)) {
+    usage();
+    exit($args ? 0 : 2);
+}
+$target = array_shift($args);
+$localRoot = getcwd();
+$stage = null;
+$bytecodeRoot = '/var/www/bytecode';
+$includeAssets = false;
+$profile = null;
+$excludes = [];
+$machineId = null;
+$hostnames = null;
+$fingerprints = null;
+$expiresAt = null;
+$vendorSignKey = null;
+$routes = [];
+$port = '8095';
+$cutover = false;
+$rollback = false;
+$startRunner = false;
+while ($args) {
+    $arg = array_shift($args);
+    if ($arg === '--local-root') {
+        $localRoot = array_shift($args) ?: '';
+        continue;
+    }
+    if (str_starts_with($arg, '--local-root=')) {
+        $localRoot = substr($arg, 13);
+        continue;
+    }
+    if ($arg === '--stage') {
+        $stage = array_shift($args) ?: null;
+        continue;
+    }
+    if (str_starts_with($arg, '--stage=')) {
+        $stage = substr($arg, 8);
+        continue;
+    }
+    if ($arg === '--bytecode-root') {
+        $bytecodeRoot = array_shift($args) ?: '';
+        continue;
+    }
+    if ($arg === '--include-assets') {
+        $includeAssets = true;
+        continue;
+    }
+    if ($arg === '--profile') {
+        $profile = array_shift($args) ?: null;
+        continue;
+    }
+    if ($arg === '--exclude') {
+        $excludes[] = array_shift($args) ?: '';
+        continue;
+    }
+    if ($arg === '--machine-id') {
+        $machineId = array_shift($args) ?: null;
+        continue;
+    }
+    if ($arg === '--hostnames') {
+        $hostnames = array_shift($args) ?: null;
+        continue;
+    }
+    if ($arg === '--fingerprints') {
+        $fingerprints = array_shift($args) ?: null;
+        continue;
+    }
+    if ($arg === '--expires-at') {
+        $expiresAt = array_shift($args) ?: null;
+        continue;
+    }
+    if ($arg === '--vendor-sign-key') {
+        $vendorSignKey = array_shift($args) ?: null;
+        continue;
+    }
+    if ($arg === '--verify-routes') {
+        $routes = array_filter(array_map('trim', explode(',', array_shift($args) ?: '')));
+        continue;
+    }
+    if ($arg === '--port') {
+        $port = array_shift($args) ?: '8095';
+        continue;
+    }
+    if ($arg === '--cutover') {
+        $cutover = true;
+        continue;
+    }
+    if ($arg === '--rollback') {
+        $rollback = true;
+        continue;
+    }
+    if ($arg === '--start-runner') {
+        $startRunner = true;
+        continue;
+    }
+    usage();
+    exit(2);
+}
+if ($stage === null || $stage === '') {
+    fail('--stage is required; deploys are staged first by design', 2);
+}
+if (!preg_match('/\A[0-9]{2,5}\z/', $port)) {
+    fail('--port must be numeric', 2);
+}
+if (!preg_match('/\A([^:]+):(.+)\z/', $target, $m)) {
+    fail('target must look like user@host:/remote/app', 2);
+}
+$ssh = $m[1];
+$remoteApp = rtrim($m[2], '/');
+
+if ($rollback) {
+    $remote = 'set -e; backup_dir=' . escapeshellarg($remoteApp . '.bytecode-backups')
+        . '; latest=$(ls -1dt "$backup_dir"/* 2>/dev/null | head -1)'
+        . '; test -n "$latest"'
+        . '; sudo rsync -a --delete "$latest"/ ' . escapeshellarg($remoteApp) . '/'
+        . '; echo "rollback complete from $latest"';
+    run(['ssh', $ssh, $remote]);
+    exit(0);
+}
+
+run(['rsync', '-az', '--delete', '--exclude', '.git', '--exclude', 'vendor', '--exclude', 'node_modules', rtrim($localRoot, '/') . '/', "{$ssh}:{$stage}/"]);
+
+$dumpArgs = [];
+if ($includeAssets) {
+    $dumpArgs[] = '--include-assets';
+}
+if ($profile !== null && $profile !== '') {
+    array_push($dumpArgs, '--profile', $profile);
+}
+foreach ($excludes as $exclude) {
+    if ($exclude !== '') {
+        array_push($dumpArgs, '--exclude', $exclude);
+    }
+}
+foreach ([
+    '--machine-id' => $machineId,
+    '--hostnames' => $hostnames,
+    '--fingerprints' => $fingerprints,
+    '--expires-at' => $expiresAt,
+    '--vendor-sign-key' => $vendorSignKey,
+] as $opt => $value) {
+    if ($value !== null && $value !== '') {
+        array_push($dumpArgs, $opt, $value);
+    }
+}
+$remote = 'set -e; cd ' . escapeshellarg($stage)
+    . '; if [ -f bytecode.json ]; then php8.4 -r ' . escapeshellarg('$j=json_decode(file_get_contents("bytecode.json"),true); if(isset($j["healthchecks"])&&is_array($j["healthchecks"])) echo implode(",", $j["healthchecks"]);') . ' > /tmp/bytecode-healthchecks.txt; fi'
+    . '; rm -rf /tmp/bytecode-stage-out'
+    . '; BYTECODE_VENDOR_KEY_FILE=' . escapeshellarg($bytecodeRoot . '/build/vendor-secret.key')
+    . ' php8.4 ' . escapeshellarg($bytecodeRoot . '/php/bin/bytecode-dump') . ' '
+    . implode(' ', array_map('escapeshellarg', $dumpArgs))
+    . ' ' . escapeshellarg($stage) . ' /tmp/bytecode-stage-out'
+    . '; php8.4 ' . escapeshellarg($bytecodeRoot . '/php/bin/bytecode-verify') . ' --decrypt-test /tmp/bytecode-stage-out'
+    . '; rsync -a /tmp/bytecode-stage-out/ ' . escapeshellarg($stage) . '/';
+run(['ssh', $ssh, $remote]);
+
+if ($routes === []) {
+    $routeCapture = trim(shell_exec('ssh ' . escapeshellarg($ssh) . ' ' . escapeshellarg('cat /tmp/bytecode-healthchecks.txt 2>/dev/null || true')) ?: '');
+    if ($routeCapture !== '') {
+        $routes = array_filter(array_map('trim', explode(',', $routeCapture)));
+    }
+}
+
+if ($startRunner) {
+    $tag = 'bytecode-stage-runner-' . preg_replace('/[^0-9A-Za-z_.-]/', '_', $port);
+    $relayPort = '6' . substr($port, -3);
+    $remote = 'set -e; cd ' . escapeshellarg($stage)
+        . '; pkill -f ' . escapeshellarg($tag) . ' 2>/dev/null || true'
+        . '; export OPDUMP_MACHINE_ID=' . escapeshellarg($machineId ?? '')
+        . '; if [ -x ./rr ] && [ -f .rr.yaml ]; then sed -e ' . escapeshellarg('s/0.0.0.0:[0-9][0-9]*/127.0.0.1:' . $port . '/') . ' -e ' . escapeshellarg('s/127.0.0.1:[0-9][0-9]*/127.0.0.1:' . $relayPort . '/') . ' .rr.yaml > .rr-bytecode-stage.yaml; BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup ./rr serve -c .rr-bytecode-stage.yaml >/tmp/bytecode-stage-runner.log 2>&1 &'
+        . '; elif [ -f artisan ] || [ -f public/index.php ]; then BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup php8.4 -S 127.0.0.1:' . $port . ' -t public >/tmp/bytecode-stage-runner.log 2>&1 &'
+        . '; else BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup php8.4 -S 127.0.0.1:' . $port . ' >/tmp/bytecode-stage-runner.log 2>&1 & fi'
+        . '; sleep 2; echo ' . escapeshellarg("stage runner attempted on 127.0.0.1:{$port}");
+    run(['ssh', $ssh, $remote]);
+}
+
+foreach ($routes as $route) {
+    $route = '/' . ltrim($route, '/');
+    $url = "http://127.0.0.1:{$port}{$route}";
+    run(['ssh', $ssh, 'curl -s -o /dev/null -w ' . escapeshellarg($route . ' %{http_code}' . "\n") . ' ' . escapeshellarg($url)]);
+}
+
+if ($cutover) {
+    run(['ssh', $ssh, 'set -e; backup_parent=' . escapeshellarg($remoteApp . '.bytecode-backups') . '; backup_dir="$backup_parent/$(date -u +%Y%m%dT%H%M%SZ)"; sudo mkdir -p "$backup_dir"; sudo rsync -a ' . escapeshellarg($remoteApp) . '/ "$backup_dir"/; sudo rsync -a --delete ' . escapeshellarg($stage) . '/ ' . escapeshellarg($remoteApp) . '/']);
+    fwrite(STDOUT, "cutover complete: {$target}\n");
+} else {
+    fwrite(STDOUT, "staged encoded app at {$ssh}:{$stage}; rerun with --cutover after app-level verification.\n");
+}

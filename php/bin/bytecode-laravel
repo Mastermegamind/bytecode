@@ -1,0 +1,34 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+if (($argv[1] ?? '') !== 'prepare' || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-laravel prepare [app-dir]\n");
+    exit(($argv[1] ?? '') === '--help' ? 0 : 2);
+}
+$app = $argv[2] ?? getcwd();
+if (!is_file($app . DIRECTORY_SEPARATOR . 'artisan')) {
+    fwrite(STDERR, "artisan not found in {$app}\n");
+    exit(2);
+}
+$php = getenv('PHP_BIN') ?: 'php8.4';
+$commands = [
+    ['cache:clear'],
+    ['config:clear'],
+    ['route:clear'],
+    ['view:clear'],
+    ['config:cache'],
+    ['route:cache'],
+    ['view:cache'],
+    ['about', '--only=environment'],
+];
+foreach ($commands as $artisanArgs) {
+    $cmd = [$php, 'artisan', ...$artisanArgs];
+    echo '$ ', implode(' ', $cmd), PHP_EOL;
+    $p = proc_open($cmd, [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes, $app);
+    $exit = is_resource($p) ? proc_close($p) : 127;
+    if ($exit !== 0) {
+        exit($exit);
+    }
+}

@@ -677,6 +677,7 @@ static void opdump_map_add(char *source, char *encoded)
 
 /* Defined further down (needs opdump_read_text_file). */
 static bool opdump_verify_manifest_signature(const char *map_dir, const char *map_path);
+static bool opdump_policy_check_machine_id(const char *json, const char *label);
 /* Vendor Ed25519 seal over manifest+map(+license). Returns true when the seal
  * verifies OR when no vendor public-key trust anchor is configured (legacy,
  * unenforced). Returns false only when an anchor IS configured and the seal is
@@ -1182,18 +1183,11 @@ static bool opdump_license_resolve_ikm(const char *key_file, unsigned char ikm[3
         return false;
     }
 
-    char *machine_id = opdump_json_extract_string(json, "machine_id");
-    if (machine_id && machine_id[0]) {
-        const char *actual_machine_id = getenv("OPDUMP_MACHINE_ID");
-        if (!actual_machine_id || strcmp(machine_id, actual_machine_id) != 0) {
-            php_error_docref(NULL, E_WARNING, "opdump: license machine_id does not match this server");
-            free(machine_id);
-            free(json);
-            free(derived_path);
-            return false;
-        }
+    if (!opdump_policy_check_machine_id(json, "license")) {
+        free(json);
+        free(derived_path);
+        return false;
     }
-    free(machine_id);
 
     char *wrapped_b64 = opdump_json_extract_string(json, "wrapped_dek");
     free(json);
@@ -1285,6 +1279,76 @@ static bool opdump_sha256_hex_file(const char *path, char out[65])
     return true;
 }
 
+static bool opdump_sha256_hex_bytes(const unsigned char *bytes, size_t len, char out[65])
+{
+    unsigned char digest[32];
+    unsigned int digest_len = 0;
+    bool ok = EVP_Digest(bytes, len, digest, &digest_len, EVP_sha256(), NULL) == 1 && digest_len == 32;
+    if (!ok) {
+        return false;
+    }
+    static const char hex[] = "0123456789abcdef";
+    for (int i = 0; i < 32; i++) {
+        out[i * 2] = hex[digest[i] >> 4];
+        out[i * 2 + 1] = hex[digest[i] & 0x0f];
+    }
+    out[64] = '\0';
+    return true;
+}
+
+static char *opdump_seal_policy_message(const char *json)
+{
+    const char *keys[] = {
+        "machine_id",
+        "domains",
+        "ips",
+        "hostnames",
+        "fingerprints",
+        "expires_at",
+        "license_id",
+        "activation_token",
+        "revocation_url",
+        "unlock_policy",
+        NULL
+    };
+    size_t len = strlen("bytecode-seal-policy-v1\n");
+    char *values[10] = {0};
+    for (int i = 0; keys[i]; i++) {
+        values[i] = opdump_json_extract_string(json, keys[i]);
+        len += strlen(keys[i]) + 2 + (values[i] && values[i][0] ? strlen(values[i]) : 1);
+    }
+    char *msg = (char *) malloc(len + 1);
+    if (!msg) {
+        for (int i = 0; keys[i]; i++) free(values[i]);
+        return NULL;
+    }
+    strcpy(msg, "bytecode-seal-policy-v1\n");
+    for (int i = 0; keys[i]; i++) {
+        strcat(msg, keys[i]);
+        strcat(msg, ":");
+        strcat(msg, values[i] && values[i][0] ? values[i] : "-");
+        strcat(msg, "\n");
+        free(values[i]);
+    }
+    return msg;
+}
+
+static bool opdump_policy_check_machine_id(const char *json, const char *label)
+{
+    char *machine_id = opdump_json_extract_string(json, "machine_id");
+    if (!machine_id || !machine_id[0]) {
+        free(machine_id);
+        return true;
+    }
+    const char *actual_machine_id = getenv("OPDUMP_MACHINE_ID");
+    bool ok = actual_machine_id && strcmp(machine_id, actual_machine_id) == 0;
+    if (!ok) {
+        php_error_docref(NULL, E_WARNING, "opdump: %s machine_id does not match this server", label);
+    }
+    free(machine_id);
+    return ok;
+}
+
 /* Resolves the vendor public-key trust anchor into *out.
  * Returns: 1 anchor resolved (caller must EVP_PKEY_free *out);
  *          0 no anchor configured (seal not enforced);
@@ -1344,8 +1408,9 @@ static bool opdump_verify_vendor_seal(const char *dir)
     char *license_path = opdump_join_path(dir, "bytecode.license.json");
     unsigned char *sig = NULL;
     char *fmt = NULL, *alg = NULL, *sig_b64 = NULL;
-    char *seal_manifest = NULL, *seal_map = NULL, *seal_license = NULL;
+    char *seal_manifest = NULL, *seal_map = NULL, *seal_license = NULL, *seal_policy = NULL;
     char *seal = NULL;
+    char *policy_msg = NULL;
     bool ok = false;
 
     /* Existence-check first so a legitimately missing seal fails closed with a
@@ -1377,6 +1442,7 @@ static bool opdump_verify_vendor_seal(const char *dir)
     seal_manifest = opdump_json_extract_string(seal, "manifest_sha256");
     seal_map = opdump_json_extract_string(seal, "map_sha256");
     seal_license = opdump_json_extract_string(seal, "license_sha256"); /* optional */
+    seal_policy = opdump_json_extract_string(seal, "policy_sha256"); /* optional */
     sig_b64 = opdump_json_extract_string(seal, "signature");
     if (!seal_manifest || !seal_map || !sig_b64) {
         php_error_docref(NULL, E_WARNING, "opdump: bytecode.seal.json in %s is missing required fields", dir);
@@ -1413,13 +1479,40 @@ static bool opdump_verify_vendor_seal(const char *dir)
         goto cleanup;
     }
 
+    if (seal_policy && seal_policy[0]) {
+        char actual_policy[65];
+        policy_msg = opdump_seal_policy_message(seal);
+        if (!policy_msg ||
+            !opdump_sha256_hex_bytes((const unsigned char *) policy_msg, strlen(policy_msg), actual_policy) ||
+            strcasecmp(actual_policy, seal_policy) != 0) {
+            php_error_docref(NULL, E_WARNING, "opdump: bytecode.seal.json policy digest does not match its signed policy fields in %s", dir);
+            goto cleanup;
+        }
+        if (!opdump_license_check_constraints(seal) || !opdump_policy_check_machine_id(seal, "seal policy")) {
+            goto cleanup;
+        }
+    }
+
     /* Reconstruct the exact canonical message bytecode-dump signed. */
-    char msg[256];
-    int msg_len = snprintf(msg, sizeof(msg),
+    size_t msg_cap = 512;
+    char *msg = (char *) malloc(msg_cap);
+    if (!msg) {
+        goto cleanup;
+    }
+    int msg_len = snprintf(msg, msg_cap,
         "bytecode-seal-v1\nmanifest:%s\nmap:%s\nlicense:%s\n",
         seal_manifest, seal_map, (license_present && seal_license) ? seal_license : "-");
-    if (msg_len <= 0 || (size_t)msg_len >= sizeof(msg)) {
+    if (msg_len > 0 && seal_policy && seal_policy[0]) {
+        int extra = snprintf(msg + msg_len, msg_cap - (size_t) msg_len, "policy:%s\n", seal_policy);
+        if (extra > 0) {
+            msg_len += extra;
+        } else {
+            msg_len = -1;
+        }
+    }
+    if (msg_len <= 0 || (size_t)msg_len >= msg_cap) {
         php_error_docref(NULL, E_WARNING, "opdump: seal message construction failed in %s", dir);
+        free(msg);
         goto cleanup;
     }
 
@@ -1434,6 +1527,7 @@ static bool opdump_verify_vendor_seal(const char *dir)
     ok = mdctx
         && EVP_DigestVerifyInit(mdctx, NULL, NULL, NULL, pkey) == 1
         && EVP_DigestVerify(mdctx, sig, sig_len, (const unsigned char *) msg, (size_t) msg_len) == 1;
+    free(msg);
     if (mdctx) {
         EVP_MD_CTX_free(mdctx);
     }
@@ -1451,6 +1545,8 @@ cleanup:
     free(seal_manifest);
     free(seal_map);
     free(seal_license);
+    free(seal_policy);
+    free(policy_msg);
     free(fmt);
     free(alg);
     free(seal);

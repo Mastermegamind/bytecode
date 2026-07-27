@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Mixed package smoke: PHP files use Zend bytecode containers, while
-# html/css/js/twig files use encrypted raw asset containers.
+# html/css/js/twig/blade files use encrypted raw asset containers.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -29,9 +29,10 @@ printf '<!doctype html><title>Bytecode</title><h1>encoded html</h1>' > "$TREE/pa
 printf 'body { color: #123456; }\n' > "$TREE/assets/app.css"
 printf 'console.log("encoded js");\n' > "$TREE/assets/app.js"
 printf '<p>{{ name }}</p>\n' > "$TREE/templates/view.twig"
+printf '<h1>{{ $name }}</h1>\n' > "$TREE/templates/home.blade.php"
 
 BYTECODE_KEY="$KEY" PHP_BIN="$PHP_BIN" "$ROOT/php/bin/bytecode-dump" "$TREE" "$OUT_DEFAULT" >/dev/null
-if [[ -e "$OUT_DEFAULT/assets/app.css" || -e "$OUT_DEFAULT/assets/app.js" || -e "$OUT_DEFAULT/page.html" || -e "$OUT_DEFAULT/templates/view.twig" ]]; then
+if [[ -e "$OUT_DEFAULT/assets/app.css" || -e "$OUT_DEFAULT/assets/app.js" || -e "$OUT_DEFAULT/page.html" || -e "$OUT_DEFAULT/templates/view.twig" || -e "$OUT_DEFAULT/templates/home.blade.php" ]]; then
   echo "assets were encoded without --include-assets" >&2
   exit 1
 fi
@@ -49,7 +50,7 @@ if [[ "$(printf '%s\n' "$php_output" | tail -n 1)" != "mixed:php" ]]; then
   exit 1
 fi
 
-for rel in page.html assets/app.css assets/app.js templates/view.twig; do
+for rel in page.html assets/app.css assets/app.js templates/view.twig templates/home.blade.php; do
   decoded="$(
     BYTECODE_KEY="$KEY" "$PHP_BIN" -r \
       'require $argv[1]; echo bytecode_asset_decrypt($argv[2]);' \

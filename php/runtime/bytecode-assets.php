@@ -124,6 +124,15 @@ function bytecode_asset_ikm(?string $containerPath): string
 
 function bytecode_asset_decrypt(string $containerPath): string
 {
+    static $cache = [];
+    static $telemetry = ['loads' => 0, 'cache_hits' => 0, 'decrypt_failures' => 0];
+    $cacheEnabled = getenv('BYTECODE_ASSET_CACHE') !== '0';
+    if ($cacheEnabled && isset($cache[$containerPath])) {
+        $telemetry['cache_hits']++;
+        $GLOBALS['BYTECODE_ASSET_TELEMETRY'] = $telemetry;
+        return $cache[$containerPath];
+    }
+    $telemetry['loads']++;
     $bytes = file_get_contents($containerPath);
     if ($bytes === false) {
         bytecode_asset_fail("cannot read asset container: {$containerPath}", 404);
@@ -159,13 +168,27 @@ function bytecode_asset_decrypt(string $containerPath): string
     $key = hash_hkdf('sha256', bytecode_asset_ikm($containerPath), 32, 'bytecode-v2', $keyId);
     $plain = openssl_decrypt($ciphertext, 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $nonce, $tag, $aad);
     if ($plain === false) {
+        $telemetry['decrypt_failures']++;
+        $GLOBALS['BYTECODE_ASSET_TELEMETRY'] = $telemetry;
         bytecode_asset_fail('asset authentication/decryption failed');
     }
+    if ($cacheEnabled) {
+        $cache[$containerPath] = $plain;
+    }
+    $GLOBALS['BYTECODE_ASSET_TELEMETRY'] = $telemetry;
     return $plain;
+}
+
+function bytecode_asset_telemetry(): array
+{
+    return $GLOBALS['BYTECODE_ASSET_TELEMETRY'] ?? ['loads' => 0, 'cache_hits' => 0, 'decrypt_failures' => 0];
 }
 
 function bytecode_asset_mime(string $path): string
 {
+    if (str_ends_with(strtolower(str_replace('\\', '/', $path)), '.blade.php')) {
+        return 'text/x-blade; charset=utf-8';
+    }
     return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
         'css' => 'text/css; charset=utf-8',
         'js', 'mjs' => 'text/javascript; charset=utf-8',

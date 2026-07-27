@@ -33,8 +33,15 @@ Options:
   --raw                         Write raw .opd2 bytecode blobs instead of encrypted containers.
                                 PHP files only; asset containers are encrypted
                                 deployable output.
-  --include-assets              Also encode .html/.htm/.css/.js/.mjs/.twig files
-                                as encrypted raw asset containers. Off by default.
+  --dry-run                     Report what would be encoded/skipped without writing output.
+  --report-json                 With --dry-run, print a JSON fail-closed report.
+  --profile <name>              Apply include/exclude defaults. Built-ins:
+                                php-only, php-assets, laravel, slim, symfony,
+                                codeigniter, wordpress-plugin,
+                                wordpress-theme, yii, cakephp, full-app.
+  --include-assets              Also encode .html/.htm/.css/.js/.mjs/.twig/
+                                .blade.php files as encrypted raw asset
+                                containers. Off by default.
   --obfuscate                   Enable safe local-variable obfuscation.
   --scan                        Run bytecode-scan first and embed the scan report.
   --fail-on-scan-warning        Fail if bytecode-scan reports warnings.
@@ -53,8 +60,9 @@ Options:
                                 ured with the matching public key refuses any
                                 package whose files or license rules were altered.
   --license-pubkey <path>       Encode in license mode with this RSA public key.
-  --machine-id <id>             License mode only: bind bytecode.license.json
-                                to OPDUMP_MACHINE_ID on the server.
+  --machine-id <id>             Bind the signed package policy to
+                                OPDUMP_MACHINE_ID on the server. In license
+                                mode this is also written to bytecode.license.json.
   --domains <csv>               License mode: allowed HTTP_HOST/SERVER_NAME values.
   --ips <csv>                   License mode: allowed SERVER_ADDR values.
   --hostnames <csv>             License mode: allowed system hostnames.
@@ -399,6 +407,51 @@ function ed25519_pubkey_hex(string $privateKeyPath): string
     return bin2hex(substr($der, 12, 32));
 }
 
+function seal_policy_fields(array $licenseFields): array
+{
+    $keys = [
+        'machine_id',
+        'domains',
+        'ips',
+        'hostnames',
+        'fingerprints',
+        'expires_at',
+        'license_id',
+        'activation_token',
+        'revocation_url',
+        'unlock_policy',
+    ];
+    $policy = [];
+    foreach ($keys as $key) {
+        $value = $licenseFields[$key] ?? null;
+        if ($value !== null && $value !== '') {
+            $policy[$key] = $value;
+        }
+    }
+    return $policy;
+}
+
+function seal_policy_message(array $policy): string
+{
+    $keys = [
+        'machine_id',
+        'domains',
+        'ips',
+        'hostnames',
+        'fingerprints',
+        'expires_at',
+        'license_id',
+        'activation_token',
+        'revocation_url',
+        'unlock_policy',
+    ];
+    $message = "bytecode-seal-policy-v1\n";
+    foreach ($keys as $key) {
+        $message .= $key . ':' . (($policy[$key] ?? '') !== '' ? $policy[$key] : '-') . "\n";
+    }
+    return $message;
+}
+
 $args = array_slice($argv, 1);
 if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
     usage();
@@ -406,10 +459,14 @@ if (isset($args[0]) && in_array($args[0], ['-h', '--help'], true)) {
 }
 
 $raw = false;
+$dryRun = false;
+$reportJson = false;
 $includeAssets = false;
+$includeAssetsExplicit = false;
 $obfuscate = false;
 $scan = false;
 $failOnScanWarning = false;
+$profile = null;
 $configPath = null;
 $excludes = [];
 $out = null;
@@ -444,8 +501,28 @@ while ($args) {
         array_shift($args);
         continue;
     }
+    if ($a === '--dry-run') {
+        $dryRun = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--report-json') {
+        $reportJson = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--profile') {
+        $profile = take_option_value($args, '--profile');
+        continue;
+    }
+    if (str_starts_with($a, '--profile=')) {
+        $profile = substr($a, strlen('--profile='));
+        array_shift($args);
+        continue;
+    }
     if ($a === '--include-assets') {
         $includeAssets = true;
+        $includeAssetsExplicit = true;
         array_shift($args);
         continue;
     }
@@ -630,9 +707,68 @@ $sources = $args;
 
 $config = load_bytecode_config($configPath);
 $scannerConfig = scanner_config($config);
-$excludes = array_values(array_unique([...config_list($config, 'exclude'), ...$excludes]));
+$profile = $profile ?: (($config['profile'] ?? null) ?: null);
+
+function bytecode_profile(string $profile): array
+{
+    return match ($profile) {
+        'php-only' => [
+            'include_assets' => false,
+            'exclude' => ['vendor/*', 'storage/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'php-assets' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'storage/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'laravel' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'storage/*', 'bootstrap/cache/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'slim' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'var/cache/*', 'var/log/*', 'storage/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'symfony' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'var/cache/*', 'var/log/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'codeigniter' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'writable/cache/*', 'writable/logs/*', 'writable/session/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'wordpress-plugin' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'node_modules/*', '.git/*', '.history/*', 'tests/*'],
+        ],
+        'wordpress-theme' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'node_modules/*', '.git/*', '.history/*', 'screenshot.png'],
+        ],
+        'yii' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'runtime/*', 'web/assets/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'cakephp' => [
+            'include_assets' => true,
+            'exclude' => ['vendor/*', 'tmp/*', 'logs/*', 'node_modules/*', '.git/*', '.history/*'],
+        ],
+        'full-app' => [
+            'include_assets' => true,
+            'exclude' => ['.git/*', '.history/*', 'node_modules/*'],
+        ],
+        default => fail("unknown profile '{$profile}' (expected php-only, php-assets, laravel, slim, symfony, codeigniter, wordpress-plugin, wordpress-theme, yii, cakephp, full-app)", 2),
+    };
+}
+
+$profileConfig = is_string($profile) && $profile !== '' ? bytecode_profile($profile) : [];
+$excludes = array_values(array_unique([...($profileConfig['exclude'] ?? []), ...config_list($config, 'exclude'), ...$excludes]));
 if (($config['assets']['include'] ?? false) === true || ($config['include_assets'] ?? false) === true) {
     $includeAssets = true;
+}
+if (($profileConfig['include_assets'] ?? null) === true) {
+    $includeAssets = true;
+} elseif (($profileConfig['include_assets'] ?? null) === false && !$includeAssetsExplicit && !isset($config['assets']['include']) && !isset($config['include_assets'])) {
+    $includeAssets = false;
 }
 if (($scannerConfig['enabled'] ?? false) === true) {
     $scan = true;
@@ -655,13 +791,14 @@ $defaultVendorKeyFile = $vendorKeyFileOption
 if (!$raw && !is_file($assetPacker)) {
     fail("asset packer not found at {$assetPacker}");
 }
-if (!is_dir($out) && !@mkdir($out, 0777, true) && !is_dir($out)) {
+if (!$dryRun && !is_dir($out) && !@mkdir($out, 0777, true) && !is_dir($out)) {
     fail("cannot create output directory: {$out}");
 }
 $outAbs = realpath($out);
-if ($outAbs === false) {
+if ($outAbs === false && !$dryRun) {
     fail("cannot resolve output directory: {$out}");
 }
+$outAbs = $outAbs ?: rtrim($out, DIRECTORY_SEPARATOR);
 
 function php_version_id(string $phpBin): int
 {
@@ -703,8 +840,8 @@ $licenseFields = [
     'unlock_policy' => $unlockPolicyOption ?: getenv('BYTECODE_UNLOCK_POLICY') ?: null,
 ];
 $hasLicensePolicy = count(array_filter($licenseFields, static fn ($value): bool => $value !== null && $value !== '')) > 0;
-if ($hasLicensePolicy && ($licensePubkey === null || $licensePubkey === '')) {
-    fail('license policy options require --license-pubkey / BYTECODE_LICENSE_PUBKEY', 2);
+if ($hasLicensePolicy && ($licensePubkey === null || $licensePubkey === '') && ($vendorSignKey === null || $vendorSignKey === '')) {
+    fail('machine/license policy options require either --license-pubkey or --vendor-sign-key so the policy is cryptographically bound', 2);
 }
 $dekHex = null;
 if ($licensePubkey !== null && $licensePubkey !== '') {
@@ -720,11 +857,11 @@ if ($licensePubkey !== null && $licensePubkey !== '') {
 // bytecode.manifest.json + bytecode.map so tampering with the map's source-to-
 // container wiring is detectable, not just tampering with a single container.
 $envOrOptionKey = $bytecodeKeyOption ?: $opdumpKeyOption ?: $vendorKeyOption ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: '';
-$defaultVendorKey = (!$raw && $dekHex === null && $envOrOptionKey === '')
+$defaultVendorKey = (!$dryRun && !$raw && $dekHex === null && $envOrOptionKey === '')
     ? read_or_create_key_file($defaultVendorKeyFile)
     : '';
 $ikmHex = $dekHex ?? ($envOrOptionKey ?: $defaultVendorKey);
-if (!$raw && $dekHex === null && !preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
+if (!$dryRun && !$raw && $dekHex === null && !preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
     fail('a 64-hex key is required; pass --key, --vendor-key, set BYTECODE_KEY/BYTECODE_VENDOR_KEY, configure build/vendor-secret.key, or use --license-pubkey', 2);
 }
 
@@ -733,6 +870,9 @@ $mapLines = [];
 
 function source_kind(string $path): ?string
 {
+    if (str_ends_with(strtolower(str_replace('\\', '/', $path)), '.blade.php')) {
+        return 'asset';
+    }
     return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
         'php' => 'php',
         'html', 'htm', 'css', 'js', 'mjs', 'twig' => 'asset',
@@ -744,6 +884,19 @@ function is_supported_source(string $path, bool $includeAssets): bool
 {
     $kind = source_kind($path);
     return $kind === 'php' || ($includeAssets && $kind === 'asset');
+}
+
+function content_type_for_path(string $path): string
+{
+    if (str_ends_with(strtolower(str_replace('\\', '/', $path)), '.blade.php')) {
+        return 'text/x-blade; charset=utf-8';
+    }
+    return match (strtolower(pathinfo($path, PATHINFO_EXTENSION))) {
+        'css' => 'text/css; charset=utf-8',
+        'js', 'mjs' => 'text/javascript; charset=utf-8',
+        'html', 'htm', 'twig' => 'text/html; charset=utf-8',
+        default => 'application/octet-stream',
+    };
 }
 
 function path_parts(string $path): array
@@ -826,6 +979,108 @@ if ($scan) {
             $scanReport['warning_count'] ?? 0,
         ),
     );
+}
+
+function collect_plan_files(array $sourceAbsList, bool $multiSource, string $relativeBase, bool $includeAssets, array $excludes): array
+{
+    $planned = [];
+    $skipped = [];
+    foreach ($sourceAbsList as $srcAbs) {
+        if (is_file($srcAbs)) {
+            $kind = source_kind($srcAbs);
+            $rel = $multiSource ? to_rel($relativeBase, $srcAbs) : basename($srcAbs);
+            if ($kind === null) {
+                $skipped[] = ['source' => str_replace('\\', '/', $srcAbs), 'reason' => 'unsupported-extension'];
+            } elseif ($kind === 'asset' && !$includeAssets) {
+                $skipped[] = ['source' => str_replace('\\', '/', $srcAbs), 'reason' => 'assets-disabled'];
+            } elseif (is_excluded($rel, $excludes)) {
+                $skipped[] = ['source' => str_replace('\\', '/', $srcAbs), 'reason' => 'excluded', 'pattern_match_target' => $rel];
+            } else {
+                $planned[] = [$srcAbs, $rel, $kind];
+            }
+            continue;
+        }
+
+        $files = [];
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($srcAbs, FilesystemIterator::SKIP_DOTS)
+        );
+        foreach ($iterator as $fileInfo) {
+            if (!$fileInfo->isFile()) {
+                continue;
+            }
+            $path = $fileInfo->getPathname();
+            $rel = to_rel($multiSource ? $relativeBase : $srcAbs, $path);
+            $kind = source_kind($path);
+            if ($kind === null) {
+                continue;
+            }
+            if ($kind === 'asset' && !$includeAssets) {
+                $skipped[] = ['source' => str_replace('\\', '/', $path), 'reason' => 'assets-disabled', 'output' => $rel];
+                continue;
+            }
+            if (is_excluded($rel, $excludes)) {
+                $skipped[] = ['source' => str_replace('\\', '/', $path), 'reason' => 'excluded', 'output' => $rel];
+                continue;
+            }
+            $files[] = [$path, $rel, $kind];
+        }
+        sort($files);
+        array_push($planned, ...$files);
+    }
+    return [$planned, $skipped];
+}
+
+[$plannedFiles, $skippedFiles] = collect_plan_files($sourceAbsList, $multiSource, $relativeBase, $includeAssets, $excludes);
+
+if ($dryRun) {
+    $byKind = ['php' => 0, 'asset' => 0];
+    $entries = [];
+    foreach ($plannedFiles as [$file, $rel, $kind]) {
+        $byKind[$kind]++;
+        $entries[] = [
+            'source' => str_replace('\\', '/', $file),
+            'output' => $raw && $kind === 'php' ? "{$rel}.opd2" : $rel,
+            'kind' => $kind,
+            'backend' => $kind === 'php' ? 'php-zend-opdump' : 'bytecode-asset',
+            'content_type' => $kind === 'asset' ? content_type_for_path($file) : null,
+            'size' => filesize($file),
+            'sha256' => hash_file('sha256', $file),
+        ];
+    }
+    $report = [
+        'format' => 'bytecode-dry-run-v1',
+        'profile' => $profile,
+        'include_assets' => $includeAssets,
+        'raw' => $raw,
+        'source_root' => str_replace('\\', '/', $relativeBase),
+        'output_root' => str_replace('\\', '/', $outAbs),
+        'planned_count' => count($entries),
+        'planned_php' => $byKind['php'],
+        'planned_assets' => $byKind['asset'],
+        'skipped_count' => count($skippedFiles),
+        'skipped' => $skippedFiles,
+        'files' => $entries,
+        'scan' => $scanReport,
+    ];
+    if ($reportJson) {
+        echo json_encode($report, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
+    } else {
+        printf(
+            "bytecode-dump dry-run: %d planned (%d php, %d assets), %d skipped\n",
+            $report['planned_count'],
+            $report['planned_php'],
+            $report['planned_assets'],
+            $report['skipped_count'],
+        );
+        foreach ($entries as $entry) {
+            printf("%-6s %s -> %s\n", $entry['kind'], $entry['source'], $entry['output']);
+        }
+        foreach ($skippedFiles as $entry) {
+            printf("skip   %s (%s)\n", $entry['source'], $entry['reason']);
+        }
+    }
+    exit(0);
 }
 
 function dump_one(
@@ -971,12 +1226,7 @@ function dump_asset_one(
         'backend' => 'bytecode-asset',
         'backend_format' => 'RAW1',
         'container' => 'BYTC2',
-        'content_type' => match (strtolower(pathinfo($file, PATHINFO_EXTENSION))) {
-            'css' => 'text/css; charset=utf-8',
-            'js', 'mjs' => 'text/javascript; charset=utf-8',
-            'html', 'htm', 'twig' => 'text/html; charset=utf-8',
-            default => 'application/octet-stream',
-        },
+        'content_type' => content_type_for_path($file),
         'sha256' => hash_file('sha256', $dest),
         'size' => filesize($dest),
     ];
@@ -1037,11 +1287,18 @@ if (!$raw) {
 
     $manifest = [
         'format' => 'bytecode-manifest-v1',
+        'tool_version' => '0.0.1-phase0',
+        'created_at' => gmdate('c'),
+        'build_id' => bin2hex(random_bytes(8)),
         'php_version_id' => $phpVersionId,
         'backend' => 'php-zend-opdump',
         'container' => 'BYTC2',
+        'container_version' => 2,
         'protection_mode' => $protectionMode,
         'metadata' => [
+            'app_id' => basename($relativeBase),
+            'profile' => $profile,
+            'include_assets' => $includeAssets,
             'paths_stripped' => $stripPaths,
             'virtual_root' => $stripPaths ? ($virtualRootOption ?: 'bytecode://') : null,
             'license_id' => $licenseFields['license_id'],
@@ -1122,11 +1379,16 @@ if (!$raw) {
         $manifestSha = hash_file('sha256', $manifestPath);
         $mapSha = hash_file('sha256', $mapPath);
         $licenseSha = is_file($licensePath) ? hash_file('sha256', $licensePath) : null;
+        $policy = seal_policy_fields($licenseFields);
+        $policySha = $policy !== [] ? hash('sha256', seal_policy_message($policy)) : null;
 
         $message = "bytecode-seal-v1\n"
             . "manifest:{$manifestSha}\n"
             . "map:{$mapSha}\n"
             . 'license:' . ($licenseSha ?? '-') . "\n";
+        if ($policySha !== null) {
+            $message .= "policy:{$policySha}\n";
+        }
 
         $signature = openssl_ed25519_sign($vendorSignKey, $message);
         $keyId = substr(hash('sha256', hex2bin(ed25519_pubkey_hex($vendorSignKey))), 0, 16);
@@ -1140,6 +1402,12 @@ if (!$raw) {
         ];
         if ($licenseSha !== null) {
             $seal['license_sha256'] = $licenseSha;
+        }
+        if ($policySha !== null) {
+            $seal['policy_sha256'] = $policySha;
+            foreach ($policy as $key => $value) {
+                $seal[$key] = $value;
+            }
         }
         $seal['signature'] = base64_encode($signature);
 

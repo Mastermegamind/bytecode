@@ -84,12 +84,16 @@ class ManifestEntry {
   const ManifestEntry({
     required this.source,
     required this.output,
+    required this.backend,
+    required this.contentType,
     required this.size,
     required this.sha256,
   });
 
   final String source;
   final String output;
+  final String backend;
+  final String contentType;
   final int size;
   final String sha256;
 
@@ -97,6 +101,8 @@ class ManifestEntry {
     return ManifestEntry(
       source: json['source'] as String? ?? '',
       output: json['output'] as String? ?? '',
+      backend: json['backend'] as String? ?? '',
+      contentType: json['content_type'] as String? ?? '',
       size: json['size'] as int? ?? 0,
       sha256: json['sha256'] as String? ?? '',
     );
@@ -117,11 +123,24 @@ class _EncoderPageState extends State<EncoderPage> {
   final _phpVersionController = TextEditingController(text: '8.4');
   final _configController = TextEditingController();
   final _licensePubkeyController = TextEditingController();
+  final _machineIdController = TextEditingController();
   final _licenseKeyDirController = TextEditingController();
   final _vendorSignKeyController = TextEditingController();
   final _vendorKeyDirController = TextEditingController();
   final _inspectPathController = TextEditingController();
   final _packageVersionController = TextEditingController(text: '1.0.0');
+  final _profileController = TextEditingController(text: 'php-assets');
+  final _remoteTargetController = TextEditingController(
+    text: 'trigger@192.168.8.42:/var/www/exam.test',
+  );
+  final _remoteStageController = TextEditingController(
+    text: '/var/www/exam.test.stage',
+  );
+  final _remoteRoutesController = TextEditingController(
+    text: '/,/login,/backend/login',
+  );
+  final _remotePortController = TextEditingController(text: '8095');
+  final _manifestFilterController = TextEditingController();
   final _excludeController = TextEditingController(
     text: '.history/*, vendor/*, storage/*, node_modules/*',
   );
@@ -132,10 +151,12 @@ class _EncoderPageState extends State<EncoderPage> {
 
   bool _busy = false;
   bool _rawContainers = false;
+  bool _dryRun = false;
   bool _includeAssets = false;
   bool _obfuscate = false;
   bool _scanBeforeDump = true;
   bool _failOnScanWarning = false;
+  bool _deployStartRunner = false;
   String? _status;
 
   @override
@@ -159,11 +180,18 @@ class _EncoderPageState extends State<EncoderPage> {
     _phpVersionController.dispose();
     _configController.dispose();
     _licensePubkeyController.dispose();
+    _machineIdController.dispose();
     _licenseKeyDirController.dispose();
     _vendorSignKeyController.dispose();
     _vendorKeyDirController.dispose();
     _inspectPathController.dispose();
     _packageVersionController.dispose();
+    _profileController.dispose();
+    _remoteTargetController.dispose();
+    _remoteStageController.dispose();
+    _remoteRoutesController.dispose();
+    _remotePortController.dispose();
+    _manifestFilterController.dispose();
     _excludeController.dispose();
     super.dispose();
   }
@@ -347,6 +375,11 @@ class _EncoderPageState extends State<EncoderPage> {
     return config.isEmpty ? [] : ['--config', config];
   }
 
+  List<String> _profileArgs() {
+    final profile = _profileController.text.trim();
+    return profile.isEmpty ? [] : ['--profile', profile];
+  }
+
   Future<int> _runStreaming(
     String executable,
     List<String> args, {
@@ -395,10 +428,20 @@ class _EncoderPageState extends State<EncoderPage> {
       final exit = await _runStreaming(_phpBinary(), [
         _join(_root, 'php/bin/bytecode-dump'),
         if (_rawContainers) '--raw',
+        if (_dryRun) '--dry-run',
         if (_includeAssets && !_rawContainers) '--include-assets',
         if (_obfuscate) '--obfuscate',
         if (_scanBeforeDump) '--scan',
         if (_failOnScanWarning) '--fail-on-scan-warning',
+        if (_machineIdController.text.trim().isNotEmpty) ...[
+          '--machine-id',
+          _machineIdController.text.trim(),
+        ],
+        if (_vendorSignKeyController.text.trim().isNotEmpty) ...[
+          '--vendor-sign-key',
+          _vendorSignKeyController.text.trim(),
+        ],
+        ..._profileArgs(),
         ..._configArgs(),
         ..._excludeArgs(),
         ..._sources,
@@ -409,8 +452,62 @@ class _EncoderPageState extends State<EncoderPage> {
         throw StateError('bytecode-dump exited with $exit');
       }
 
+      if (_dryRun) {
+        _status = 'Dry run complete';
+      } else {
+        await _loadManifest();
+        _status = 'Dump complete';
+      }
+    });
+  }
+
+  Future<void> _doctor() async {
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Running doctor';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-doctor'),
+        '--php-version',
+        _phpVersionController.text.trim().isEmpty
+            ? '8.4'
+            : _phpVersionController.text.trim(),
+      ]);
+      if (exit != 0) {
+        throw StateError('bytecode-doctor exited with $exit');
+      }
+      _status = 'Doctor checks passed';
+    });
+  }
+
+  Future<void> _rotateKey() async {
+    final output = _outputController.text.trim();
+    if (_sources.isEmpty || output.isEmpty) {
+      setState(() => _status = 'At least one source and output are required');
+      return;
+    }
+    await _runLocked(() async {
+      _log.clear();
+      _manifestRows.clear();
+      _status = 'Rotating key and re-encoding';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-key-rotate'),
+        '--force',
+        '--source',
+        _sources.first,
+        '--out',
+        output,
+        if (_includeAssets && !_rawContainers) '--include-assets',
+        ..._profileArgs(),
+        ..._excludeArgs(),
+      ]);
+      if (exit != 0) {
+        throw StateError('bytecode-key-rotate exited with $exit');
+      }
       await _loadManifest();
-      _status = 'Dump complete';
+      _keyController.text = _vendorSecretPath;
+      _status = 'Key rotated and output re-encoded';
     });
   }
 
@@ -441,6 +538,10 @@ class _EncoderPageState extends State<EncoderPage> {
   }
 
   Future<void> _verify() async {
+    await _verifyWith(decryptTest: false);
+  }
+
+  Future<void> _verifyWith({required bool decryptTest}) async {
     await _runLocked(() async {
       _status = 'Verifying';
       setState(() {});
@@ -456,7 +557,11 @@ class _EncoderPageState extends State<EncoderPage> {
       }
       final result = await Process.run(
         _phpBinary(),
-        [_join(_root, 'php/bin/bytecode-verify'), _manifestPath],
+        [
+          _join(_root, 'php/bin/bytecode-verify'),
+          if (decryptTest) '--decrypt-test',
+          _manifestPath,
+        ],
         workingDirectory: _root,
         environment: env.isEmpty ? null : env,
       );
@@ -466,6 +571,85 @@ class _EncoderPageState extends State<EncoderPage> {
         throw StateError('bytecode-verify exited with ${result.exitCode}');
       }
       _status = result.stdout.toString().trim();
+    });
+  }
+
+  Future<void> _selfTest() async {
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Running self-test';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-selftest'),
+      ]);
+      if (exit != 0) {
+        throw StateError('bytecode-selftest exited with $exit');
+      }
+      _status = 'Self-test passed';
+    });
+  }
+
+  Future<void> _packageSign() async {
+    final output = _outputController.text.trim();
+    if (output.isEmpty) {
+      setState(() => _status = 'Output folder is required');
+      return;
+    }
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Signing package';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-package-sign'),
+        output,
+      ]);
+      if (exit != 0) {
+        throw StateError('bytecode-package-sign exited with $exit');
+      }
+      _status = 'Package signed';
+    });
+  }
+
+  Future<void> _saveProjectPreset() async {
+    final file = File(_join(_join(_root, 'build'), 'gui-project.json'));
+    await file.parent.create(recursive: true);
+    final data = {
+      'sources': _sources,
+      'output': _outputController.text,
+      'profile': _profileController.text,
+      'excludes': _excludeController.text,
+      'remote_target': _remoteTargetController.text,
+      'remote_stage': _remoteStageController.text,
+      'routes': _remoteRoutesController.text,
+      'port': _remotePortController.text,
+      'include_assets': _includeAssets,
+      'scan': _scanBeforeDump,
+    };
+    await file.writeAsString(const JsonEncoder.withIndent('  ').convert(data));
+    setState(() => _status = 'Project preset saved');
+  }
+
+  Future<void> _loadProjectPreset() async {
+    final file = File(_join(_join(_root, 'build'), 'gui-project.json'));
+    if (!await file.exists()) {
+      setState(() => _status = 'No saved project preset found');
+      return;
+    }
+    final data = jsonDecode(await file.readAsString()) as Map<String, dynamic>;
+    setState(() {
+      _sources
+        ..clear()
+        ..addAll((data['sources'] as List<dynamic>? ?? []).cast<String>());
+      _outputController.text = data['output'] as String? ?? '';
+      _profileController.text = data['profile'] as String? ?? 'php-assets';
+      _excludeController.text = data['excludes'] as String? ?? '';
+      _remoteTargetController.text = data['remote_target'] as String? ?? '';
+      _remoteStageController.text = data['remote_stage'] as String? ?? '';
+      _remoteRoutesController.text = data['routes'] as String? ?? '';
+      _remotePortController.text = data['port'] as String? ?? '8095';
+      _includeAssets = data['include_assets'] as bool? ?? _includeAssets;
+      _scanBeforeDump = data['scan'] as bool? ?? _scanBeforeDump;
+      _status = 'Project preset loaded';
     });
   }
 
@@ -567,6 +751,80 @@ class _EncoderPageState extends State<EncoderPage> {
       }
 
       _status = buildOnly ? 'Loader build complete' : 'Loader installed';
+    });
+  }
+
+  Future<void> _deploy({required bool cutover}) async {
+    final target = _remoteTargetController.text.trim();
+    final stage = _remoteStageController.text.trim();
+    if (target.isEmpty || stage.isEmpty) {
+      setState(() => _status = 'Remote target and stage are required');
+      return;
+    }
+    await _runLocked(() async {
+      _log.clear();
+      _status = cutover ? 'Deploying and cutting over' : 'Deploying to stage';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-deploy'),
+        target,
+        '--stage',
+        stage,
+        '--local-root',
+        _sources.isNotEmpty ? _sources.first : Directory.current.path,
+        '--bytecode-root',
+        _root,
+        if (_includeAssets && !_rawContainers) '--include-assets',
+        if (_machineIdController.text.trim().isNotEmpty) ...[
+          '--machine-id',
+          _machineIdController.text.trim(),
+        ],
+        if (_vendorSignKeyController.text.trim().isNotEmpty) ...[
+          '--vendor-sign-key',
+          _vendorSignKeyController.text.trim(),
+        ],
+        ..._profileArgs(),
+        ..._excludeArgs(),
+        if (_remoteRoutesController.text.trim().isNotEmpty) ...[
+          '--verify-routes',
+          _remoteRoutesController.text.trim(),
+        ],
+        '--port',
+        _remotePortController.text.trim().isEmpty
+            ? '8095'
+            : _remotePortController.text.trim(),
+        if (_deployStartRunner) '--start-runner',
+        if (cutover) '--cutover',
+      ]);
+      if (exit != 0) {
+        throw StateError('bytecode-deploy exited with $exit');
+      }
+      _status = cutover ? 'Remote cutover complete' : 'Remote stage complete';
+    });
+  }
+
+  Future<void> _deployRollback() async {
+    final target = _remoteTargetController.text.trim();
+    final stage = _remoteStageController.text.trim();
+    if (target.isEmpty || stage.isEmpty) {
+      setState(() => _status = 'Remote target and stage are required');
+      return;
+    }
+    await _runLocked(() async {
+      _log.clear();
+      _status = 'Rolling back remote app';
+      setState(() {});
+      final exit = await _runStreaming(_phpBinary(), [
+        _join(_root, 'php/bin/bytecode-deploy'),
+        target,
+        '--stage',
+        stage,
+        '--rollback',
+      ]);
+      if (exit != 0) {
+        throw StateError('bytecode-deploy rollback exited with $exit');
+      }
+      _status = 'Remote rollback complete';
     });
   }
 
@@ -699,20 +957,29 @@ class _EncoderPageState extends State<EncoderPage> {
               phpVersionController: _phpVersionController,
               configController: _configController,
               licensePubkeyController: _licensePubkeyController,
+              machineIdController: _machineIdController,
               licenseKeyDirController: _licenseKeyDirController,
               vendorSignKeyController: _vendorSignKeyController,
               vendorKeyDirController: _vendorKeyDirController,
               inspectPathController: _inspectPathController,
               packageVersionController: _packageVersionController,
+              profileController: _profileController,
+              remoteTargetController: _remoteTargetController,
+              remoteStageController: _remoteStageController,
+              remoteRoutesController: _remoteRoutesController,
+              remotePortController: _remotePortController,
+              manifestFilterController: _manifestFilterController,
               excludeController: _excludeController,
               sources: _sources,
               busy: _busy,
               status: _status,
               rawContainers: _rawContainers,
+              dryRun: _dryRun,
               includeAssets: _includeAssets,
               obfuscate: _obfuscate,
               scanBeforeDump: _scanBeforeDump,
               failOnScanWarning: _failOnScanWarning,
+              deployStartRunner: _deployStartRunner,
               onPickRoot: _pickRoot,
               onPickOutput: () => _pickFolder(_outputController),
               onPickConfig: () => _pickFile(_configController),
@@ -728,10 +995,17 @@ class _EncoderPageState extends State<EncoderPage> {
               onGenerateKey: _generateKey,
               onGenerateLicenseKeys: _generateLicenseKeys,
               onGenerateVendorKeys: _generateVendorKeys,
+              onDoctor: _doctor,
+              onSelfTest: _selfTest,
+              onRotateKey: _rotateKey,
               onScan: _scanSources,
               onDump: _dump,
               onVerify: _verify,
+              onDecryptVerify: () => _verifyWith(decryptTest: true),
               onInspect: _inspectContainer,
+              onPackageSign: _packageSign,
+              onSaveProject: _saveProjectPreset,
+              onLoadProject: _loadProjectPreset,
               onBuildLoader: () => _installLoader(buildOnly: true),
               onInstallLoader: () => _installLoader(buildOnly: false),
               onBuildAppImage: () => _buildDesktopPackage('AppImage'),
@@ -739,8 +1013,12 @@ class _EncoderPageState extends State<EncoderPage> {
               onBuildMac: () => _buildDesktopPackage('macOS'),
               onBuildWindowsZip: () => _buildDesktopPackage('Windows ZIP'),
               onBuildWindowsMsi: () => _buildDesktopPackage('Windows MSI'),
+              onDeployStage: () => _deploy(cutover: false),
+              onDeployCutover: () => _deploy(cutover: true),
+              onDeployRollback: _deployRollback,
               onRawContainersChanged: (value) =>
                   setState(() => _rawContainers = value),
+              onDryRunChanged: (value) => setState(() => _dryRun = value),
               onIncludeAssetsChanged: (value) =>
                   setState(() => _includeAssets = value),
               onObfuscateChanged: (value) => setState(() => _obfuscate = value),
@@ -748,10 +1026,13 @@ class _EncoderPageState extends State<EncoderPage> {
                   setState(() => _scanBeforeDump = value),
               onFailOnScanWarningChanged: (value) =>
                   setState(() => _failOnScanWarning = value),
+              onDeployStartRunnerChanged: (value) =>
+                  setState(() => _deployStartRunner = value),
             );
             final results = _ResultsPanel(
               rows: _manifestRows,
               logText: _log.toString(),
+              filterController: _manifestFilterController,
             );
 
             return Padding(
@@ -936,20 +1217,29 @@ class _Controls extends StatelessWidget {
     required this.phpVersionController,
     required this.configController,
     required this.licensePubkeyController,
+    required this.machineIdController,
     required this.licenseKeyDirController,
     required this.vendorSignKeyController,
     required this.vendorKeyDirController,
     required this.inspectPathController,
     required this.packageVersionController,
+    required this.profileController,
+    required this.remoteTargetController,
+    required this.remoteStageController,
+    required this.remoteRoutesController,
+    required this.remotePortController,
+    required this.manifestFilterController,
     required this.excludeController,
     required this.sources,
     required this.busy,
     required this.status,
     required this.rawContainers,
+    required this.dryRun,
     required this.includeAssets,
     required this.obfuscate,
     required this.scanBeforeDump,
     required this.failOnScanWarning,
+    required this.deployStartRunner,
     required this.onPickRoot,
     required this.onPickOutput,
     required this.onPickConfig,
@@ -965,10 +1255,17 @@ class _Controls extends StatelessWidget {
     required this.onGenerateKey,
     required this.onGenerateLicenseKeys,
     required this.onGenerateVendorKeys,
+    required this.onDoctor,
+    required this.onSelfTest,
+    required this.onRotateKey,
     required this.onScan,
     required this.onDump,
     required this.onVerify,
+    required this.onDecryptVerify,
     required this.onInspect,
+    required this.onPackageSign,
+    required this.onSaveProject,
+    required this.onLoadProject,
     required this.onBuildLoader,
     required this.onInstallLoader,
     required this.onBuildAppImage,
@@ -976,11 +1273,16 @@ class _Controls extends StatelessWidget {
     required this.onBuildMac,
     required this.onBuildWindowsZip,
     required this.onBuildWindowsMsi,
+    required this.onDeployStage,
+    required this.onDeployCutover,
+    required this.onDeployRollback,
     required this.onRawContainersChanged,
+    required this.onDryRunChanged,
     required this.onIncludeAssetsChanged,
     required this.onObfuscateChanged,
     required this.onScanBeforeDumpChanged,
     required this.onFailOnScanWarningChanged,
+    required this.onDeployStartRunnerChanged,
   });
 
   final TextEditingController rootController;
@@ -989,20 +1291,29 @@ class _Controls extends StatelessWidget {
   final TextEditingController phpVersionController;
   final TextEditingController configController;
   final TextEditingController licensePubkeyController;
+  final TextEditingController machineIdController;
   final TextEditingController licenseKeyDirController;
   final TextEditingController vendorSignKeyController;
   final TextEditingController vendorKeyDirController;
   final TextEditingController inspectPathController;
   final TextEditingController packageVersionController;
+  final TextEditingController profileController;
+  final TextEditingController remoteTargetController;
+  final TextEditingController remoteStageController;
+  final TextEditingController remoteRoutesController;
+  final TextEditingController remotePortController;
+  final TextEditingController manifestFilterController;
   final TextEditingController excludeController;
   final List<String> sources;
   final bool busy;
   final String? status;
   final bool rawContainers;
+  final bool dryRun;
   final bool includeAssets;
   final bool obfuscate;
   final bool scanBeforeDump;
   final bool failOnScanWarning;
+  final bool deployStartRunner;
   final VoidCallback onPickRoot;
   final VoidCallback onPickOutput;
   final VoidCallback onPickConfig;
@@ -1018,10 +1329,17 @@ class _Controls extends StatelessWidget {
   final VoidCallback onGenerateKey;
   final VoidCallback onGenerateLicenseKeys;
   final VoidCallback onGenerateVendorKeys;
+  final VoidCallback onDoctor;
+  final VoidCallback onSelfTest;
+  final VoidCallback onRotateKey;
   final VoidCallback onScan;
   final VoidCallback onDump;
   final VoidCallback onVerify;
+  final VoidCallback onDecryptVerify;
   final VoidCallback onInspect;
+  final VoidCallback onPackageSign;
+  final VoidCallback onSaveProject;
+  final VoidCallback onLoadProject;
   final VoidCallback onBuildLoader;
   final VoidCallback onInstallLoader;
   final VoidCallback onBuildAppImage;
@@ -1029,11 +1347,16 @@ class _Controls extends StatelessWidget {
   final VoidCallback onBuildMac;
   final VoidCallback onBuildWindowsZip;
   final VoidCallback onBuildWindowsMsi;
+  final VoidCallback onDeployStage;
+  final VoidCallback onDeployCutover;
+  final VoidCallback onDeployRollback;
   final ValueChanged<bool> onRawContainersChanged;
+  final ValueChanged<bool> onDryRunChanged;
   final ValueChanged<bool> onIncludeAssetsChanged;
   final ValueChanged<bool> onObfuscateChanged;
   final ValueChanged<bool> onScanBeforeDumpChanged;
   final ValueChanged<bool> onFailOnScanWarningChanged;
+  final ValueChanged<bool> onDeployStartRunnerChanged;
 
   @override
   Widget build(BuildContext context) {
@@ -1070,6 +1393,26 @@ class _Controls extends StatelessWidget {
             Row(
               children: [
                 Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : onDecryptVerify,
+                    icon: const Icon(Icons.lock),
+                    label: const Text('Decrypt Test'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : onPackageSign,
+                    icon: const Icon(Icons.approval_outlined),
+                    label: const Text('Sign Package'),
+                  ),
+                ),
+              ],
+            ),
+            const SizedBox(height: 12),
+            Row(
+              children: [
+                Expanded(
                   child: TextField(
                     controller: phpVersionController,
                     decoration: const InputDecoration(
@@ -1079,6 +1422,18 @@ class _Controls extends StatelessWidget {
                   ),
                 ),
                 const SizedBox(width: 10),
+                IconButton.filledTonal(
+                  tooltip: 'Doctor',
+                  onPressed: busy ? null : onDoctor,
+                  icon: const Icon(Icons.health_and_safety_outlined),
+                ),
+                const SizedBox(width: 8),
+                IconButton.filledTonal(
+                  tooltip: 'Self-test',
+                  onPressed: busy ? null : onSelfTest,
+                  icon: const Icon(Icons.checklist),
+                ),
+                const SizedBox(width: 8),
                 IconButton.filledTonal(
                   tooltip: 'Build loader',
                   onPressed: busy ? null : onBuildLoader,
@@ -1095,16 +1450,64 @@ class _Controls extends StatelessWidget {
             const SizedBox(height: 16),
             _OptionGrid(
               rawContainers: rawContainers,
+              dryRun: dryRun,
               includeAssets: includeAssets,
               obfuscate: obfuscate,
               scanBeforeDump: scanBeforeDump,
               failOnScanWarning: failOnScanWarning,
               busy: busy,
               onRawContainersChanged: onRawContainersChanged,
+              onDryRunChanged: onDryRunChanged,
               onIncludeAssetsChanged: onIncludeAssetsChanged,
               onObfuscateChanged: onObfuscateChanged,
               onScanBeforeDumpChanged: onScanBeforeDumpChanged,
               onFailOnScanWarningChanged: onFailOnScanWarningChanged,
+            ),
+            const SizedBox(height: 12),
+            DropdownMenu<String>(
+              controller: profileController,
+              label: const Text('Profile'),
+              leadingIcon: const Icon(Icons.account_tree),
+              expandedInsets: EdgeInsets.zero,
+              dropdownMenuEntries: const [
+                DropdownMenuEntry(value: 'php-only', label: 'php-only'),
+                DropdownMenuEntry(value: 'php-assets', label: 'php-assets'),
+                DropdownMenuEntry(value: 'laravel', label: 'laravel'),
+                DropdownMenuEntry(value: 'slim', label: 'slim'),
+                DropdownMenuEntry(value: 'symfony', label: 'symfony'),
+                DropdownMenuEntry(value: 'codeigniter', label: 'codeigniter'),
+                DropdownMenuEntry(
+                  value: 'wordpress-plugin',
+                  label: 'wordpress-plugin',
+                ),
+                DropdownMenuEntry(
+                  value: 'wordpress-theme',
+                  label: 'wordpress-theme',
+                ),
+                DropdownMenuEntry(value: 'yii', label: 'yii'),
+                DropdownMenuEntry(value: 'cakephp', label: 'cakephp'),
+                DropdownMenuEntry(value: 'full-app', label: 'full-app'),
+              ],
+            ),
+            const SizedBox(height: 8),
+            Row(
+              children: [
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : onSaveProject,
+                    icon: const Icon(Icons.save_outlined),
+                    label: const Text('Save Project'),
+                  ),
+                ),
+                const SizedBox(width: 10),
+                Expanded(
+                  child: OutlinedButton.icon(
+                    onPressed: busy ? null : onLoadProject,
+                    icon: const Icon(Icons.folder_open),
+                    label: const Text('Load Project'),
+                  ),
+                ),
+              ],
             ),
             const SizedBox(height: 12),
             Row(
@@ -1157,12 +1560,27 @@ class _Controls extends StatelessWidget {
                 ),
               ),
             ),
+            const SizedBox(height: 8),
+            OutlinedButton.icon(
+              onPressed: busy || rawContainers ? null : onRotateKey,
+              icon: const Icon(Icons.rotate_right),
+              label: const Text('Rotate Key + Re-encode'),
+            ),
             const SizedBox(height: 12),
             _PathField(
               label: 'License public key',
               controller: licensePubkeyController,
               icon: Icons.verified_user_outlined,
               onPick: busy || rawContainers ? null : onPickLicensePubkey,
+            ),
+            const SizedBox(height: 12),
+            TextField(
+              controller: machineIdController,
+              enabled: !rawContainers,
+              decoration: const InputDecoration(
+                labelText: 'Authorized machine ID',
+                prefixIcon: Icon(Icons.computer),
+              ),
             ),
             const SizedBox(height: 12),
             Row(
@@ -1289,6 +1707,19 @@ class _Controls extends StatelessWidget {
               onBuildWindowsMsi: onBuildWindowsMsi,
             ),
             const SizedBox(height: 12),
+            _DeployActions(
+              targetController: remoteTargetController,
+              stageController: remoteStageController,
+              routesController: remoteRoutesController,
+              portController: remotePortController,
+              startRunner: deployStartRunner,
+              busy: busy,
+              onDeployStage: onDeployStage,
+              onDeployCutover: onDeployCutover,
+              onDeployRollback: onDeployRollback,
+              onStartRunnerChanged: onDeployStartRunnerChanged,
+            ),
+            const SizedBox(height: 12),
             _StatusBanner(status: status, busy: busy),
           ],
         ),
@@ -1300,12 +1731,14 @@ class _Controls extends StatelessWidget {
 class _OptionGrid extends StatelessWidget {
   const _OptionGrid({
     required this.rawContainers,
+    required this.dryRun,
     required this.includeAssets,
     required this.obfuscate,
     required this.scanBeforeDump,
     required this.failOnScanWarning,
     required this.busy,
     required this.onRawContainersChanged,
+    required this.onDryRunChanged,
     required this.onIncludeAssetsChanged,
     required this.onObfuscateChanged,
     required this.onScanBeforeDumpChanged,
@@ -1313,12 +1746,14 @@ class _OptionGrid extends StatelessWidget {
   });
 
   final bool rawContainers;
+  final bool dryRun;
   final bool includeAssets;
   final bool obfuscate;
   final bool scanBeforeDump;
   final bool failOnScanWarning;
   final bool busy;
   final ValueChanged<bool> onRawContainersChanged;
+  final ValueChanged<bool> onDryRunChanged;
   final ValueChanged<bool> onIncludeAssetsChanged;
   final ValueChanged<bool> onObfuscateChanged;
   final ValueChanged<bool> onScanBeforeDumpChanged;
@@ -1336,6 +1771,13 @@ class _OptionGrid extends StatelessWidget {
           selected: rawContainers,
           busy: busy,
           onChanged: onRawContainersChanged,
+        ),
+        _OptionChip(
+          icon: Icons.fact_check_outlined,
+          label: 'Dry run',
+          selected: dryRun,
+          busy: busy,
+          onChanged: onDryRunChanged,
         ),
         _OptionChip(
           icon: Icons.web_asset,
@@ -1477,6 +1919,127 @@ class _PackageActions extends StatelessWidget {
                   onPressed: busy ? null : onBuildWindowsMsi,
                   icon: const Icon(Icons.install_desktop),
                   label: const Text('MSI'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _DeployActions extends StatelessWidget {
+  const _DeployActions({
+    required this.targetController,
+    required this.stageController,
+    required this.routesController,
+    required this.portController,
+    required this.startRunner,
+    required this.busy,
+    required this.onDeployStage,
+    required this.onDeployCutover,
+    required this.onDeployRollback,
+    required this.onStartRunnerChanged,
+  });
+
+  final TextEditingController targetController;
+  final TextEditingController stageController;
+  final TextEditingController routesController;
+  final TextEditingController portController;
+  final bool startRunner;
+  final bool busy;
+  final VoidCallback onDeployStage;
+  final VoidCallback onDeployCutover;
+  final VoidCallback onDeployRollback;
+  final ValueChanged<bool> onStartRunnerChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: const Color(0xfffaf9f6),
+        border: Border.all(color: const Color(0xffddd6c8)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          TextField(
+            controller: targetController,
+            decoration: const InputDecoration(
+              labelText: 'Remote app',
+              prefixIcon: Icon(Icons.dns_outlined),
+            ),
+          ),
+          const SizedBox(height: 10),
+          TextField(
+            controller: stageController,
+            decoration: const InputDecoration(
+              labelText: 'Remote stage',
+              prefixIcon: Icon(Icons.inventory_outlined),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Material(
+            color: Colors.transparent,
+            child: SwitchListTile(
+              dense: true,
+              contentPadding: EdgeInsets.zero,
+              value: startRunner,
+              onChanged: busy ? null : onStartRunnerChanged,
+              title: const Text('Start staged runner'),
+              secondary: const Icon(Icons.play_circle_outline),
+            ),
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                flex: 3,
+                child: TextField(
+                  controller: routesController,
+                  decoration: const InputDecoration(
+                    labelText: 'Routes',
+                    prefixIcon: Icon(Icons.route_outlined),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: TextField(
+                  controller: portController,
+                  decoration: const InputDecoration(
+                    labelText: 'Port',
+                    prefixIcon: Icon(Icons.tag),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 10),
+              IconButton.filledTonal(
+                tooltip: 'Rollback latest backup',
+                onPressed: busy ? null : onDeployRollback,
+                icon: const Icon(Icons.restore),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          Row(
+            children: [
+              Expanded(
+                child: FilledButton.tonalIcon(
+                  onPressed: busy ? null : onDeployStage,
+                  icon: const Icon(Icons.cloud_upload_outlined),
+                  label: const Text('Stage'),
+                ),
+              ),
+              const SizedBox(width: 10),
+              Expanded(
+                child: FilledButton.icon(
+                  onPressed: busy ? null : onDeployCutover,
+                  icon: const Icon(Icons.swap_horiz),
+                  label: const Text('Cutover'),
                 ),
               ),
             ],
@@ -1718,10 +2281,15 @@ class _SourceList extends StatelessWidget {
 }
 
 class _ResultsPanel extends StatelessWidget {
-  const _ResultsPanel({required this.rows, required this.logText});
+  const _ResultsPanel({
+    required this.rows,
+    required this.logText,
+    required this.filterController,
+  });
 
   final List<ManifestEntry> rows;
   final String logText;
+  final TextEditingController filterController;
 
   @override
   Widget build(BuildContext context) {
@@ -1738,11 +2306,24 @@ class _ResultsPanel extends StatelessWidget {
                 title: 'Artifacts',
               ),
               const SizedBox(height: 14),
+              TextField(
+                controller: filterController,
+                decoration: const InputDecoration(
+                  labelText: 'Filter manifest',
+                  prefixIcon: Icon(Icons.search),
+                ),
+              ),
+              const SizedBox(height: 12),
               Expanded(
                 child: stacked
                     ? Column(
                         children: [
-                          Expanded(child: _ManifestTable(rows: rows)),
+                          Expanded(
+                            child: _FilteredManifestTable(
+                              rows: rows,
+                              filterController: filterController,
+                            ),
+                          ),
                           const SizedBox(height: 12),
                           Expanded(child: _LogPane(text: logText)),
                         ],
@@ -1750,7 +2331,13 @@ class _ResultsPanel extends StatelessWidget {
                     : Row(
                         crossAxisAlignment: CrossAxisAlignment.stretch,
                         children: [
-                          Expanded(flex: 7, child: _ManifestTable(rows: rows)),
+                          Expanded(
+                            flex: 7,
+                            child: _FilteredManifestTable(
+                              rows: rows,
+                              filterController: filterController,
+                            ),
+                          ),
                           const SizedBox(width: 12),
                           Expanded(flex: 5, child: _LogPane(text: logText)),
                         ],
@@ -1759,6 +2346,38 @@ class _ResultsPanel extends StatelessWidget {
             ],
           ),
         );
+      },
+    );
+  }
+}
+
+class _FilteredManifestTable extends StatelessWidget {
+  const _FilteredManifestTable({
+    required this.rows,
+    required this.filterController,
+  });
+
+  final List<ManifestEntry> rows;
+  final TextEditingController filterController;
+
+  @override
+  Widget build(BuildContext context) {
+    return AnimatedBuilder(
+      animation: filterController,
+      builder: (context, _) {
+        final q = filterController.text.toLowerCase().trim();
+        final filtered = q.isEmpty
+            ? rows
+            : rows
+                  .where(
+                    (row) =>
+                        row.source.toLowerCase().contains(q) ||
+                        row.output.toLowerCase().contains(q) ||
+                        row.backend.toLowerCase().contains(q) ||
+                        row.contentType.toLowerCase().contains(q),
+                  )
+                  .toList();
+        return _ManifestTable(rows: filtered);
       },
     );
   }
@@ -1801,6 +2420,8 @@ class _ManifestTable extends StatelessWidget {
                     columns: const [
                       DataColumn(label: Text('Source')),
                       DataColumn(label: Text('Output')),
+                      DataColumn(label: Text('Backend')),
+                      DataColumn(label: Text('Type')),
                       DataColumn(label: Text('Size')),
                       DataColumn(label: Text('SHA-256')),
                     ],
@@ -1810,6 +2431,8 @@ class _ManifestTable extends StatelessWidget {
                           cells: [
                             DataCell(SelectableText(row.source)),
                             DataCell(SelectableText(row.output)),
+                            DataCell(Text(row.backend)),
+                            DataCell(Text(row.contentType)),
                             DataCell(Text(_formatBytes(row.size))),
                             DataCell(SelectableText(row.sha256)),
                           ],

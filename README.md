@@ -99,9 +99,9 @@ extension (e.g. `index.php` in → `index.php` out, encrypted) so it's a drop-in
 replacement — it's identified by content, not by a special extension. (`--raw`
 debug output is the exception, written as `<name>.opd2`.) PHP files are stored
 as Zend opcode dumps (`php-zend-opdump`/`OPD2`). When `bytecode-dump` is run
-with `--include-assets`, `.html`, `.htm`, `.css`, `.js`, `.mjs`, and `.twig`
-files are stored as encrypted raw assets (`bytecode-asset`/`RAW1`) for serving
-through `php/runtime/bytecode-assets.php`.
+with `--include-assets`, `.html`, `.htm`, `.css`, `.js`, `.mjs`, `.twig`, and
+`.blade.php` files are stored as encrypted raw assets (`bytecode-asset`/`RAW1`)
+for serving through `php/runtime/bytecode-assets.php`.
 
 `BYTC2` provides:
 
@@ -126,29 +126,49 @@ workflow:
 - `bytecode-keygen`: generate a random shared key, or regenerate the default
   `build/vendor-secret.key` with `--vendor-secret --force`.
 - `bytecode-dump`: walk files/directories, dump bytecode, pack encoded
-  containers, and write the manifest/map.
+  containers, write the manifest/map, support dry-runs, profiles, scans, and
+  optional asset containers.
 - `bytecode-pack`: pack one raw dump into a container.
 - `bytecode-pack-asset`: pack one HTML/CSS/JS/Twig asset into an encrypted
   raw-asset container.
+- `bytecode-doctor`: preflight PHP, loader, key, SAPI, and toolchain setup.
 - `bytecode-info`: inspect a container header and metadata.
 - `bytecode-verify`: verify manifests, hashes, sizes, map entries, and
-  signatures.
+  signatures; `--decrypt-test` also proves the configured key decrypts every
+  container.
+- `bytecode-key-rotate`: regenerate the default vendor secret and re-encode
+  source-backed builds.
+- `bytecode-deploy`: sync an app to a remote staging path, encode there,
+  verify, start a staged runner, cut over with backups, or roll back.
+- `bytecode-selftest`: run the local smoke/regression suite.
+- `bytecode-package-sign`: sign a whole encoded output directory with a bundle
+  manifest.
+- `bytecode-env-pack`: encrypt `.env` or config files as asset containers.
+- `bytecode-laravel`: prepare Laravel caches before encoding.
 - `bytecode-license-keygen`: generate RSA license keys.
 - `bytecode-vendor-keygen`: generate the vendor Ed25519 signing keypair used to
   seal packages (tamper-proof licensing); prints the compile-in public-key hex.
+  Seals can also carry signed machine policy (`--machine-id`, hostnames,
+  fingerprints, expiry, activation token), letting vendor-secret/shared-key
+  containers run only when the loader has the vendor public-key anchor and the
+  runtime machine matches.
 - `bytecode-scan`: preflight source scanner for dynamic PHP hazards.
 
 Twig templates can be protected two ways. For normal Twig rendering, compile the
 Twig cache to PHP and encode that cache as PHP bytecode. If you include raw
 `.twig` files in a dump with `--include-assets`, they are protected as encrypted
-assets; the runtime helper can decrypt and stream them, but they are not Zend
-bytecode until Twig compiles them.
+assets and can be read through `php/runtime/BytecodeTwigLoader.php`. Laravel
+Blade templates (`.blade.php`) are protected the same way and can be compiled
+from encrypted source through `php/runtime/BytecodeBladeCompiler.php`. Static
+assets can be served through `php/runtime/BytecodeAssetMiddleware.php`, and
+encrypted config/env files can be loaded with `php/runtime/BytecodeConfig.php`.
 
 The scanner was inspired by Yakpro PO's practical PHP-obfuscation lessons. It
 does not replace bytecode encoding; it warns about constructs that affect safe
-name handling and future symbol rewriting, such as dynamic calls, variable
-variables, callable arrays, dynamic class/member access, and framework-sensitive
-object hydration patterns.
+name handling, bytecode compatibility, and future symbol rewriting, such as
+dynamic calls, variable variables, callable arrays, dynamic class/member access,
+enums, attributes, readonly classes, trait adaptations, `eval()`, Fibers, and
+framework-sensitive object hydration patterns.
 
 ### 4. Flutter Desktop UI And Packages
 

@@ -72,7 +72,36 @@ function parse_bytc(string $path): array
     return compact('bytes', 'version', 'phpVersionId', 'backendId', 'backendFormat', 'cipherId', 'keyId', 'headerSize', 'nonce', 'tag', 'ciphertext');
 }
 
-function verify_container(string $path): array
+function resolve_ikm_hex(): string
+{
+    $vendorKeyFile = getenv('BYTECODE_VENDOR_KEY_FILE') ?: dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key';
+    $fileKey = is_file($vendorKeyFile) ? trim((string) file_get_contents($vendorKeyFile)) : '';
+    return getenv('BYTECODE_DEK') ?: getenv('BYTECODE_KEY') ?: getenv('OPDUMP_KEY') ?: getenv('BYTECODE_VENDOR_KEY') ?: $fileKey;
+}
+
+function decrypt_test_container(string $path): int
+{
+    $container = parse_bytc($path);
+    if ($container['version'] !== 2) {
+        fail("{$path}: decrypt-test requires BYTC2");
+    }
+    $ikmHex = resolve_ikm_hex();
+    if (!preg_match('/\A[0-9a-fA-F]{64}\z/', $ikmHex)) {
+        fail('decrypt-test requires BYTECODE_KEY/OPDUMP_KEY/BYTECODE_VENDOR_KEY/BYTECODE_DEK or build/vendor-secret.key');
+    }
+    $aad = substr($container['bytes'], 0, $container['headerSize']);
+    $key = hash_hkdf('sha256', hex2bin($ikmHex), 32, 'bytecode-v2', $container['keyId']);
+    $plain = openssl_decrypt($container['ciphertext'], 'aes-256-gcm', $key, OPENSSL_RAW_DATA, $container['nonce'], $container['tag'], $aad);
+    if ($plain === false) {
+        fail("{$path}: decrypt-test failed (wrong key or tampered container)");
+    }
+    if ($container['backendId'] === 'php-zend-opdump' && substr($plain, 0, 4) !== 'OPD2') {
+        fail("{$path}: decrypt-test payload is not OPD2");
+    }
+    return strlen($plain);
+}
+
+function verify_container(string $path, bool $decryptTest): array
 {
     $container = parse_bytc($path);
     if ($container['phpVersionId'] !== PHP_VERSION_ID) {
@@ -89,22 +118,64 @@ function verify_container(string $path): array
     if (strlen($container['nonce']) !== 12 || strlen($container['tag']) !== 16) {
         fail("{$path}: unsupported nonce/tag length");
     }
-    return [
+    $result = [
         'path' => $path,
         'backend' => $container['backendId'],
         'backend_format' => $container['backendFormat'],
         'sha256' => hash('sha256', $container['bytes']),
         'size' => strlen($container['bytes']),
     ];
+    if ($decryptTest) {
+        $result['payload_size'] = decrypt_test_container($path);
+    }
+    return $result;
 }
 
-if ($argc !== 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
-    fwrite(STDERR, "Usage: bytecode-verify <manifest.json|encoded-file>\n");
-    fwrite(STDERR, "\nValidates BYTC headers, manifest hashes, sizes, and bytecode.map consistency.\n");
-    exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
+function seal_policy_message(array $seal): string
+{
+    $keys = [
+        'machine_id',
+        'domains',
+        'ips',
+        'hostnames',
+        'fingerprints',
+        'expires_at',
+        'license_id',
+        'activation_token',
+        'revocation_url',
+        'unlock_policy',
+    ];
+    $message = "bytecode-seal-policy-v1\n";
+    foreach ($keys as $key) {
+        $value = (string) ($seal[$key] ?? '');
+        $message .= $key . ':' . ($value !== '' ? $value : '-') . "\n";
+    }
+    return $message;
 }
 
-$target = $argv[1];
+$args = array_slice($argv, 1);
+if (!$args || in_array($args[0] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-verify [--decrypt-test] <manifest.json|encoded-file>\n");
+    fwrite(STDERR, "\nValidates BYTC headers, manifest hashes, sizes, map entries, and optionally decrypts every container.\n");
+    exit($args ? 0 : 2);
+}
+
+$decryptTest = false;
+while ($args && str_starts_with($args[0], '-')) {
+    $arg = array_shift($args);
+    if ($arg === '--decrypt-test') {
+        $decryptTest = true;
+        continue;
+    }
+    fwrite(STDERR, "unknown option: {$arg}\n");
+    exit(2);
+}
+if (count($args) !== 1) {
+    fwrite(STDERR, "Usage: bytecode-verify [--decrypt-test] <manifest.json|encoded-file>\n");
+    exit(2);
+}
+
+$target = $args[0];
 $baseDir = is_dir($target) ? $target : dirname($target);
 $files = [];
 
@@ -148,7 +219,7 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
             fail("{$mapPath}: missing output for manifest entry {$output}");
         }
         $path = $baseDir . DIRECTORY_SEPARATOR . $output;
-        $result = verify_container($path);
+        $result = verify_container($path, $decryptTest);
         if (($entry['backend'] ?? '') !== '' && $entry['backend'] !== $result['backend']) {
             fail("{$path}: manifest backend mismatch");
         }
@@ -215,6 +286,13 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
         } elseif (isset($seal['license_sha256'])) {
             fail("{$sealPath}: seal covers a bytecode.license.json that is missing");
         }
+        $policySha = $seal['policy_sha256'] ?? null;
+        if (is_string($policySha) && $policySha !== '') {
+            $actualPolicySha = hash('sha256', seal_policy_message($seal));
+            if (!hash_equals(strtolower($policySha), $actualPolicySha)) {
+                fail("{$sealPath}: policy_sha256 does not match signed policy fields");
+            }
+        }
 
         $pubKey = getenv('BYTECODE_VENDOR_PUBKEY') ?: getenv('OPDUMP_VENDOR_PUBKEY_FILE') ?: '';
         if ($pubKey !== '') {
@@ -225,6 +303,9 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
                 . "manifest:{$manifestSha}\n"
                 . "map:{$mapSha}\n"
                 . 'license:' . ($licenseSha ?? '-') . "\n";
+            if (is_string($policySha) && $policySha !== '') {
+                $message .= "policy:{$policySha}\n";
+            }
             $signature = base64_decode((string) ($seal['signature'] ?? ''), true);
             if ($signature === false || strlen($signature) !== 64) {
                 fail("{$sealPath}: malformed Ed25519 signature");
@@ -261,8 +342,11 @@ if (is_file($manifestPath) && substr($manifestPath, -5) === '.json') {
         }
     }
 } else {
-    verify_container($target);
+    verify_container($target, $decryptTest);
     $files[] = $target;
 }
 
 echo 'verified ', count($files), ' file(s) metadata/hash/map consistency', PHP_EOL;
+if ($decryptTest) {
+    echo 'decrypt-test: PASS', PHP_EOL;
+}

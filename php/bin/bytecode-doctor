@@ -1,0 +1,116 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+function usage(): void
+{
+    fwrite(STDERR, "Usage: bytecode-doctor [--php-bin <php>] [--php-version <8.4>] [--json]\n");
+}
+
+function run_capture(array $cmd): array
+{
+    $p = proc_open($cmd, [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes);
+    if ($p === false) {
+        return [127, '', 'failed to start'];
+    }
+    fclose($pipes[0]);
+    $out = stream_get_contents($pipes[1]);
+    $err = stream_get_contents($pipes[2]);
+    fclose($pipes[1]);
+    fclose($pipes[2]);
+    return [proc_close($p), $out, $err];
+}
+
+function check(bool $ok, string $name, string $detail): array
+{
+    return ['ok' => $ok, 'name' => $name, 'detail' => $detail];
+}
+
+$args = array_slice($argv, 1);
+$phpBin = getenv('PHP_BIN') ?: 'php8.4';
+$phpVersion = '8.4';
+$json = false;
+while ($args) {
+    $arg = array_shift($args);
+    if ($arg === '-h' || $arg === '--help') {
+        usage();
+        exit(0);
+    }
+    if ($arg === '--json') {
+        $json = true;
+        continue;
+    }
+    if ($arg === '--php-bin') {
+        $phpBin = array_shift($args) ?: '';
+        continue;
+    }
+    if (str_starts_with($arg, '--php-bin=')) {
+        $phpBin = substr($arg, 10);
+        continue;
+    }
+    if ($arg === '--php-version') {
+        $phpVersion = array_shift($args) ?: '';
+        continue;
+    }
+    if (str_starts_with($arg, '--php-version=')) {
+        $phpVersion = substr($arg, 14);
+        continue;
+    }
+    usage();
+    exit(2);
+}
+
+$repoRoot = dirname(__DIR__, 2);
+$keyFile = getenv('BYTECODE_VENDOR_KEY_FILE') ?: $repoRoot . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key';
+$checks = [];
+
+[$exit, $out, $err] = run_capture([$phpBin, '-r', 'echo PHP_VERSION_ID, " ", PHP_VERSION;']);
+$checks[] = check($exit === 0, 'php executable', trim($out ?: $err));
+$phpVersionId = $exit === 0 ? (int) strtok(trim($out), ' ') : 0;
+
+[$exit, $out, $err] = run_capture([$phpBin, '-r', 'echo ini_get("extension_dir");']);
+$extensionDir = trim($out);
+$checks[] = check($exit === 0 && $extensionDir !== '' && is_dir($extensionDir), 'extension_dir', $extensionDir ?: trim($err));
+
+$loaderPath = $extensionDir !== '' ? $extensionDir . DIRECTORY_SEPARATOR . 'bytecode_loader.so' : '';
+$checks[] = check($loaderPath !== '' && is_file($loaderPath), 'installed loader', $loaderPath !== '' ? $loaderPath : 'unknown');
+if ($loaderPath !== '' && is_file($loaderPath)) {
+    $checks[] = check(true, 'loader provenance', 'sha256=' . hash_file('sha256', $loaderPath) . ' mtime=' . gmdate('c', filemtime($loaderPath)));
+}
+
+[$exit, $out, $err] = run_capture([$phpBin, '-v']);
+$checks[] = check($exit === 0 && stripos($out . $err, 'Bytecode PHP Loader') !== false, 'loader enabled in CLI', trim(preg_replace('/\s+/', ' ', $out . $err)));
+
+$checks[] = check(is_file($keyFile) && preg_match('/\A[0-9a-fA-F]{64}\z/', trim((string) @file_get_contents($keyFile))) === 1, 'vendor key file', $keyFile);
+$checks[] = check(extension_loaded('openssl'), 'openssl extension', extension_loaded('openssl') ? OPENSSL_VERSION_TEXT : 'not loaded in doctor runtime');
+
+[$exit, $out] = run_capture([$phpBin, '-r', 'echo "opcache.enable=", ini_get("opcache.enable"), "\n"; echo "opcache.enable_cli=", ini_get("opcache.enable_cli"), "\n"; echo "opcache.validate_timestamps=", ini_get("opcache.validate_timestamps"), "\n"; echo "opcache.file_cache=", ini_get("opcache.file_cache"), "\n";']);
+if ($exit === 0) {
+    $checks[] = check(true, 'opcache settings', trim(str_replace("\n", '; ', $out)));
+    if (str_contains($out, 'opcache.validate_timestamps=0')) {
+        $checks[] = check(false, 'opcache deployment note', 'validate_timestamps=0 requires service restart after encoded cutover');
+    }
+}
+
+foreach (['cli', 'fpm', 'apache2'] as $sapi) {
+    $link = "/etc/php/{$phpVersion}/{$sapi}/conf.d/20-bytecode.ini";
+    $checks[] = check(is_link($link) || is_file($link), "{$sapi} ini link", $link);
+}
+
+foreach (['phpize' . $phpVersion, 'php-config' . $phpVersion, 'rsync', 'ssh', 'openssl'] as $tool) {
+    [$exit, $out] = run_capture(['sh', '-c', 'command -v ' . escapeshellarg($tool)]);
+    $checks[] = check($exit === 0, "tool {$tool}", trim($out) ?: 'missing');
+}
+
+if ($json) {
+    echo json_encode(['format' => 'bytecode-doctor-v1', 'ok' => !in_array(false, array_column($checks, 'ok'), true), 'php_version_id' => $phpVersionId, 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
+    exit(0);
+}
+
+$ok = true;
+foreach ($checks as $c) {
+    $ok = $ok && $c['ok'];
+    printf("%s %-24s %s\n", $c['ok'] ? 'OK  ' : 'WARN', $c['name'], $c['detail']);
+}
+exit($ok ? 0 : 1);

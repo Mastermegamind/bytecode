@@ -1,0 +1,9 @@
+{
+  "scripts": {
+    "bytecode:doctor": "php /var/www/bytecode/php/bin/bytecode-doctor --php-version 8.4",
+    "bytecode:scan": "php /var/www/bytecode/php/bin/bytecode-scan --config bytecode.json .",
+    "bytecode:dump": "php /var/www/bytecode/php/bin/bytecode-dump --config bytecode.json --profile php-assets . build/bytecode-out",
+    "bytecode:verify": "php /var/www/bytecode/php/bin/bytecode-verify --decrypt-test build/bytecode-out",
+    "bytecode:deploy": "php /var/www/bytecode/php/bin/bytecode-deploy trigger@192.168.8.42:/var/www/exam.test --stage /var/www/exam.test.stage --profile slim --include-assets"
+  }
+}

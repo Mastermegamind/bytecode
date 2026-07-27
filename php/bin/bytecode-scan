@@ -24,6 +24,8 @@ rewriting or make encoded-build debugging harder:
   - call_user_func()/call_user_func_array()/is_callable()
   - callable arrays like [SomeClass::class, 'method']
   - PDO::FETCH_OBJ
+  - enums, attributes, readonly classes, anonymous classes, trait adaptations
+  - eval(), Fiber usage, and other compatibility-sensitive runtime features
 
 USAGE);
 }
@@ -251,6 +253,13 @@ function scan_file(string $file): array
     $regexChecks = [
         ['#\$\s*(?:\$|\{)#', 'variable-variable', 'variable variables depend on runtime names and block safe variable rewriting'],
         ['#\bnew\s+\$#i', 'dynamic-class', 'dynamic class instantiation depends on runtime class names'],
+        ['#\bnew\s+class\b#i', 'anonymous-class', 'anonymous classes need explicit bytecode loader coverage before production encoding'],
+        ['#\benum\s+[A-Za-z_\x80-\xff][A-Za-z0-9_\x80-\xff]*#', 'enum', 'enum case objects are not yet supported by the loader and should fail closed at dump time'],
+        ['#\breadonly\s+class\b#i', 'readonly-class', 'readonly classes rely on exact property metadata; verify promoted/private properties after encoding'],
+        ['#\#\[\s*[A-Za-z_\\\\]#', 'attribute', 'attributes should be included in compatibility testing for framework reflection paths'],
+        ['#\buse\s+[A-Za-z_\\\\][^;{}]*\{#s', 'trait-adaptation', 'trait adaptations need explicit loader support before production encoding'],
+        ['#\beval\s*\(#i', 'eval', 'eval() compiles source at runtime and cannot be pre-encoded'],
+        ['#\bFiber\s*(?:::|\\()#', 'fiber', 'Fiber control flow should be covered by project-level runtime tests after encoding'],
         ['#(?:->|::)\s*(?:\$|\{)#', 'dynamic-member', 'dynamic property/method/member access depends on runtime names'],
         ['#\[\s*[^\\]]*::class\s*,\s*(["\'])#s', 'callable-array', 'callable array contains a literal method name that must stay in sync if methods are renamed'],
         ['#PDO\s*::\s*FETCH_OBJ#i', 'pdo-fetch-obj', 'PDO::FETCH_OBJ hydrates object properties by name; property rewriting can break it'],

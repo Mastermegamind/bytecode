@@ -1,0 +1,38 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+$root = dirname(__DIR__, 2);
+$tests = [
+    'run-cli-feature-surface.sh',
+    'run-bytecode-scan.sh',
+    'run-bytecode-config-scan.sh',
+    'run-load-tree.sh',
+    'run-asset-containers.sh',
+    'run-vendor-secret-default.sh',
+    'run-rung11-inheritance-props.sh',
+    'run-rung12-class-shapes.sh',
+    'run-rung13-authorized-machine-seal.sh',
+];
+$ok = true;
+foreach ($tests as $test) {
+    $cmd = ['bash', $root . '/php/tests/' . $test];
+    $p = proc_open($cmd, [0 => STDIN, 1 => ['pipe', 'w'], 2 => ['pipe', 'w']], $pipes, $root);
+    $out = $err = '';
+    if (is_resource($p)) {
+        $out = stream_get_contents($pipes[1]);
+        $err = stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        $exit = proc_close($p);
+    } else {
+        $exit = 127;
+    }
+    printf("%-38s %s\n", $test . ':', $exit === 0 ? 'PASS' : 'FAIL');
+    if ($exit !== 0) {
+        $ok = false;
+        fwrite(STDERR, $out . $err);
+    }
+}
+exit($ok ? 0 : 1);

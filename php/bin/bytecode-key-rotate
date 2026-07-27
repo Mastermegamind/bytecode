@@ -1,0 +1,95 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+function usage(): void
+{
+    fwrite(STDERR, <<<'USAGE'
+Usage:
+  bytecode-key-rotate --source <path> --out <dir> [bytecode-dump options...]
+  bytecode-key-rotate --vendor-secret-only [--force]
+
+Creates/regenerates build/vendor-secret.key and, when --source/--out are
+provided, re-encodes the source with the new key. Existing BYTC containers are
+not decrypted in place; key rotation is intentionally source-backed.
+
+USAGE);
+}
+
+function fail(string $message, int $code = 1): never
+{
+    fwrite(STDERR, $message . PHP_EOL);
+    exit($code);
+}
+
+function run_passthru(array $cmd, array $env = []): int
+{
+    foreach ($env as $k => $v) {
+        putenv("{$k}={$v}");
+    }
+    $p = proc_open($cmd, [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+    return is_resource($p) ? proc_close($p) : 127;
+}
+
+$args = array_slice($argv, 1);
+$source = null;
+$out = null;
+$force = false;
+$secretOnly = false;
+$dumpArgs = [];
+while ($args) {
+    $arg = array_shift($args);
+    if ($arg === '-h' || $arg === '--help') {
+        usage();
+        exit(0);
+    }
+    if ($arg === '--force') {
+        $force = true;
+        continue;
+    }
+    if ($arg === '--vendor-secret-only') {
+        $secretOnly = true;
+        continue;
+    }
+    if ($arg === '--source') {
+        $source = array_shift($args) ?: null;
+        continue;
+    }
+    if (str_starts_with($arg, '--source=')) {
+        $source = substr($arg, 9);
+        continue;
+    }
+    if ($arg === '--out') {
+        $out = array_shift($args) ?: null;
+        continue;
+    }
+    if (str_starts_with($arg, '--out=')) {
+        $out = substr($arg, 6);
+        continue;
+    }
+    $dumpArgs[] = $arg;
+}
+
+$root = dirname(__DIR__, 2);
+$php = getenv('PHP_BIN') ?: 'php8.4';
+$keygen = __DIR__ . '/bytecode-keygen';
+$dump = __DIR__ . '/bytecode-dump';
+$keyFile = $root . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key';
+
+$cmd = [$php, $keygen, '--vendor-secret'];
+if ($force || $secretOnly || is_file($keyFile)) {
+    $cmd[] = '--force';
+}
+$exit = run_passthru($cmd);
+if ($exit !== 0) {
+    exit($exit);
+}
+if ($secretOnly) {
+    exit(0);
+}
+if ($source === null || $out === null) {
+    fail('--source and --out are required unless --vendor-secret-only is used', 2);
+}
+$exit = run_passthru([$php, $dump, '--vendor-key-file', $keyFile, ...$dumpArgs, $source, $out], ['BYTECODE_VENDOR_KEY_FILE' => $keyFile]);
+exit($exit);

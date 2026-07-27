@@ -34,7 +34,7 @@ it — none of it is hypothetical.
 | Term | Meaning |
 |---|---|
 | **`opdump`** | The Zend extension (`php/src/opdump.c`) that hooks PHP's compile step. In `dump` mode it serializes a compiled `zend_op_array` to disk instead of executing it; in `load`/`load-tree` mode it reconstructs one from disk *without ever parsing PHP source text*. |
-| **Container** (`BYTC2`) | One encoded file: an AES-256-GCM-encrypted blob. PHP files hold compiled Zend bytecode (`php-zend-opdump`/`OPD2`); when `--include-assets` is enabled, `.html`, `.htm`, `.css`, `.js`, `.mjs`, and `.twig` files hold encrypted raw asset bytes (`bytecode-asset`/`RAW1`). **The output file keeps the source's own extension** (`index.php` in → `index.php` out, encrypted) — it's identified by content (the `BYTC` magic bytes), not by a special file extension, so it can be a drop-in replacement for the original file. (`--raw` debug output is the one exception: it's written as `<name>.opd2`, since it's never meant to be deployed.) |
+| **Container** (`BYTC2`) | One encoded file: an AES-256-GCM-encrypted blob. PHP files hold compiled Zend bytecode (`php-zend-opdump`/`OPD2`); when `--include-assets` is enabled, `.html`, `.htm`, `.css`, `.js`, `.mjs`, `.twig`, and `.blade.php` files hold encrypted raw asset bytes (`bytecode-asset`/`RAW1`). **The output file keeps the source's own extension** (`index.php` in → `index.php` out, encrypted) — it's identified by content (the `BYTC` magic bytes), not by a special file extension, so it can be a drop-in replacement for the original file. (`--raw` debug output is the one exception: it's written as `<name>.opd2`, since it's never meant to be deployed.) |
 | **`bytecode.manifest.json`** | Written once per `bytecode-dump` run. Lists every encoded file, its hash, size, and (if `--scan` was used) scan warnings. |
 | **`bytecode.map`** | Tab-separated `absolute-source-path → relative-container-path` file. This is what the loader reads at runtime to know which container to load instead of a given source request. |
 | **`bytecode.manifest.sig`** | HMAC-SHA256 over the manifest + map together, so editing the map to repoint a source path at a different container is detected and refused. |
@@ -176,16 +176,19 @@ php8.4 php/bin/bytecode-scan --exclude 'vendor/*' --exclude 'storage/*' /tmp/dem
 
 Warning codes you can see: `variable-variable`, `dynamic-class`,
 `dynamic-member`, `dynamic-function-call`, `callable-array`,
-`pdo-fetch-obj`, `nonliteral-symbol-name`, `dynamic-dispatch`.
+`pdo-fetch-obj`, `nonliteral-symbol-name`, `dynamic-dispatch`, `enum`,
+`attribute`, `readonly-class`, `anonymous-class`, `trait-adaptation`, `eval`,
+and `fiber`.
 
 ### 3.3 Encode a project
 
 `bytecode-dump` walks a file or directory tree and writes one encoded
 container per supported PHP file, keeping the source's own filename and
 extension, so it's a drop-in replacement. Pass `--include-assets` to also
-encode `.html`, `.htm`, `.css`, `.js`, `.mjs`, and `.twig` files. PHP files are
-true Zend bytecode containers and are listed in `bytecode.map`; asset files are
-encrypted raw containers and are listed in `bytecode.manifest.json`.
+encode `.html`, `.htm`, `.css`, `.js`, `.mjs`, `.twig`, and `.blade.php` files.
+PHP files are true Zend bytecode containers and are listed in `bytecode.map`;
+asset files are encrypted raw containers and are listed in
+`bytecode.manifest.json`.
 
 ```bash
 $ BYTECODE_KEY="$KEY" PHP_BIN=php8.4 php8.4 php/bin/bytecode-dump --include-assets /tmp/demo/app /tmp/demo/out
@@ -213,6 +216,87 @@ To rotate the default vendor secret:
 ```bash
 php8.4 php/bin/bytecode-keygen --vendor-secret --force
 ```
+
+Or rotate and immediately re-encode from source:
+
+```bash
+php8.4 php/bin/bytecode-key-rotate \
+  --source /tmp/demo/app \
+  --out /tmp/demo/out-rotated \
+  --include-assets
+```
+
+Preflight a build without writing containers:
+
+```bash
+php8.4 php/bin/bytecode-dump --dry-run --report-json --profile php-assets /tmp/demo/app /tmp/demo/out
+```
+
+Built-in profiles are `php-only`, `php-assets`, `laravel`, `slim`, and
+`full-app`. Profiles apply include/exclude defaults; explicit flags still win.
+
+Check the local PHP/loader/key/SAPI/toolchain setup:
+
+```bash
+php8.4 php/bin/bytecode-doctor --php-version 8.4
+```
+
+Run the local smoke suite:
+
+```bash
+php8.4 php/bin/bytecode-selftest
+```
+
+Verify that the configured key can actually decrypt every container:
+
+```bash
+php8.4 php/bin/bytecode-verify --decrypt-test /tmp/demo/out
+```
+
+Sign the full output directory as a release bundle:
+
+```bash
+php8.4 php/bin/bytecode-package-sign /tmp/demo/out
+```
+
+Encrypt a `.env` or config file and load it at runtime with
+`php/runtime/BytecodeConfig.php`:
+
+```bash
+php8.4 php/bin/bytecode-env-pack /tmp/demo/app/.env /tmp/demo/out/.env.bytc
+```
+
+Stage a remote app, encode on the remote machine, and verify the generated
+manifest before any cutover:
+
+```bash
+php8.4 php/bin/bytecode-deploy trigger@192.168.8.42:/var/www/exam.test \
+  --local-root /var/www/exam.test \
+  --stage /var/www/exam.test.stage \
+  --profile slim \
+  --include-assets \
+  --start-runner \
+  --verify-routes /,/login,/backend/login
+```
+
+After app-level verification, add `--cutover` to replace the remote app from
+the staged copy. Cutover creates a timestamped backup first. Restore the latest
+backup with:
+
+```bash
+php8.4 php/bin/bytecode-deploy trigger@192.168.8.42:/var/www/exam.test \
+  --stage /var/www/exam.test.stage \
+  --rollback
+```
+
+For Laravel apps, prepare framework caches before encoding:
+
+```bash
+php8.4 php/bin/bytecode-laravel prepare /var/www/my-laravel-app
+```
+
+To add Composer script shortcuts to an app, merge
+`php/composer-scripts.example.json` into that app's `composer.json`.
 
 **Always encode into a separate output directory, never back into the
 source tree.** Since the encoded output keeps the exact same filename as its
@@ -322,6 +406,34 @@ Use your web server rewrite/router to send protected asset URLs to a PHP entry
 point like this. The helper uses the same `BYTECODE_KEY`/`OPDUMP_KEY`/
 `BYTECODE_VENDOR_KEY` material as the loader, and can also unwrap
 `bytecode.license.json` when `OPDUMP_LICENSE_KEY_FILE` is set.
+
+Twig templates protected with `--include-assets` can be read through
+`php/runtime/BytecodeTwigLoader.php`.
+
+Laravel Blade templates (`resources/views/**/*.blade.php`) are also asset
+containers, not Zend bytecode. Register the Blade compiler bridge in an app
+service provider after Laravel has booted its filesystem and view services:
+
+```php
+<?php
+require_once '/var/www/bytecode/php/runtime/BytecodeBladeCompiler.php';
+
+$this->app->singleton('blade.compiler', function ($app) {
+    return new BytecodeBladeCompiler(
+        $app['files'],
+        $app['config']['view.compiled']
+    );
+});
+```
+
+Then encode with:
+
+```bash
+php8.4 /var/www/bytecode/php/bin/bytecode-dump \
+  --profile laravel \
+  --include-assets \
+  /var/www/app /var/www/app-encoded
+```
 
 ### 3.6 Run the encoded tree
 
@@ -461,6 +573,36 @@ $ BYTECODE_LICENSE_PUBKEY=/tmp/demo/keys/license.pub.pem \
 wrote /tmp/demo/out-license/bytecode.license.json (RSA-OAEP-SHA256-wrapped DEK)
 wrote /tmp/demo/out-license/bytecode.seal.json (Ed25519 vendor seal, key_id cafd3996...)
 ```
+
+**Authorize specific machines without RSA license mode** — signed seal policy
+can bind ordinary vendor-secret/shared-key containers to runtime machine
+identity. The policy fields live in `bytecode.seal.json`, are hashed into
+`policy_sha256`, and that hash is included in the Ed25519 signature. Editing
+`machine_id`, hostnames, fingerprints, expiry, or activation settings after
+encoding breaks the seal and the loader refuses the package.
+
+```bash
+BYTECODE_VENDOR_SIGN_KEY=/tmp/demo/vendor/vendor.sign.key.pem \
+PHP_BIN=php8.4 \
+php8.4 php/bin/bytecode-dump \
+  --machine-id customer-prod-01 \
+  --expires-at 2030-01-01 \
+  /tmp/demo/app /tmp/demo/out-bound
+```
+
+Run it only on the authorized machine:
+
+```bash
+BYTECODE_VENDOR_KEY_FILE=/var/www/bytecode/build/vendor-secret.key \
+OPDUMP_VENDOR_PUBKEY_FILE=/tmp/demo/vendor/vendor.sign.pub.pem \
+OPDUMP_MACHINE_ID=customer-prod-01 \
+OPDUMP_MODE=load-tree \
+OPDUMP_MAP=/tmp/demo/out-bound/bytecode.map \
+php8.4 -d zend_extension=/var/www/bytecode/php/src/modules/opdump.so /tmp/demo/app/index.php
+```
+
+With a different or missing `OPDUMP_MACHINE_ID`, the loader fails closed before
+executing protected code.
 
 **Anchor the loader.** Give the loader your public key, two ways (compiled-in
 wins when both are present):
@@ -663,6 +805,7 @@ filled in after you run something).
 | **License public key** field | `BYTECODE_LICENSE_PUBKEY` — set this (instead of a key) to dump in license mode; disabled under **Raw**. |
 | **License key folder** field + key icon (**Generate license keys**) | `bytecode-license-keygen <dir>` — writes `license.key.pem`/`license.pub.pem` into that folder and auto-fills **License public key** with the resulting `license.pub.pem`. |
 | **Vendor sign key** field | `BYTECODE_VENDOR_SIGN_KEY` — set this to write a `bytecode.seal.json` (Ed25519 vendor seal) alongside the build; disabled under **Raw**. When set, **Verify** also passes the sibling `vendor.sign.pub.pem` as `BYTECODE_VENDOR_PUBKEY` to check the seal signature. §3.7. |
+| **Authorized machine ID** field | Adds `--machine-id <id>` to Dump/Deploy. With a vendor sign key and a runtime vendor public-key anchor, the loader requires matching `OPDUMP_MACHINE_ID`. |
 | **Vendor key folder** field + shield icon (**Generate vendor signing keys**) | `bytecode-vendor-keygen <dir>` — writes `vendor.sign.key.pem`/`vendor.sign.pub.pem`, auto-fills **Vendor sign key**, and streams the `--with-opdump-vendor-pubkey` compile-in hex into the log pane. |
 | **Exclude globs** field | Comma-separated list, split into repeated `--exclude` flags. Pre-filled with `.history/*, vendor/*, storage/*, node_modules/*`. |
 | **Scan** button | Runs `bytecode-scan` standalone (no dump) over the current source list. |
@@ -732,6 +875,7 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 | `BYTECODE_VENDOR_SIGN_KEY` | `bytecode-dump` | Path to the vendor Ed25519 private key (`bytecode-vendor-keygen`); writes `bytecode.seal.json`. Same as `--vendor-sign-key`. |
 | `OPDUMP_VENDOR_PUBKEY_FILE` | `opdump.so`, `bytecode-verify` | Path to `vendor.sign.pub.pem`; the seal trust anchor when no key is compiled in (`--with-opdump-vendor-pubkey` wins over it). Present ⇒ loader fails closed on a missing/invalid seal. |
 | `BYTECODE_VENDOR_PUBKEY` | `bytecode-verify` | Path to `vendor.sign.pub.pem` for full Ed25519 seal verification (falls back to `OPDUMP_VENDOR_PUBKEY_FILE`). |
+| `OPDUMP_MACHINE_ID` | `opdump.so` | Runtime machine id checked against signed seal policy and/or `bytecode.license.json`. |
 | `OPDUMP_LICENSE_KEY_FILE` | `opdump.so` | Path to `license.key.pem`; switches the loader to license mode. |
 | `OPDUMP_LICENSE_KEY_PASSPHRASE` | `opdump.so` | Passphrase for an encrypted `license.key.pem`, if any. |
 | `OPDUMP_LICENSE_FILE` | `opdump.so` | Path to `bytecode.license.json`; default is alongside `OPDUMP_MAP`. |
@@ -748,7 +892,7 @@ Running the resulting build is not yet wired into the GUI — use the CLI
 
 | File | Contents |
 |---|---|
-| `<name>.<ext>` | One encrypted container per included source file, at the same relative path and filename the source had. PHP files contain Zend bytecode; HTML/CSS/JS/Twig files contain encrypted raw asset bytes only when `--include-assets` is enabled. (`--raw` writes PHP debug blobs as `<name>.php.opd2` instead.) |
+| `<name>.<ext>` | One encrypted container per included source file, at the same relative path and filename the source had. PHP files contain Zend bytecode; HTML/CSS/JS/Twig/Blade files contain encrypted raw asset bytes only when `--include-assets` is enabled. (`--raw` writes PHP debug blobs as `<name>.php.opd2` instead.) |
 | `bytecode.manifest.json` | Per-file source/output/hash/size list, PHP version, container format, and (if `--scan`) embedded scan results. |
 | `bytecode.map` | `absolute-source-path<TAB>relative-container-path`, one per line — the loader's runtime lookup table. |
 | `bytecode.manifest.sig` | Hex HMAC-SHA256 over manifest + map, keyed by an HKDF derivation of your IKM/DEK. |

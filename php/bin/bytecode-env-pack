@@ -1,0 +1,13 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+if ($argc !== 3 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-env-pack <.env-or-config-file> <output-container>\n");
+    exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
+}
+$packer = __DIR__ . '/bytecode-pack-asset';
+$php = getenv('PHP_BIN') ?: 'php8.4';
+$p = proc_open([$php, $packer, $argv[1], $argv[2]], [0 => STDIN, 1 => STDOUT, 2 => STDERR], $pipes);
+exit(is_resource($p) ? proc_close($p) : 127);

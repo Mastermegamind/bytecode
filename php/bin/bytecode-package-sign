@@ -1,0 +1,33 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+if ($argc < 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
+    fwrite(STDERR, "Usage: bytecode-package-sign <encoded-output-dir>\n");
+    exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
+}
+$dir = rtrim($argv[1], DIRECTORY_SEPARATOR);
+if (!is_dir($dir)) {
+    fwrite(STDERR, "not a directory: {$dir}\n");
+    exit(2);
+}
+$files = [];
+$it = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir, FilesystemIterator::SKIP_DOTS));
+foreach ($it as $file) {
+    if (!$file->isFile() || basename($file->getPathname()) === 'bytecode.package.json') {
+        continue;
+    }
+    $rel = str_replace('\\', '/', substr($file->getPathname(), strlen($dir) + 1));
+    $files[] = ['path' => $rel, 'sha256' => hash_file('sha256', $file->getPathname()), 'size' => $file->getSize()];
+}
+usort($files, fn (array $a, array $b): int => $a['path'] <=> $b['path']);
+$package = [
+    'format' => 'bytecode-package-v1',
+    'created_at' => gmdate('c'),
+    'file_count' => count($files),
+    'files' => $files,
+];
+$package['sha256'] = hash('sha256', json_encode($files, JSON_UNESCAPED_SLASHES));
+file_put_contents($dir . DIRECTORY_SEPARATOR . 'bytecode.package.json', json_encode($package, JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES) . "\n");
+echo "wrote {$dir}/bytecode.package.json\n";
