@@ -1,41 +1,24 @@
 # Security Policy
 
-This project handles encryption keys, RSA key wrapping, and native Zend
-Engine internals — please report security issues privately rather than
-through a public GitHub issue.
+Bytecode PHP Loader handles encoded PHP bytecode, encrypted assets, vendor
+keys, license keys, and machine authorization policies. Please report security
+issues privately before publishing details.
 
-## Reporting a Vulnerability
+## Reporting A Vulnerability
 
-Email **hello@megamindtechnologies.com** with:
+Email hello@megamindtechnologies.com or open a private security advisory in the
+project host if that feature is available. Include:
 
-- A description of the issue and its impact.
-- Steps to reproduce (a minimal PHP script + container/key setup is ideal).
-- Which component is affected: the `opdump` C extension
-  (`php/src/opdump.c`), the container format/key handling
-  (`php/bin/bytecode-pack`, `php/bin/bytecode-dump`,
-  `php/bin/bytecode-license-keygen`), or tooling elsewhere.
+- A short description of the issue.
+- Reproduction steps or proof of concept.
+- Affected version, commit, platform, and PHP version.
+- Any known impact on encoded packages, keys, or runtime authorization.
 
-Please do not open a public issue or PR that discloses an unpatched
-vulnerability. You'll get an acknowledgement within a few days and a plan
-for a fix/disclosure timeline.
+Please do not include real customer keys or production encoded applications in
+reports. Use throwaway keys and minimal test projects.
 
-## Scope
+## Supported Versions
 
-In scope:
-
-- Container format / cryptographic weaknesses (`BYTC1`/`BYTC2`, AES-256-GCM
-  usage, HKDF key derivation, RSA-OAEP key wrapping in license mode).
-- Memory-safety issues in the `opdump` C extension, especially in the
-  untrusted-input paths (parsing encoded containers, `bytecode.map`,
-  `bytecode.license.json`).
-- Cases where the loader executes reconstructed bytecode with different
-  semantics than the original source (a correctness bug with security
-  implications, not just a crash).
-
-Out of scope:
-
-- The project's current phase status is that only PHP 8.4 is fully
-  supported (see `docs/PLAN.md`); issues specific to PHP 8.1-8.3/8.5 builds
-  not yet working are tracked as normal bugs, not security reports.
-- Denial-of-service via a self-inflicted misconfiguration (e.g. losing your
-  own `BYTECODE_KEY` or license private key).
+The project is early-stage. Security fixes are expected to target the latest
+public source version unless a separate commercial support agreement says
+otherwise.

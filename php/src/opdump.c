@@ -59,6 +59,10 @@
 # define OPDUMP_VENDOR_PUBKEY_HEX ""
 #endif
 
+#ifndef OPDUMP_VERSION
+# define OPDUMP_VERSION "0.0.1phase2"
+#endif
+
 #ifndef ZEND_HASH_MAP_FOREACH_PTR
 # define ZEND_HASH_MAP_FOREACH_PTR ZEND_HASH_FOREACH_PTR
 #endif
@@ -3084,7 +3088,7 @@ zend_module_entry opdump_module_entry = {
     PHP_MINIT(opdump),
     PHP_MSHUTDOWN(opdump),
     NULL, NULL, NULL,
-    "0.0.1-phase0",
+    OPDUMP_VERSION,
     STANDARD_MODULE_PROPERTIES
 };
 
@@ -3112,9 +3116,9 @@ ZEND_EXTENSION();
 
 ZEND_EXT_API zend_extension zend_extension_entry = {
     .name = "Bytecode PHP Loader",
-    .version = "0.0.1-phase0",
+    .version = OPDUMP_VERSION,
     .author = "MegaMind Technologies LTD",
-    .URL = "https://github.com/Mastermegamind/bytecode",
+    .URL = "https://megamindtechnologies.com",
     .copyright = "Copyright (c) 2026 MegaMind Technologies LTD",
     .startup = opdump_zend_startup,
     .shutdown = opdump_zend_shutdown,

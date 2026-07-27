@@ -15,6 +15,7 @@ it — none of it is hypothetical.
 1. [Concepts](#1-concepts)
 2. [Build the extension](#2-build-the-extension)
 3. [CLI walkthrough](#3-cli-walkthrough)
+   - [3.0 Set the project version](#30-set-the-project-version)
    - [3.1 Generate a key](#31-generate-a-key)
    - [3.2 Scan source for risky dynamic constructs](#32-scan-source-for-risky-dynamic-constructs)
    - [3.3 Encode a project](#33-encode-a-project)
@@ -91,6 +92,20 @@ function greet(string $name = 'world'): string
 echo greet('Bytecode'), PHP_EOL;
 PHP
 ```
+
+### 3.0 Set the project version
+
+The current release label lives in `VERSION`. Set it once, then new encoded
+manifests, signed package metadata, doctor JSON, GUI package defaults, and new
+loader builds will use the same label:
+
+```bash
+php8.4 php/bin/bytecode-version --set v0.0.1phase2
+php8.4 php/bin/bytecode-version
+```
+
+The native loader strips only the leading `v` while compiling, so PHP still
+prints the normal banner shape: `with Bytecode PHP Loader v0.0.1phase2`.
 
 ### 3.1 Generate a key
 
@@ -709,7 +724,7 @@ registers correctly:
 $ php8.4 -n -d zend_extension=/var/www/bytecode/php/src/modules/opdump.so -v
 PHP 8.4.23 (cli) ...
 Zend Engine v4.4.23, Copyright (c) Zend Technologies
-    with Bytecode PHP Loader v0.0.1-phase0, Copyright (c) 2026 ..., by ...
+    with Bytecode PHP Loader v0.0.1phase2, Copyright (c) 2026 ..., by ...
 ```
 
 That "with Bytecode PHP Loader ..." line is the confirmation — the same

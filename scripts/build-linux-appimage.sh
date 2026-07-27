@@ -6,6 +6,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Bytecode Encoder"
 APP_ID="bytecode-encoder"
+VERSION="${VERSION:-$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || printf 'v1.0.0')}"
 ARCH="${ARCH:-x86_64}"
 PHP_VERSION="${PHP_VERSION:-8.4}"
 BUILD_DIR="$ROOT/build/appimage"
@@ -30,10 +31,11 @@ fi
 echo "== Build PHP extension with $php_bin =="
 (
   cd "$ROOT/php/src"
+  native_version="${VERSION#v}"
   make clean >/dev/null 2>&1 || true
   "$phpize_bin" >/dev/null
-  ./configure --with-php-config="$(command -v "$php_config_bin")" >/dev/null
-  make >/dev/null
+  CFLAGS="-DOPDUMP_VERSION=\\\"$native_version\\\"" ./configure --with-php-config="$(command -v "$php_config_bin")" >/dev/null
+  CFLAGS="-DOPDUMP_VERSION=\\\"$native_version\\\"" make >/dev/null
 )
 
 echo "== Build Flutter Linux bundle =="
@@ -102,7 +104,7 @@ echo "== Build AppImage =="
 (
   cd "$ROOT"
   APPIMAGE_EXTRACT_AND_RUN=1 \
-  OUTPUT="$DIST_DIR/Bytecode_Encoder-$ARCH.AppImage" \
+  OUTPUT="$DIST_DIR/Bytecode_Encoder-${VERSION#v}-$ARCH.AppImage" \
     "$LINUXDEPLOY" \
       --appdir "$APPDIR" \
       --executable "$APPDIR/usr/bin/$APP_ID/ui" \
@@ -114,4 +116,4 @@ echo "== Build AppImage =="
 
 echo
 echo "AppImage built:"
-echo "$DIST_DIR/Bytecode_Encoder-$ARCH.AppImage"
+echo "$DIST_DIR/Bytecode_Encoder-${VERSION#v}-$ARCH.AppImage"

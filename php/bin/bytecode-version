@@ -1,0 +1,68 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+function usage(): void
+{
+    fwrite(STDERR, "Usage: bytecode-version [--set <vX.Y.ZphaseN|vX.Y.Z-phaseN>] [--json]\n");
+}
+
+function version_file(): string
+{
+    return dirname(__DIR__, 2) . DIRECTORY_SEPARATOR . 'VERSION';
+}
+
+function valid_version(string $version): bool
+{
+    return preg_match('/\Av[0-9]+\.[0-9]+\.[0-9]+(?:-?[A-Za-z][A-Za-z0-9_.-]*)?\z/', $version) === 1;
+}
+
+function current_version(): string
+{
+    $path = version_file();
+    if (!is_file($path)) {
+        return 'v0.0.0-dev';
+    }
+    return trim((string) file_get_contents($path));
+}
+
+$args = array_slice($argv, 1);
+$json = false;
+$set = null;
+while ($args) {
+    $arg = array_shift($args);
+    if ($arg === '-h' || $arg === '--help') {
+        usage();
+        exit(0);
+    }
+    if ($arg === '--json') {
+        $json = true;
+        continue;
+    }
+    if ($arg === '--set') {
+        $set = array_shift($args) ?: '';
+        continue;
+    }
+    if (str_starts_with($arg, '--set=')) {
+        $set = substr($arg, 6);
+        continue;
+    }
+    usage();
+    exit(2);
+}
+
+if ($set !== null) {
+    if (!valid_version($set)) {
+        fwrite(STDERR, "version must look like v0.0.1phase2 or v0.0.1-phase2\n");
+        exit(2);
+    }
+    file_put_contents(version_file(), $set . PHP_EOL);
+}
+
+$version = current_version();
+if ($json) {
+    echo json_encode(['format' => 'bytecode-version-v1', 'version' => $version], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
+} else {
+    echo $version, PHP_EOL;
+}

@@ -3,6 +3,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/bytecode-common.php';
+
 if ($argc < 2 || in_array($argv[1] ?? '', ['-h', '--help'], true)) {
     fwrite(STDERR, "Usage: bytecode-package-sign <encoded-output-dir>\n");
     exit(($argc === 2 && in_array($argv[1], ['-h', '--help'], true)) ? 0 : 2);
@@ -24,6 +26,7 @@ foreach ($it as $file) {
 usort($files, fn (array $a, array $b): int => $a['path'] <=> $b['path']);
 $package = [
     'format' => 'bytecode-package-v1',
+    'tool_version' => bytecode_project_version(),
     'created_at' => gmdate('c'),
     'file_count' => count($files),
     'files' => $files,

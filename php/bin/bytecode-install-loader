@@ -3,6 +3,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/bytecode-common.php';
+
 function usage(): void
 {
     fwrite(STDERR, <<<'USAGE'
@@ -90,6 +92,15 @@ function run(array $cmd, ?string $cwd = null, array $env = [], bool $echo = true
         fail('failed to start command: ' . render_cmd($cmd));
     }
     return proc_close($process);
+}
+
+function process_env(array $overrides): array
+{
+    $env = getenv();
+    if (!is_array($env)) {
+        return $overrides;
+    }
+    return array_merge($env, $overrides);
 }
 
 function capture(array $cmd, ?string $cwd = null): string
@@ -222,9 +233,15 @@ if ($extensionDir === '') {
     fail("{$phpConfig} returned an empty extension dir", 2);
 }
 
-fwrite(STDOUT, "== Build Bytecode PHP Loader for PHP {$minor} ==\n");
+$loaderVersion = bytecode_project_version();
+$nativeLoaderVersion = preg_replace('/^v/', '', $loaderVersion) ?: $loaderVersion;
+$cVersion = addcslashes($nativeLoaderVersion, "\\\"");
+$cflags = '-DOPDUMP_VERSION=\\"' . $cVersion . '\\"';
+$buildEnv = process_env(['CFLAGS' => $cflags]);
+
+fwrite(STDOUT, "== Build Bytecode PHP Loader {$loaderVersion} for PHP {$minor} ==\n");
 foreach ([['make', 'clean'], [$phpize], ['./configure', '--enable-opdump', '--with-php-config=' . $phpConfig], ['make']] as $cmd) {
-    $exit = run($cmd, $sourceDir, [], true, $dryRun);
+    $exit = run($cmd, $sourceDir, $buildEnv, true, $dryRun);
     if ($exit !== 0 && $cmd !== ['make', 'clean']) {
         fail('build failed', $exit);
     }

@@ -1,5 +1,5 @@
 import 'package:flutter_test/flutter_test.dart';
-import 'package:ui/main.dart';
+import 'package:bytecode_encoder/main.dart';
 
 void main() {
   testWidgets('encoder shell renders primary controls', (tester) async {

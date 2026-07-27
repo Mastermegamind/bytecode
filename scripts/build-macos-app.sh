@@ -7,6 +7,7 @@ APP_NAME="${APP_NAME:-Bytecode Encoder}"
 PHP_BIN="${PHP_BIN:-php}"
 PHPIZE_BIN="${PHPIZE_BIN:-phpize}"
 PHP_CONFIG_BIN="${PHP_CONFIG_BIN:-php-config}"
+VERSION="${VERSION:-$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || printf 'v1.0.0')}"
 DIST_DIR="$ROOT/dist"
 APP_PATH="$ROOT/ui/build/macos/Build/Products/Release/ui.app"
 OUT_APP="$DIST_DIR/$APP_NAME.app"
@@ -20,10 +21,11 @@ fi
 echo "== Build PHP extension =="
 (
   cd "$ROOT/php/src"
+  native_version="${VERSION#v}"
   make clean >/dev/null 2>&1 || true
   "$PHPIZE_BIN" >/dev/null
-  ./configure --with-php-config="$(command -v "$PHP_CONFIG_BIN")" >/dev/null
-  make >/dev/null
+  CFLAGS="-DOPDUMP_VERSION=\\\"$native_version\\\"" ./configure --with-php-config="$(command -v "$PHP_CONFIG_BIN")" >/dev/null
+  CFLAGS="-DOPDUMP_VERSION=\\\"$native_version\\\"" make >/dev/null
 )
 
 echo "== Build Flutter macOS app =="

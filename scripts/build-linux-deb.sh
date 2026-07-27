@@ -6,11 +6,12 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_NAME="Bytecode Encoder"
 APP_ID="bytecode-encoder"
-VERSION="${VERSION:-1.0.0}"
+VERSION="${VERSION:-$(tr -d '[:space:]' < "$ROOT/VERSION" 2>/dev/null || printf 'v1.0.0')}"
+DEB_VERSION="${VERSION#v}"
 ARCH="${DEB_ARCH:-amd64}"
 PHP_VERSION="${PHP_VERSION:-8.4}"
 BUILD_DIR="$ROOT/build/deb"
-PKGROOT="$BUILD_DIR/${APP_ID}_${VERSION}_${ARCH}"
+PKGROOT="$BUILD_DIR/${APP_ID}_${DEB_VERSION}_${ARCH}"
 DIST_DIR="$ROOT/dist"
 
 php_bin="php$PHP_VERSION"
@@ -30,10 +31,11 @@ fi
 echo "== Build PHP extension with $php_bin =="
 (
   cd "$ROOT/php/src"
+  native_version="${VERSION#v}"
   make clean >/dev/null 2>&1 || true
   "$phpize_bin" >/dev/null
-  ./configure --with-php-config="$(command -v "$php_config_bin")" >/dev/null
-  make >/dev/null
+  CFLAGS="-DOPDUMP_VERSION=\\\"$native_version\\\"" ./configure --with-php-config="$(command -v "$php_config_bin")" >/dev/null
+  CFLAGS="-DOPDUMP_VERSION=\\\"$native_version\\\"" make >/dev/null
 )
 
 echo "== Build Flutter Linux bundle =="
@@ -96,11 +98,11 @@ installed_size="$(
 
 cat > "$PKGROOT/DEBIAN/control" <<EOF_CONTROL
 Package: $APP_ID
-Version: $VERSION
+Version: $DEB_VERSION
 Section: devel
 Priority: optional
 Architecture: $ARCH
-Maintainer: Bytecode <noreply@example.com>
+Maintainer: MegaMind Technologies LTD <hello@megamindtechnologies.com>
 Installed-Size: $installed_size
 Depends: libc6, libgtk-3-0, libstdc++6
 Description: Bytecode Encoder desktop app
@@ -112,8 +114,8 @@ find "$PKGROOT/DEBIAN" -type f -exec chmod 0644 {} +
 chmod u-s,g-s,o-t "$PKGROOT/DEBIAN"
 
 echo "== Build .deb =="
-dpkg-deb --build --root-owner-group "$PKGROOT" "$DIST_DIR/${APP_ID}_${VERSION}_${ARCH}.deb"
+dpkg-deb --build --root-owner-group "$PKGROOT" "$DIST_DIR/${APP_ID}_${DEB_VERSION}_${ARCH}.deb"
 
 echo
 echo "Debian package built:"
-echo "$DIST_DIR/${APP_ID}_${VERSION}_${ARCH}.deb"
+echo "$DIST_DIR/${APP_ID}_${DEB_VERSION}_${ARCH}.deb"

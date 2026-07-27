@@ -128,7 +128,7 @@ class _EncoderPageState extends State<EncoderPage> {
   final _vendorSignKeyController = TextEditingController();
   final _vendorKeyDirController = TextEditingController();
   final _inspectPathController = TextEditingController();
-  final _packageVersionController = TextEditingController(text: '1.0.0');
+  final _packageVersionController = TextEditingController();
   final _profileController = TextEditingController(text: 'php-assets');
   final _remoteTargetController = TextEditingController(
     text: 'trigger@192.168.8.42:/var/www/exam.test',
@@ -164,6 +164,7 @@ class _EncoderPageState extends State<EncoderPage> {
     super.initState();
     _rootController = TextEditingController(text: _defaultRepoRoot());
     _keyController.text = _vendorSecretPath;
+    _packageVersionController.text = _projectVersion();
     _rootController.addListener(() {
       final path = _vendorSecretPath;
       if (_keyController.text != path) {
@@ -285,6 +286,15 @@ class _EncoderPageState extends State<EncoderPage> {
       _join(_join(_root, 'build'), 'vendor-secret.key');
   String get _manifestPath =>
       _join(_outputController.text.trim(), 'bytecode.manifest.json');
+
+  String _projectVersion() {
+    final file = File(_join(_root, 'VERSION'));
+    if (!file.existsSync()) {
+      return 'v1.0.0';
+    }
+    final version = file.readAsStringSync().trim();
+    return version.isEmpty ? 'v1.0.0' : version;
+  }
 
   Future<void> _pickFolder(TextEditingController controller) async {
     final path = await getDirectoryPath();
@@ -840,7 +850,7 @@ class _EncoderPageState extends State<EncoderPage> {
       late final List<String> args;
       final env = <String, String>{
         'PHP_VERSION': phpVersion.isEmpty ? '8.4' : phpVersion,
-        'VERSION': version.isEmpty ? '1.0.0' : version,
+        'VERSION': version.isEmpty ? _projectVersion() : version,
       };
 
       switch (kind) {

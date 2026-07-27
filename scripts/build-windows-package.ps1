@@ -3,12 +3,28 @@ param(
     [string] $OpdumpDll = $env:OPDUMP_DLL,
     [switch] $SkipExtension,
     [switch] $BuildMsi,
-    [string] $Version = "1.0.0"
+    [string] $Version = $null
 )
 
 $ErrorActionPreference = "Stop"
 
 $Root = Resolve-Path (Join-Path $PSScriptRoot "..")
+if (-not $Version) {
+    $VersionFile = Join-Path $Root "VERSION"
+    if (Test-Path $VersionFile) {
+        $Version = (Get-Content -Raw $VersionFile).Trim()
+    }
+    else {
+        $Version = "v1.0.0"
+    }
+}
+$MsiVersion = $Version -replace '^v', ''
+if ($MsiVersion -match '^([0-9]+\.[0-9]+\.[0-9]+)') {
+    $MsiVersion = $Matches[1]
+}
+else {
+    $MsiVersion = "1.0.0"
+}
 $DistDir = Join-Path $Root "dist"
 $Bundle = Join-Path $Root "ui\build\windows\x64\runner\Release"
 $PackageDir = Join-Path $DistDir "Bytecode_Encoder-windows-x64"
@@ -151,7 +167,7 @@ if ($BuildMsi) {
     $upgradeCode = "8D1844F0-291B-4A45-95D4-A083E020E888"
 
     $lines.Add('<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">')
-    $lines.Add("  <Package Name=""Bytecode Encoder"" Manufacturer=""Bytecode"" Version=""$Version"" UpgradeCode=""$upgradeCode"" Scope=""perMachine"">")
+    $lines.Add("  <Package Name=""Bytecode Encoder"" Manufacturer=""Bytecode"" Version=""$MsiVersion"" UpgradeCode=""$upgradeCode"" Scope=""perMachine"">")
     $lines.Add('    <MajorUpgrade DowngradeErrorMessage="A newer version of Bytecode Encoder is already installed." />')
     $lines.Add('    <MediaTemplate EmbedCab="yes" />')
     $lines.Add('    <StandardDirectory Id="ProgramFiles64Folder">')

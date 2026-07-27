@@ -3,6 +3,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/bytecode-common.php';
+
 function usage(): void
 {
     fwrite(STDERR, "Usage: bytecode-doctor [--php-bin <php>] [--php-version <8.4>] [--json]\n");
@@ -62,8 +64,11 @@ while ($args) {
 }
 
 $repoRoot = dirname(__DIR__, 2);
+$projectVersion = bytecode_project_version();
 $keyFile = getenv('BYTECODE_VENDOR_KEY_FILE') ?: $repoRoot . DIRECTORY_SEPARATOR . 'build' . DIRECTORY_SEPARATOR . 'vendor-secret.key';
 $checks = [];
+
+$checks[] = check(true, 'project version', $projectVersion);
 
 [$exit, $out, $err] = run_capture([$phpBin, '-r', 'echo PHP_VERSION_ID, " ", PHP_VERSION;']);
 $checks[] = check($exit === 0, 'php executable', trim($out ?: $err));
@@ -104,7 +109,7 @@ foreach (['phpize' . $phpVersion, 'php-config' . $phpVersion, 'rsync', 'ssh', 'o
 }
 
 if ($json) {
-    echo json_encode(['format' => 'bytecode-doctor-v1', 'ok' => !in_array(false, array_column($checks, 'ok'), true), 'php_version_id' => $phpVersionId, 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
+    echo json_encode(['format' => 'bytecode-doctor-v1', 'version' => $projectVersion, 'ok' => !in_array(false, array_column($checks, 'ok'), true), 'php_version_id' => $phpVersionId, 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
     exit(0);
 }
 

@@ -3,6 +3,8 @@
 
 declare(strict_types=1);
 
+require_once __DIR__ . '/bytecode-common.php';
+
 /*
  * Phase 1 tree dumper: walk PHP source and emit encrypted BYTC2 containers.
  * Uses lint mode (-l) so PHP compiles each file without executing it. Static
@@ -1287,7 +1289,7 @@ if (!$raw) {
 
     $manifest = [
         'format' => 'bytecode-manifest-v1',
-        'tool_version' => '0.0.1-phase0',
+        'tool_version' => bytecode_project_version(),
         'created_at' => gmdate('c'),
         'build_id' => bin2hex(random_bytes(8)),
         'php_version_id' => $phpVersionId,

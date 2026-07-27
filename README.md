@@ -199,6 +199,20 @@ scripts/                      Linux/macOS/Windows packaging scripts
 .github/workflows/            CI for PHP matrix and desktop packages
 ```
 
+## Versioning
+
+The project version lives in [`VERSION`](VERSION). Use `bytecode-version` to
+read or set it:
+
+```bash
+php8.4 php/bin/bytecode-version
+php8.4 php/bin/bytecode-version --set v0.0.1phase2
+```
+
+That value is embedded into new loader builds, `bytecode.manifest.json`,
+`bytecode.package.json`, `bytecode-doctor --json`, and the GUI package-version
+default.
+
 ## Build The PHP Extension
 
 Build against a specific PHP minor version by pairing the matching `phpize` and
@@ -255,7 +269,7 @@ Expected shape:
 
 ```text
 Zend Engine v4.4.23, Copyright (c) Zend Technologies
-    with Bytecode PHP Loader v0.0.1-phase0, Copyright (c) 2026 MegaMind Technologies LTD, by MegaMind Technologies LTD
+    with Bytecode PHP Loader v0.0.1phase2, Copyright (c) 2026 MegaMind Technologies LTD, by MegaMind Technologies LTD
 ```
 
 Runtime bytecode loading works through the Zend-extension path too:
@@ -573,4 +587,9 @@ Important remaining work includes:
 
 ## License
 
-MIT - see [`LICENSE`](LICENSE).
+Apache License 2.0 - see [`LICENSE`](LICENSE). Copyright remains with
+MegaMind Technologies LTD and contributors. See [`NOTICE`](NOTICE) for
+attribution and trademark notes.
+
+Official website: https://megamindtechnologies.com
+Contact: hello@megamindtechnologies.com

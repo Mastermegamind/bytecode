@@ -18,10 +18,14 @@ restore_key() {
 trap restore_key EXIT
 
 mkdir -p "$TMP/src"
+VERSION="$("$PHP_BIN" "$ROOT/php/bin/bytecode-version")"
 printf '<?php echo "ok";\n' > "$TMP/src/a.php"
 printf 'body{}\n' > "$TMP/src/a.css"
 printf '<h1>{{ $name }}</h1>\n' > "$TMP/src/a.blade.php"
 printf '<?php #[Attr] readonly class A {} enum E { case A; } eval("echo 1;"); new class {}; Fiber::suspend();\n' > "$TMP/src/scan.php"
+
+printf '%s\n' "$VERSION" | grep -q '^v'
+"$PHP_BIN" "$ROOT/php/bin/bytecode-version" --json | grep -q '"format": "bytecode-version-v1"'
 
 dry="$("$PHP_BIN" "$ROOT/php/bin/bytecode-dump" --dry-run --report-json --profile php-assets "$TMP/src" "$TMP/out")"
 grep -q '"format": "bytecode-dry-run-v1"' <<<"$dry"
@@ -39,6 +43,7 @@ done
 test -f "$ROOT/build/vendor-secret.key"
 
 "$PHP_BIN" "$ROOT/php/bin/bytecode-dump" --include-assets "$TMP/src/a.php" "$TMP/src/a.css" "$TMP/src/a.blade.php" "$TMP/encoded" >/dev/null
+grep -q "\"tool_version\": \"$VERSION\"" "$TMP/encoded/bytecode.manifest.json"
 "$PHP_BIN" "$ROOT/php/bin/bytecode-verify" --decrypt-test "$TMP/encoded" | grep -q 'decrypt-test: PASS'
 "$PHP_BIN" "$ROOT/php/bin/bytecode-package-sign" "$TMP/encoded" >/dev/null
 test -f "$TMP/encoded/bytecode.package.json"
