@@ -2093,6 +2093,71 @@ static bool opdump_op_array_uses_dynamic_vars(zend_op_array *op_array)
     return false;
 }
 
+/* ---- local-variable name scrambler (YAKPro-PO-inspired) ----
+ *
+ * The dumped op_array addresses locals purely by integer slot, so op_array->vars[]
+ * is only a name-lookup table (compact()/extract()/Reflection/debug). The prior
+ * obfuscation replaced local names with the *predictable* sequence _v0,_v1,...,
+ * which reveals slot order and is trivially normalised back. Learning from
+ * YAKPro-PO's scrambler, we instead emit unpredictable, per-build-random
+ * identifiers, with the same three modes (identifier / hexa / numeric), a
+ * configurable length, and collision avoidance -- while keeping this a pure
+ * metadata rename with zero effect on control flow. Modes/length come from
+ * OPDUMP_OBFUSCATE_MODE / OPDUMP_OBFUSCATE_LENGTH (set by bytecode-dump). */
+static uint64_t opdump_obf_rng_state(void)
+{
+    static uint64_t state = 0;
+    if (state == 0) {
+        state = (uint64_t) time(NULL) ^ ((uint64_t) (uintptr_t) &state) ^ 0x9e3779b97f4a7c15ULL;
+#ifdef ZTS
+        state ^= (uint64_t) (uintptr_t) tsrm_thread_id();
+#endif
+        if (state == 0) {
+            state = 0x9e3779b97f4a7c15ULL;
+        }
+    }
+    /* xorshift64: fast, non-cryptographic -- fine for name scrambling. */
+    state ^= state << 13;
+    state ^= state >> 7;
+    state ^= state << 17;
+    return state;
+}
+
+static int opdump_obf_mode(void)
+{
+    const char *m = getenv("OPDUMP_OBFUSCATE_MODE");
+    if (m && (strcmp(m, "hexa") == 0)) return 1;
+    if (m && (strcmp(m, "numeric") == 0)) return 2;
+    return 0; /* identifier */
+}
+
+static int opdump_obf_length(void)
+{
+    const char *l = getenv("OPDUMP_OBFUSCATE_LENGTH");
+    int n = l ? atoi(l) : 6;
+    if (n < 2) n = 2;
+    if (n > 24) n = 24;
+    return n;
+}
+
+static void opdump_scramble_ident(char *out, size_t cap, int mode, int length)
+{
+    static const char *ident_first = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    static const char *ident_rest  = "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_";
+    static const char *hex_first    = "abcdefABCDEF";
+    static const char *hex_rest     = "0123456789abcdefABCDEF";
+    const char *first = mode == 1 ? hex_first : mode == 2 ? "O" : ident_first;
+    const char *rest  = mode == 1 ? hex_rest  : mode == 2 ? "0123456789" : ident_rest;
+    size_t lf = strlen(first), lr = strlen(rest);
+    if ((size_t) length + 1 > cap) length = (int) cap - 1;
+    if (length < 2) length = 2;
+    out[0] = first[opdump_obf_rng_state() % lf];
+    for (int i = 1; i < length; i++) {
+        out[i] = rest[opdump_obf_rng_state() % lr];
+    }
+    out[length] = '\0';
+}
+
 static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
 {
     w_u8(f, op_array->type);
@@ -2150,15 +2215,38 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
     bool obfuscate_vars = getenv("OPDUMP_OBFUSCATE") != NULL
         && !opdump_op_array_uses_dynamic_vars(op_array);
     uint32_t protected_var_count = op_array->num_args + ((op_array->fn_flags & ZEND_ACC_VARIADIC) ? 1 : 0);
+    /* Randomly scramble non-parameter local names. Names must stay unique
+     * within this var table (and must not collide with a parameter name kept
+     * verbatim above), so each generated identifier is checked against the
+     * ones already chosen for this op_array and regenerated on a clash. */
+    int obf_mode = obfuscate_vars ? opdump_obf_mode() : 0;
+    int obf_len = obfuscate_vars ? opdump_obf_length() : 0;
+    char (*obf_names)[32] = NULL;
+    if (obfuscate_vars && op_array->last_var > 0) {
+        obf_names = (char (*)[32]) ecalloc(op_array->last_var, sizeof(*obf_names));
+    }
     for (int i = 0; i < op_array->last_var; i++) {
         if (obfuscate_vars && (uint32_t) i >= protected_var_count) {
-            char renamed[24];
-            snprintf(renamed, sizeof(renamed), "_v%d", i);
+            for (int attempt = 0; attempt < 64; attempt++) {
+                opdump_scramble_ident(obf_names[i], sizeof(obf_names[i]), obf_mode, obf_len);
+                bool clash = false;
+                for (uint32_t j = 0; j < protected_var_count && !clash; j++) {
+                    if (zend_string_equals_cstr(op_array->vars[j], obf_names[i], strlen(obf_names[i]))) clash = true;
+                }
+                for (int j = (int) protected_var_count; j < i && !clash; j++) {
+                    if (strcmp(obf_names[j], obf_names[i]) == 0) clash = true;
+                }
+                if (!clash) break;
+                if (attempt == 8 && obf_len < 24) obf_len++;
+            }
             w_u8(f, 1);
-            w_str(f, renamed, strlen(renamed));
+            w_str(f, obf_names[i], strlen(obf_names[i]));
         } else {
             w_zstr(f, op_array->vars[i]);
         }
+    }
+    if (obf_names) {
+        efree(obf_names);
     }
     if (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE) {
         opdump_write_arg_info(f, &op_array->arg_info[-1]);
@@ -2252,7 +2340,15 @@ static void opdump_write_property_info(FILE *f, zend_property_info *prop)
     w_u32(f, prop->offset);
     w_u32(f, prop->flags);
     w_zstr(f, prop->name);
-    w_zstr(f, prop->doc_comment);
+    /* Doc-comments are the one free-text source artifact that survives
+     * compilation into a container; under obfuscation they are dropped, since
+     * they routinely leak original names, types and intent. Runtime behaviour
+     * is unaffected (only ReflectionProperty::getDocComment() sees them). */
+    if (getenv("OPDUMP_OBFUSCATE") != NULL) {
+        w_zstr(f, NULL);
+    } else {
+        w_zstr(f, prop->doc_comment);
+    }
     opdump_write_type(f, prop->type);
 }
 

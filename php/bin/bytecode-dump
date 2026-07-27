@@ -50,7 +50,12 @@ Options:
   --include-assets              Also encode .html/.htm/.css/.js/.mjs/.twig/
                                 .blade.php files as encrypted raw asset
                                 containers. Off by default.
-  --obfuscate                   Enable safe local-variable obfuscation.
+  --obfuscate                   Enable safe local-variable obfuscation: rename
+                                non-parameter locals to random identifiers and
+                                strip property doc-comments in the bytecode.
+  --obfuscate-mode <mode>       Scrambled-name style: identifier (default),
+                                hexa, or numeric (YAKPro-PO-style).
+  --obfuscate-length <n>        Scrambled-name length (2-24, default 6).
   --scan                        Run bytecode-scan first and embed the scan report.
   --fail-on-scan-warning        Fail if bytecode-scan reports warnings.
   --config <bytecode.json>      Read default exclude/scanner options from config.
@@ -524,6 +529,8 @@ $reportJson = false;
 $includeAssets = false;
 $includeAssetsExplicit = false;
 $obfuscate = false;
+$obfuscateMode = null;
+$obfuscateLength = null;
 $workflow = 'encode-only';
 $scan = false;
 $failOnScanWarning = false;
@@ -613,6 +620,32 @@ while ($args) {
     }
     if ($a === '--obfuscate') {
         $obfuscate = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--obfuscate-mode') {
+        array_shift($args);
+        $obfuscateMode = array_shift($args);
+        if (!in_array($obfuscateMode, ['identifier', 'hexa', 'numeric'], true)) {
+            fail('--obfuscate-mode must be one of: identifier, hexa, numeric', 2);
+        }
+        continue;
+    }
+    if (str_starts_with($a, '--obfuscate-mode=')) {
+        $obfuscateMode = substr($a, strlen('--obfuscate-mode='));
+        if (!in_array($obfuscateMode, ['identifier', 'hexa', 'numeric'], true)) {
+            fail('--obfuscate-mode must be one of: identifier, hexa, numeric', 2);
+        }
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--obfuscate-length') {
+        array_shift($args);
+        $obfuscateLength = (int) array_shift($args);
+        continue;
+    }
+    if (str_starts_with($a, '--obfuscate-length=')) {
+        $obfuscateLength = (int) substr($a, strlen('--obfuscate-length='));
         array_shift($args);
         continue;
     }
@@ -1240,7 +1273,14 @@ function dump_one(
 
     $dumpEnv = ['OPDUMP_MODE' => 'dump'];
     if ($obfuscate) {
+        global $obfuscateMode, $obfuscateLength;
         $dumpEnv['OPDUMP_OBFUSCATE'] = '1';
+        if ($obfuscateMode !== null) {
+            $dumpEnv['OPDUMP_OBFUSCATE_MODE'] = $obfuscateMode;
+        }
+        if ($obfuscateLength !== null) {
+            $dumpEnv['OPDUMP_OBFUSCATE_LENGTH'] = (string) $obfuscateLength;
+        }
     }
     if ($mapSourceAbs !== null && str_replace('\\', '/', $mapSourceAbs) !== str_replace('\\', '/', $sourceAbs)) {
         $dumpEnv['OPDUMP_VIRTUAL_FILENAME'] = str_replace('\\', '/', $mapSourceAbs);
