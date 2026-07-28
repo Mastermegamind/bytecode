@@ -56,6 +56,15 @@ Options:
   --obfuscate-mode <mode>       Scrambled-name style: identifier (default),
                                 hexa, or numeric (YAKPro-PO-style).
   --obfuscate-length <n>        Scrambled-name length (2-24, default 6).
+  --obfuscate-keep <names>      Comma-separated locals to leave un-scrambled.
+  --obfuscate-seed <s>          Deterministic scramble seed (reproducible names);
+                                omit for a fresh random layout each build.
+  --strip-line-info             Zero line numbers in the bytecode (blanks
+                                backtrace line numbers; removes the source map).
+  --watermark <s>               Embed an opaque per-build marker (traitor-trace).
+  --obfuscate-profile <name>    Hardening preset: light (obfuscate), balanced
+                                (+strip-line-info +strip-paths), or paranoid
+                                (+hexa mode, length 10). Explicit flags win.
   --scan                        Run bytecode-scan first and embed the scan report.
   --fail-on-scan-warning        Fail if bytecode-scan reports warnings.
   --config <bytecode.json>      Read default exclude/scanner options from config.
@@ -531,6 +540,11 @@ $includeAssetsExplicit = false;
 $obfuscate = false;
 $obfuscateMode = null;
 $obfuscateLength = null;
+$obfuscateKeep = null;
+$obfuscateSeed = null;
+$stripLineInfo = false;
+$watermark = null;
+$obfProfile = null;
 $workflow = 'encode-only';
 $scan = false;
 $failOnScanWarning = false;
@@ -621,6 +635,34 @@ while ($args) {
     if ($a === '--obfuscate') {
         $obfuscate = true;
         array_shift($args);
+        continue;
+    }
+    if ($a === '--strip-line-info') {
+        $stripLineInfo = true;
+        array_shift($args);
+        continue;
+    }
+    if ($a === '--obfuscate-keep' || str_starts_with($a, '--obfuscate-keep=')) {
+        if (str_contains($a, '=')) { $obfuscateKeep = substr($a, strlen('--obfuscate-keep=')); array_shift($args); }
+        else { array_shift($args); $obfuscateKeep = array_shift($args); }
+        continue;
+    }
+    if ($a === '--obfuscate-seed' || str_starts_with($a, '--obfuscate-seed=')) {
+        if (str_contains($a, '=')) { $obfuscateSeed = substr($a, strlen('--obfuscate-seed=')); array_shift($args); }
+        else { array_shift($args); $obfuscateSeed = array_shift($args); }
+        continue;
+    }
+    if ($a === '--watermark' || str_starts_with($a, '--watermark=')) {
+        if (str_contains($a, '=')) { $watermark = substr($a, strlen('--watermark=')); array_shift($args); }
+        else { array_shift($args); $watermark = array_shift($args); }
+        continue;
+    }
+    if ($a === '--obfuscate-profile' || str_starts_with($a, '--obfuscate-profile=')) {
+        if (str_contains($a, '=')) { $obfProfile = substr($a, strlen('--obfuscate-profile=')); array_shift($args); }
+        else { array_shift($args); $obfProfile = array_shift($args); }
+        if (!in_array($obfProfile, ['light', 'balanced', 'paranoid'], true)) {
+            fail('--obfuscate-profile must be one of: light, balanced, paranoid', 2);
+        }
         continue;
     }
     if ($a === '--obfuscate-mode') {
@@ -822,6 +864,21 @@ if ($args === []) {
     exit(2);
 }
 $sources = $args;
+
+// Obfuscation-strength presets (distinct from the framework include/exclude
+// --profile above): bundle the hardening flags so callers don't hand-tune each
+// one. Explicit flags always win over the preset's defaults.
+if ($obfProfile !== null) {
+    $obfuscate = true;
+    if ($obfProfile === 'balanced' || $obfProfile === 'paranoid') {
+        $stripLineInfo = true;
+        $stripPaths = true;
+    }
+    if ($obfProfile === 'paranoid') {
+        $obfuscateMode ??= 'hexa';
+        $obfuscateLength ??= 10;
+    }
+}
 
 if (!in_array($workflow, ['encode-only', 'obfuscate-only', 'obfuscate-then-encode', 'encode-then-obfuscate'], true)) {
     fail("--workflow must be one of: encode-only, obfuscate-only, obfuscate-then-encode, encode-then-obfuscate", 2);
@@ -1271,9 +1328,9 @@ function dump_one(
     }
     $seenOutputs[$relativeOutput] = $file;
 
+    global $obfuscateMode, $obfuscateLength, $obfuscateKeep, $obfuscateSeed, $stripLineInfo, $watermark;
     $dumpEnv = ['OPDUMP_MODE' => 'dump'];
     if ($obfuscate) {
-        global $obfuscateMode, $obfuscateLength;
         $dumpEnv['OPDUMP_OBFUSCATE'] = '1';
         if ($obfuscateMode !== null) {
             $dumpEnv['OPDUMP_OBFUSCATE_MODE'] = $obfuscateMode;
@@ -1281,6 +1338,18 @@ function dump_one(
         if ($obfuscateLength !== null) {
             $dumpEnv['OPDUMP_OBFUSCATE_LENGTH'] = (string) $obfuscateLength;
         }
+        if ($obfuscateKeep !== null && $obfuscateKeep !== '') {
+            $dumpEnv['OPDUMP_OBFUSCATE_KEEP'] = $obfuscateKeep;
+        }
+        if ($obfuscateSeed !== null && $obfuscateSeed !== '') {
+            $dumpEnv['OPDUMP_OBFUSCATE_SEED'] = $obfuscateSeed;
+        }
+    }
+    if ($stripLineInfo) {
+        $dumpEnv['OPDUMP_STRIP_LINES'] = '1';
+    }
+    if ($watermark !== null && $watermark !== '') {
+        $dumpEnv['OPDUMP_WATERMARK'] = $watermark;
     }
     if ($mapSourceAbs !== null && str_replace('\\', '/', $mapSourceAbs) !== str_replace('\\', '/', $sourceAbs)) {
         $dumpEnv['OPDUMP_VIRTUAL_FILENAME'] = str_replace('\\', '/', $mapSourceAbs);

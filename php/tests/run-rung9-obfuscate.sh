@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Rung 9: safe variable-name obfuscation. bytecode-dump --obfuscate renames
-# non-parameter local variables to _v0, _v1, ... in the dumped OPD2 blob.
+# non-parameter local variables to random scrambled identifiers in the dumped
+# OPD2 blob (was _v0, _v1, ...; now unpredictable per YAKPro-PO-style scrambler).
 # This is safe because compiled opcodes reference CVs by integer slot index,
 # never by name -- op_array->vars[] is purely a name-lookup table, so
 # renaming it is a pure metadata edit with zero effect on control flow.
@@ -51,8 +52,10 @@ if has_string "$BLOB" 5 'extra'; then
   echo "expected 'extra' to be renamed away under --obfuscate" >&2
   exit 1
 fi
-if ! has_string "$BLOB" 3 '_v2'; then
-  echo "expected a renamed local named _v2 (first non-parameter CV in plain_locals)" >&2
+# Names are now randomized, so the old predictable _v2 must NOT appear -- its
+# presence would mean we regressed to the trivially-reversible sequence.
+if has_string "$BLOB" 3 '_v2'; then
+  echo "expected NO predictable _v2 name -- scrambled locals must be random" >&2
   exit 1
 fi
 

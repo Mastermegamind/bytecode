@@ -1780,6 +1780,7 @@ static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned c
 static void opdump_write_array(FILE *f, HashTable *ht);
 static void opdump_read_array(FILE *f, zval *zv);
 static void opdump_write_ast(FILE *f, zend_ast *ast, int depth);
+static bool opdump_strip_lines(void);
 static zend_ast *opdump_read_ast(FILE *f, int depth);
 static void opdump_free_ast(zend_ast *ast);
 
@@ -1939,13 +1940,13 @@ static void opdump_write_ast(FILE *f, zend_ast *ast, int depth)
         opdump_write_literal(f, zv);
     } else if (zend_ast_is_list(ast)) {
         zend_ast_list *list = zend_ast_get_list(ast);
-        w_u32(f, list->lineno);
+        w_u32(f, opdump_strip_lines() ? 0 : list->lineno);
         w_u32(f, list->children);
         for (uint32_t i = 0; i < list->children; i++) {
             opdump_write_ast(f, list->child[i], depth + 1);
         }
     } else {
-        w_u32(f, ast->lineno);
+        w_u32(f, opdump_strip_lines() ? 0 : ast->lineno);
         uint32_t children = zend_ast_get_num_children(ast);
         w_u32(f, children);
         for (uint32_t i = 0; i < children; i++) {
@@ -2108,10 +2109,23 @@ static uint64_t opdump_obf_rng_state(void)
 {
     static uint64_t state = 0;
     if (state == 0) {
-        state = (uint64_t) time(NULL) ^ ((uint64_t) (uintptr_t) &state) ^ 0x9e3779b97f4a7c15ULL;
+        /* Deterministic when OPDUMP_OBFUSCATE_SEED is provided (reproducible
+         * builds -- so a vendor can regenerate the same scrambled names to make
+         * sense of a customer stack trace), otherwise seeded from wall-clock +
+         * ASLR entropy for a fresh random layout each build. */
+        const char *seed = getenv("OPDUMP_OBFUSCATE_SEED");
+        if (seed && seed[0]) {
+            state = 1469598103934665603ULL; /* FNV-1a 64 offset basis */
+            for (const char *p = seed; *p; p++) {
+                state ^= (unsigned char) *p;
+                state *= 1099511628211ULL;
+            }
+        } else {
+            state = (uint64_t) time(NULL) ^ ((uint64_t) (uintptr_t) &state) ^ 0x9e3779b97f4a7c15ULL;
 #ifdef ZTS
-        state ^= (uint64_t) (uintptr_t) tsrm_thread_id();
+            state ^= (uint64_t) (uintptr_t) tsrm_thread_id();
 #endif
+        }
         if (state == 0) {
             state = 0x9e3779b97f4a7c15ULL;
         }
@@ -2121,6 +2135,44 @@ static uint64_t opdump_obf_rng_state(void)
     state ^= state >> 7;
     state ^= state << 17;
     return state;
+}
+
+/* Optional stripping of source-mapping metadata (line numbers) from dumped
+ * bytecode: pure diagnostics, so blanking them never changes behaviour, it
+ * only removes a reverse-engineer's map back to the original source layout. */
+static bool opdump_strip_lines(void)
+{
+    static int cached = -1;
+    if (cached < 0) {
+        cached = getenv("OPDUMP_STRIP_LINES") != NULL ? 1 : 0;
+    }
+    return cached == 1;
+}
+
+/* Per-build keep-list of local-variable names to leave un-scrambled, mirroring
+ * YAKPro-PO's t_ignore_variables. Read from OPDUMP_OBFUSCATE_KEEP as a
+ * comma-separated list; matched case-sensitively against the CV name. */
+static bool opdump_obf_keep_var(zend_string *name)
+{
+    const char *keep = getenv("OPDUMP_OBFUSCATE_KEEP");
+    if (!keep || !keep[0] || !name) {
+        return false;
+    }
+    size_t nlen = ZSTR_LEN(name);
+    const char *nval = ZSTR_VAL(name);
+    const char *p = keep;
+    while (*p) {
+        const char *comma = strchr(p, ',');
+        size_t seglen = comma ? (size_t) (comma - p) : strlen(p);
+        if (seglen == nlen && memcmp(p, nval, nlen) == 0) {
+            return true;
+        }
+        if (!comma) {
+            break;
+        }
+        p = comma + 1;
+    }
+    return false;
 }
 
 static int opdump_obf_mode(void)
@@ -2179,8 +2231,9 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
     } else {
         w_str(f, op_array->filename ? ZSTR_VAL(op_array->filename) : "", op_array->filename ? ZSTR_LEN(op_array->filename) : 0);
     }
-    w_u32(f, op_array->line_start);
-    w_u32(f, op_array->line_end);
+    bool strip_lines = opdump_strip_lines();
+    w_u32(f, strip_lines ? 0 : op_array->line_start);
+    w_u32(f, strip_lines ? 0 : op_array->line_end);
 
     w_u32(f, op_array->last);
     w_u32(f, (uint32_t)op_array->last_literal);
@@ -2192,7 +2245,7 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
         w_u8(f, op->op2_type);
         w_u8(f, op->result_type);
         w_u32(f, op->extended_value);
-        w_u32(f, op->lineno);
+        w_u32(f, strip_lines ? 0 : op->lineno);
         w_u32(f, op->op1.num);
         w_u32(f, op->op2.num);
         w_u32(f, op->result.num);
@@ -2226,7 +2279,8 @@ static void opdump_write_op_array(FILE *f, zend_op_array *op_array)
         obf_names = (char (*)[32]) ecalloc(op_array->last_var, sizeof(*obf_names));
     }
     for (int i = 0; i < op_array->last_var; i++) {
-        if (obfuscate_vars && (uint32_t) i >= protected_var_count) {
+        if (obfuscate_vars && (uint32_t) i >= protected_var_count
+                && !opdump_obf_keep_var(op_array->vars[i])) {
             for (int attempt = 0; attempt < 64; attempt++) {
                 opdump_scramble_ident(obf_names[i], sizeof(obf_names[i]), obf_mode, obf_len);
                 bool clash = false;
@@ -2384,8 +2438,8 @@ static void opdump_write_class_entry(FILE *f, zend_class_entry *ce)
     } else {
         w_zstr(f, ce->info.user.filename);
     }
-    w_u32(f, ce->info.user.line_start);
-    w_u32(f, ce->info.user.line_end);
+    w_u32(f, opdump_strip_lines() ? 0 : ce->info.user.line_start);
+    w_u32(f, opdump_strip_lines() ? 0 : ce->info.user.line_end);
 
     for (int i = 0; i < ce->default_properties_count; i++) {
         opdump_write_literal(f, &ce->default_properties_table[i]);
@@ -2691,6 +2745,13 @@ static void opdump_write(zend_op_array *op_array, const char *path)
     }
     fwrite(OPDUMP_MAGIC, 1, 4, f);
     w_u32(f, PHP_VERSION_ID);
+    /* Per-build watermark: an opaque marker (e.g. a customer id) baked into
+     * every container for traitor-tracing a leaked build. Purely informational
+     * -- the loader reads and ignores it. Empty when OPDUMP_WATERMARK unset. */
+    {
+        const char *wm = getenv("OPDUMP_WATERMARK");
+        w_str(f, wm ? wm : "", wm ? strlen(wm) : 0);
+    }
     opdump_write_op_array(f, op_array);
     opdump_write_file_functions(f, op_array->filename);
     opdump_write_file_classes(f, op_array->filename);
@@ -2948,6 +3009,16 @@ static zend_op_array *opdump_read_raw_stream(FILE *f, const char *path)
         php_error_docref(NULL, E_WARNING,
             "opdump: blob was dumped under PHP_VERSION_ID %u, running %u -- proceeding anyway for this spike",
             built_for_version, PHP_VERSION_ID);
+    }
+
+    /* Per-build watermark (written by opdump_write) -- read and discard. */
+    {
+        uint32_t wm_len = 0;
+        char *wm = r_str(f, &wm_len);
+        if (getenv("OPDUMP_DEBUG") && wm_len) {
+            fprintf(stderr, "[opdump debug] container watermark: %.*s\n", (int) wm_len, wm);
+        }
+        free(wm);
     }
 
     zend_op_array *op_array = opdump_read_op_array(f);
