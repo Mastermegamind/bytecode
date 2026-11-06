@@ -5,6 +5,8 @@ import 'dart:io';
 import 'package:file_selector/file_selector.dart';
 import 'package:flutter/material.dart';
 
+import 'agent_control.dart';
+
 void main() {
   runApp(const BytecodeApp());
 }
@@ -939,6 +941,18 @@ class _EncoderPageState extends State<EncoderPage> {
     });
   }
 
+  void _openAgentControl() {
+    Navigator.of(context).push(
+      MaterialPageRoute<void>(
+        builder: (_) => AgentControlPanel(
+          root: _root,
+          phpBinary: _phpBinary(),
+          onLog: _append,
+        ),
+      ),
+    );
+  }
+
   Future<void> _runLocked(Future<void> Function() action) async {
     if (_busy) {
       return;
@@ -966,6 +980,11 @@ class _EncoderPageState extends State<EncoderPage> {
     );
 
     return Scaffold(
+      floatingActionButton: FloatingActionButton.extended(
+        onPressed: _busy ? null : _openAgentControl,
+        icon: const Icon(Icons.hub),
+        label: const Text('Agent Control'),
+      ),
       body: SafeArea(
         child: LayoutBuilder(
           builder: (context, constraints) {

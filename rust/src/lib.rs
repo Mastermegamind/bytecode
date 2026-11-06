@@ -8,6 +8,9 @@
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
+pub mod ffi;
+pub mod ops;
+
 use aes_gcm::aead::{Aead, KeyInit, Payload};
 use aes_gcm::{Aes256Gcm, Key, Nonce};
 use hkdf::Hkdf;
@@ -88,59 +91,77 @@ pub struct Container {
 }
 
 /// Parse a `.bytc` container exactly as `parse_bytc()` does in the PHP tool.
+/// Exits the process with the matching message on malformed input (used by the
+/// tool binaries). Library callers should use [`try_parse_bytc`] instead.
 pub fn parse_bytc(path: &Path) -> Container {
-    let bytes = match std::fs::read(path) {
-        Ok(b) => b,
-        Err(_) => fail(format!("cannot read {}", path.display())),
-    };
+    match try_parse_bytc(path) {
+        Ok(c) => c,
+        Err(msg) => fail(msg),
+    }
+}
+
+/// Result-returning container parser for library/FFI callers — identical checks
+/// and messages to [`parse_bytc`], but never exits the process.
+pub fn try_parse_bytc(path: &Path) -> Result<Container, String> {
+    let bytes = std::fs::read(path).map_err(|_| format!("cannot read {}", path.display()))?;
     if bytes.len() < 4 || &bytes[0..4] != b"BYTC" {
-        fail(format!("not a BYTC container: {}", path.display()));
+        return Err(format!("not a BYTC container: {}", path.display()));
     }
 
-    let mut r = Reader::new(&bytes);
-    r.off = 4;
-    let version = r.u32le();
+    let mut off = 4usize;
+    let u32le = |off: &mut usize| -> Result<u32, String> {
+        if bytes.len() < *off + 4 {
+            return Err("truncated container".to_string());
+        }
+        let v = u32::from_le_bytes(bytes[*off..*off + 4].try_into().unwrap());
+        *off += 4;
+        Ok(v)
+    };
+    let u64le = |off: &mut usize| -> Result<u64, String> {
+        if bytes.len() < *off + 8 {
+            return Err("truncated container".to_string());
+        }
+        let v = u64::from_le_bytes(bytes[*off..*off + 8].try_into().unwrap());
+        *off += 8;
+        Ok(v)
+    };
+    let take = |off: &mut usize, len: usize| -> Result<Vec<u8>, String> {
+        if bytes.len() < off.saturating_add(len) {
+            return Err("truncated container".to_string());
+        }
+        let s = bytes[*off..*off + len].to_vec();
+        *off += len;
+        Ok(s)
+    };
+
+    let version = u32le(&mut off)?;
     if version != 1 && version != 2 {
-        fail(format!(
-            "{}: unsupported container version {}",
-            path.display(),
-            version
-        ));
+        return Err(format!("{}: unsupported container version {}", path.display(), version));
     }
-    let php_version_id = r.u32le();
-    let backend_id = {
-        let n = r.u32le() as usize;
-        String::from_utf8_lossy(r.take(n)).into_owned()
-    };
-    let backend_format = {
-        let n = r.u32le() as usize;
-        String::from_utf8_lossy(r.take(n)).into_owned()
-    };
+    let php_version_id = u32le(&mut off)?;
+    let n = u32le(&mut off)? as usize;
+    let backend_id = String::from_utf8_lossy(&take(&mut off, n)?).into_owned();
+    let n = u32le(&mut off)? as usize;
+    let backend_format = String::from_utf8_lossy(&take(&mut off, n)?).into_owned();
     let mut cipher_id = None;
     let mut key_id = Vec::new();
     if version == 2 {
-        cipher_id = Some(r.u32le());
-        let n = r.u32le() as usize;
-        key_id = r.take(n).to_vec();
+        cipher_id = Some(u32le(&mut off)?);
+        let n = u32le(&mut off)? as usize;
+        key_id = take(&mut off, n)?;
     }
-    let header_size = r.off;
-    let nonce = {
-        let n = r.u32le() as usize;
-        r.take(n).to_vec()
-    };
-    let tag = {
-        let n = r.u32le() as usize;
-        r.take(n).to_vec()
-    };
-    let ciphertext = {
-        let n = r.u64le() as usize;
-        r.take(n).to_vec()
-    };
-    if r.off != bytes.len() {
-        fail(format!("{}: trailing bytes after ciphertext", path.display()));
+    let header_size = off;
+    let n = u32le(&mut off)? as usize;
+    let nonce = take(&mut off, n)?;
+    let n = u32le(&mut off)? as usize;
+    let tag = take(&mut off, n)?;
+    let n = u64le(&mut off)? as usize;
+    let ciphertext = take(&mut off, n)?;
+    if off != bytes.len() {
+        return Err(format!("{}: trailing bytes after ciphertext", path.display()));
     }
 
-    Container {
+    Ok(Container {
         bytes,
         version,
         php_version_id,
@@ -152,7 +173,7 @@ pub fn parse_bytc(path: &Path) -> Container {
         nonce,
         tag,
         ciphertext,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

@@ -1,0 +1,54 @@
+#!/usr/bin/env php
+<?php
+
+declare(strict_types=1);
+
+/*
+ * Launcher for the Rust `bytecode-mcp` server: a Model Context Protocol server
+ * (stdio JSON-RPC 2.0) that exposes every bytecode tool for agentic control.
+ * This PHP wrapper keeps the server discoverable alongside the other php/bin
+ * tools; it resolves and execs the compiled Rust binary (there is no PHP
+ * fallback for the server itself -- build it with `cd rust && cargo build
+ * --release`).
+ */
+
+$root = getenv('BYTECODE_ROOT') ?: dirname(__DIR__, 2);
+$candidates = [];
+if ($explicit = getenv('BYTECODE_MCP_RS')) {
+    $candidates[] = $explicit;
+}
+$candidates[] = $root . '/rust/target/release/bytecode-mcp';
+$candidates[] = __DIR__ . '/bytecode-mcp-rs';
+
+$bin = null;
+foreach ($candidates as $cand) {
+    if ($cand !== '' && is_file($cand) && is_executable($cand)) {
+        $bin = $cand;
+        break;
+    }
+}
+if ($bin === null) {
+    fwrite(STDERR, "bytecode-mcp: Rust server binary not found.\n");
+    fwrite(STDERR, "Build it with: (cd {$root}/rust && cargo build --release)\n");
+    fwrite(STDERR, "Or set BYTECODE_MCP_RS to its path.\n");
+    exit(127);
+}
+
+if (getenv('BYTECODE_ROOT') === false) {
+    putenv('BYTECODE_ROOT=' . dirname(__DIR__, 2));
+}
+
+if (!function_exists('proc_open')) {
+    fwrite(STDERR, "bytecode-mcp: proc_open is disabled; cannot launch server.\n");
+    exit(1);
+}
+$proc = proc_open(
+    array_merge([$bin], array_slice($argv, 1)),
+    [0 => STDIN, 1 => STDOUT, 2 => STDERR],
+    $pipes
+);
+if (!is_resource($proc)) {
+    fwrite(STDERR, "bytecode-mcp: failed to launch {$bin}\n");
+    exit(127);
+}
+exit(proc_close($proc));

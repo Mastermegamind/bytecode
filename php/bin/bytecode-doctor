@@ -108,6 +108,34 @@ foreach (['phpize' . $phpVersion, 'php-config' . $phpVersion, 'rsync', 'ssh', 'o
     $checks[] = check($exit === 0, "tool {$tool}", trim($out) ?: 'missing');
 }
 
+// Rust tooling: the byte-compatible CLI tools, the FFI shared library, and the
+// agentic-control servers (bytecode-api / bytecode-mcp). These are optional --
+// the PHP tools run without them -- but when present every CLI tool is
+// Rust-first and the API/MCP servers can drive the full pipeline.
+$rustReleaseDir = getenv('BYTECODE_RUST_DIR') ?: $repoRoot . '/rust/target/release';
+[$exit, $cargoOut] = run_capture(['sh', '-c', 'command -v cargo']);
+$checks[] = check($exit === 0, 'rust toolchain (cargo)', trim($cargoOut) ?: 'missing (optional; build with cargo)');
+
+$soCandidates = ['libbytecode_tools.so', 'libbytecode_tools.dylib', 'libbytecode_tools.dll'];
+$soFound = '';
+foreach ($soCandidates as $so) {
+    if (is_file($rustReleaseDir . DIRECTORY_SEPARATOR . $so)) {
+        $soFound = $rustReleaseDir . DIRECTORY_SEPARATOR . $so;
+        break;
+    }
+}
+$checks[] = check($soFound !== '', 'rust ffi library', $soFound !== '' ? $soFound : "not built ({$rustReleaseDir})");
+
+foreach (['bytecode-verify', 'bytecode-pack', 'bytecode-keygen', 'bytecode-vendor-keygen', 'bytecode-license-keygen', 'bytecode-package-sign', 'bytecode'] as $rbin) {
+    $p = $rustReleaseDir . DIRECTORY_SEPARATOR . $rbin;
+    $checks[] = check(is_file($p) && is_executable($p), "rust tool {$rbin}", is_file($p) ? $p : 'not built');
+}
+
+foreach (['bytecode-mcp' => 'MCP server (stdio)', 'bytecode-api' => 'HTTP API server'] as $server => $label) {
+    $p = $rustReleaseDir . DIRECTORY_SEPARATOR . $server;
+    $checks[] = check(is_file($p) && is_executable($p), "agentic {$server}", is_file($p) ? "{$label}: {$p}" : "{$label}: not built (cd rust && cargo build --release)");
+}
+
 if ($json) {
     echo json_encode(['format' => 'bytecode-doctor-v1', 'version' => $projectVersion, 'ok' => !in_array(false, array_column($checks, 'ok'), true), 'php_version_id' => $phpVersionId, 'checks' => $checks], JSON_PRETTY_PRINT | JSON_UNESCAPED_SLASHES), PHP_EOL;
     exit(0);

@@ -6,92 +6,23 @@ use std::path::{Path, PathBuf};
 use std::process::exit;
 
 use base64::Engine;
+use bytecode_tools::ops::{self, VerifyOne};
 use bytecode_tools::*;
 use serde_json::Value;
-
-struct VerifyResult {
-    backend: String,
-    backend_format: String,
-    sha256: String,
-    size: u64,
-    payload_size: Option<usize>,
-}
 
 fn usage_err() -> ! {
     eprintln!("Usage: bytecode-verify [--decrypt-test] <manifest.json|encoded-file>");
     exit(2);
 }
 
-fn aad<'a>(c: &'a Container) -> &'a [u8] {
-    &c.bytes[0..c.header_size]
-}
-
-/// `--decrypt-test`: derive the per-file key and AES-256-GCM decrypt. Returns
-/// the plaintext length. Mirrors decrypt_test_container().
-fn decrypt_test_container(path: &Path) -> usize {
-    let c = parse_bytc(path);
-    if c.version != 2 {
-        fail(format!("{}: decrypt-test requires BYTC2", path.display()));
+/// Verify one container via the shared `ops` surface, exiting with the matching
+/// message on failure (CLI behaviour). The structural checks, decrypt-test and
+/// error strings all live in `bytecode_tools::ops::verify_one`.
+fn verify_container(path: &Path, decrypt_test: bool) -> VerifyOne {
+    match ops::verify_one(path, decrypt_test, php_version_id()) {
+        Ok(r) => r,
+        Err(e) => fail(e),
     }
-    let ikm_hex = resolve_ikm_hex_decrypt();
-    if !is_hex64(&ikm_hex) {
-        fail("decrypt-test requires BYTECODE_KEY/OPDUMP_KEY/BYTECODE_VENDOR_KEY/BYTECODE_DEK or build/vendor-secret.key");
-    }
-    let ikm = hex::decode(&ikm_hex).unwrap();
-    let key = hkdf_sha256(&ikm, 32, b"bytecode-v2", &c.key_id);
-    let plain = aes256gcm_decrypt(&key, &c.nonce, &c.tag, aad(&c), &c.ciphertext).unwrap_or_else(
-        || fail(format!("{}: decrypt-test failed (wrong key or tampered container)", path.display())),
-    );
-    if c.backend_id == BACKEND_PHP && (plain.len() < 4 || &plain[0..4] != b"OPD2") {
-        fail(format!("{}: decrypt-test payload is not OPD2", path.display()));
-    }
-    plain.len()
-}
-
-/// Structural + metadata verification of a single container (verify_container).
-fn verify_container(path: &Path, decrypt_test: bool) -> VerifyResult {
-    let c = parse_bytc(path);
-    let want = php_version_id();
-    if c.php_version_id != want {
-        fail(format!(
-            "{}: PHP_VERSION_ID {} does not match {}",
-            path.display(),
-            c.php_version_id,
-            want
-        ));
-    }
-    let is_php = c.backend_id == BACKEND_PHP && c.backend_format == FORMAT_OPD2;
-    let is_asset = c.backend_id == BACKEND_ASSET && c.backend_format == FORMAT_RAW1;
-    if !is_php && !is_asset {
-        fail(format!(
-            "{}: unsupported backend {}/{}",
-            path.display(),
-            c.backend_id,
-            c.backend_format
-        ));
-    }
-    if c.version == 2 && c.cipher_id != Some(1) {
-        fail(format!(
-            "{}: unsupported cipher_id {}",
-            path.display(),
-            c.cipher_id.unwrap_or(0)
-        ));
-    }
-    if c.nonce.len() != 12 || c.tag.len() != 16 {
-        fail(format!("{}: unsupported nonce/tag length", path.display()));
-    }
-    let result = VerifyResult {
-        backend: c.backend_id.clone(),
-        backend_format: c.backend_format.clone(),
-        sha256: sha256_hex(&c.bytes),
-        size: c.bytes.len() as u64,
-        payload_size: if decrypt_test {
-            Some(decrypt_test_container(path))
-        } else {
-            None
-        },
-    };
-    result
 }
 
 /// JSON value -> string using the same rules as PHP's `(string)` cast, used by

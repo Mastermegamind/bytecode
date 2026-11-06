@@ -12,6 +12,11 @@ publish = false
 [lib]
 name = "bytecode_tools"
 path = "src/lib.rs"
+# rlib: used by the tool binaries in this package.
+# cdylib: C ABI shared library (libbytecode_tools.so/.dylib/.dll) for the
+#         Flutter desktop app to call verify/pack/keygen in-process via FFI.
+# staticlib: optional static archive for embedding.
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 sha2 = "0.10"

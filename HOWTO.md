@@ -933,3 +933,59 @@ All CLI tools: `0` success, `2` usage error (bad flags/args), `1` operational
 failure (build/pack/verify/scan failed). `bytecode-scan`/`bytecode-dump
 --fail-on-scan-warning` exit `1` specifically when warnings were found, even
 though scanning itself succeeded.
+
+## Agentic control (CLI / MCP / API)
+
+The Rust workspace in `rust/` builds byte-compatible reimplementations of the
+standalone tools plus three agent-facing front-ends. Build them once:
+
+```bash
+cd rust && cargo build --release
+```
+
+`bytecode-doctor` reports whether these are present (look for the `rust …` and
+`agentic …` rows).
+
+### Unified CLI — `bytecode`
+
+One entry point over every tool (args pass through verbatim):
+
+```bash
+rust/target/release/bytecode --help          # list all tools
+rust/target/release/bytecode keygen
+rust/target/release/bytecode verify --decrypt-test <output-dir>
+rust/target/release/bytecode dump ...         # the PHP encoder, too
+```
+
+### MCP server — `php/bin/bytecode-mcp`
+
+A Model Context Protocol server over stdio (JSON-RPC 2.0) exposing every tool.
+Point an MCP client at the launcher (it execs the Rust binary):
+
+```json
+{ "mcpServers": { "bytecode": { "command": "/var/www/bytecode/php/bin/bytecode-mcp" } } }
+```
+
+Each tool takes `{ "args": [...], "stdin"?: "...", "env"?: { "KEY": "VALUE" } }`
+— the tool's full command line — so there is no capability subset.
+
+### HTTP API — `php/bin/bytecode-api`
+
+A locked-down local HTTP server. Set `BYTECODE_API_TOKEN` to require
+`Authorization: Bearer <token>`; it binds loopback only unless
+`BYTECODE_API_ALLOW_REMOTE=1`.
+
+```bash
+BYTECODE_API_TOKEN=secret php/bin/bytecode-api 127.0.0.1:8787 &
+curl -H "Authorization: Bearer secret" localhost:8787/tools
+curl -H "Authorization: Bearer secret" -X POST localhost:8787/tools/verify \
+     -d '{"args":["--decrypt-test","<output-dir>"],"env":{"BYTECODE_KEY":"<64hex>"}}'
+```
+
+Endpoints: `GET /health`, `GET /tools`, `POST /tools/<name>` → `{code, stdout, stderr}`.
+
+### Desktop app
+
+The encoder GUI has an **Agent Control** button (bottom-right): it generates an
+in-process key via the FFI library (`libbytecode_tools`), starts/stops the HTTP
+API with a generated token, and shows the MCP launch command to hand to an agent.

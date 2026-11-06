@@ -7,7 +7,7 @@ use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::exit;
 
-use bytecode_tools::{fail, random_bytes, repo_root};
+use bytecode_tools::{fail, ops, repo_root};
 
 fn usage() {
     eprintln!(
@@ -66,7 +66,7 @@ fn main() {
         }
     }
 
-    let key = hex::encode(random_bytes(32));
+    let key = ops::keygen_hex();
 
     match out {
         None => {
