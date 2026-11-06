@@ -3,9 +3,11 @@
 //! operation and returns a `Result` with the exact human-readable message the
 //! PHP/CLI tools emit on failure — callers decide how to render or exit.
 
+use std::collections::HashMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 
 use crate::*;
 
@@ -87,6 +89,44 @@ pub struct ToolOutput {
     pub stderr: String,
 }
 
+/// Environment keys an adapter (MCP/API) is permitted to forward to a tool.
+/// The bytecode tools only read `BYTECODE_*` / `OPDUMP_*` and `PHP_BIN`; anything
+/// else is rejected so a remote caller cannot smuggle in `PATH`, `LD_PRELOAD`,
+/// etc. NOTE: values forwarded here become process environment and are readable
+/// via `/proc/<pid>/environ` by the same OS user — pass secrets accordingly.
+pub fn is_allowed_env(key: &str) -> bool {
+    key.starts_with("BYTECODE_") || key.starts_with("OPDUMP_") || key == "PHP_BIN"
+}
+
+/// Cached `<tool> --help` text, used to enrich MCP/API tool descriptions.
+pub fn tool_help(tool: &str) -> String {
+    static CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    if let Some(h) = cache.lock().unwrap().get(tool) {
+        return h.clone();
+    }
+    let help = match run_tool(tool, &["--help".to_string()], None, &[]) {
+        Ok(o) => {
+            let t = if o.stdout.trim().is_empty() { o.stderr } else { o.stdout };
+            truncate_chars(t.trim(), 1500)
+        }
+        Err(_) => String::new(),
+    };
+    cache.lock().unwrap().insert(tool.to_string(), help.clone());
+    help
+}
+
+fn truncate_chars(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        return s.to_string();
+    }
+    let mut end = max;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &s[..end])
+}
+
 /// Run a tool to completion, capturing stdout/stderr. `stdin` is fed to the
 /// process; `envs` are overlaid on the current environment. Launch falls back
 /// to a sibling Rust binary if the PHP launcher is missing.
@@ -96,6 +136,11 @@ pub fn run_tool(
     stdin: Option<&[u8]>,
     envs: &[(String, String)],
 ) -> Result<ToolOutput, String> {
+    for (k, _) in envs {
+        if !is_allowed_env(k) {
+            return Err(format!("environment variable not permitted: {k}"));
+        }
+    }
     let (prog, pre) = resolve_tool(tool)?;
     let spawn = |prog: &str, pre: &[String]| -> std::io::Result<std::process::Child> {
         let mut cmd = Command::new(prog);
@@ -290,4 +335,68 @@ pub fn verify_one(
         size: c.bytes.len() as u64,
         payload_size,
     })
+}
+
+// ---------------------------------------------------------------------------
+// High-level encode pipeline (scan? -> dump -> verify?)
+// ---------------------------------------------------------------------------
+
+/// Run the encode pipeline in one call, aggregating each stage's output.
+///
+/// 1. If `scan_paths` is non-empty, run `scan` first; a non-zero scan aborts.
+/// 2. Run `dump` with `dump_args` (the encoder; produces the output tree).
+/// 3. If `verify_dir` is set, run `verify` on it (optionally `--decrypt-test`).
+///
+/// `verify_dir` is explicit (not parsed from `dump_args`) so the pipeline makes
+/// no assumptions about the encoder's flags. The returned `code` is the first
+/// non-zero stage code (0 if all stages pass).
+pub fn encode(
+    dump_args: &[String],
+    scan_paths: &[String],
+    verify_dir: Option<&str>,
+    decrypt_test: bool,
+    envs: &[(String, String)],
+) -> Result<ToolOutput, String> {
+    let mut out = String::new();
+    let mut err = String::new();
+
+    let append = |label: &str, o: &ToolOutput, out: &mut String, err: &mut String| {
+        out.push_str(&format!("=== {label} (exit {}) ===\n", o.code));
+        out.push_str(&o.stdout);
+        if !o.stdout.ends_with('\n') && !o.stdout.is_empty() {
+            out.push('\n');
+        }
+        if !o.stderr.trim().is_empty() {
+            err.push_str(&format!("=== {label} ===\n"));
+            err.push_str(&o.stderr);
+        }
+    };
+
+    if !scan_paths.is_empty() {
+        let o = run_tool("scan", scan_paths, None, envs)?;
+        append("scan", &o, &mut out, &mut err);
+        if o.code != 0 {
+            return Ok(ToolOutput { code: o.code, stdout: out, stderr: err });
+        }
+    }
+
+    let o = run_tool("dump", dump_args, None, envs)?;
+    append("dump", &o, &mut out, &mut err);
+    if o.code != 0 {
+        return Ok(ToolOutput { code: o.code, stdout: out, stderr: err });
+    }
+
+    let mut code = 0;
+    if let Some(dir) = verify_dir {
+        let mut vargs = Vec::new();
+        if decrypt_test {
+            vargs.push("--decrypt-test".to_string());
+        }
+        vargs.push(dir.to_string());
+        let o = run_tool("verify", &vargs, None, envs)?;
+        append("verify", &o, &mut out, &mut err);
+        code = o.code;
+    }
+
+    Ok(ToolOutput { code, stdout: out, stderr: err })
 }

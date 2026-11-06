@@ -104,16 +104,39 @@ fn tool_specs() -> Value {
         },
         "required": []
     });
-    let tools: Vec<Value> = ops::TOOLS
+    let mut tools: Vec<Value> = ops::TOOLS
         .iter()
         .map(|(name, desc)| {
+            let help = ops::tool_help(name);
+            let description = if help.is_empty() {
+                format!("{desc} Pass CLI args in `args`.")
+            } else {
+                format!("{desc} Pass CLI args in `args`.\n\nUsage:\n{help}")
+            };
             json!({
                 "name": *name,
-                "description": format!("{desc} Pass CLI args in `args` (e.g. run with [\"--help\"] to see usage)."),
+                "description": description,
                 "inputSchema": input_schema
             })
         })
         .collect();
+
+    // High-level pipeline tool (scan? -> dump -> verify?).
+    tools.push(json!({
+        "name": "encode",
+        "description": "Run the encode pipeline in one call: optional scan, then dump (the encoder), then optional verify of the output directory.",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dump_args": { "type": "array", "items": { "type": "string" }, "description": "arguments passed to the `dump` encoder" },
+                "scan_paths": { "type": "array", "items": { "type": "string" }, "description": "optional source paths to scan first; a scan failure aborts" },
+                "verify_dir": { "type": "string", "description": "optional output directory to verify after encoding" },
+                "decrypt_test": { "type": "boolean", "description": "with verify_dir, also AES-GCM-decrypt each container" },
+                "env": { "type": "object", "additionalProperties": { "type": "string" } }
+            },
+            "required": ["dump_args"]
+        }
+    }));
     Value::Array(tools)
 }
 
@@ -122,10 +145,14 @@ fn call_tool(params: &Value) -> Result<Value, String> {
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| "tools/call missing 'name'".to_string())?;
+    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
+
+    if name == "encode" {
+        return call_encode(&arguments);
+    }
     if !ops::is_tool(name) {
         return Err(format!("unknown tool: {name}"));
     }
-    let arguments = params.get("arguments").cloned().unwrap_or(json!({}));
 
     let args: Vec<String> = arguments
         .get("args")
@@ -146,7 +173,35 @@ fn call_tool(params: &Value) -> Result<Value, String> {
         .unwrap_or_default();
 
     let output = ops::run_tool(name, &args, stdin.as_deref(), &envs)?;
+    Ok(format_output(&output))
+}
 
+fn call_encode(arguments: &Value) -> Result<Value, String> {
+    let string_array = |key: &str| -> Result<Vec<String>, String> {
+        match arguments.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|x| x.as_str().map(str::to_string).ok_or_else(|| format!("{key} must be strings")))
+                .collect(),
+            _ => Err(format!("{key} must be an array of strings")),
+        }
+    };
+    let dump_args = string_array("dump_args")?;
+    let scan_paths = string_array("scan_paths")?;
+    let verify_dir = arguments.get("verify_dir").and_then(Value::as_str).map(str::to_string);
+    let decrypt_test = arguments.get("decrypt_test").and_then(Value::as_bool).unwrap_or(false);
+    let envs: Vec<(String, String)> = arguments
+        .get("env")
+        .and_then(Value::as_object)
+        .map(|m| m.iter().filter_map(|(k, v)| v.as_str().map(|s| (k.clone(), s.to_string()))).collect())
+        .unwrap_or_default();
+
+    let output = ops::encode(&dump_args, &scan_paths, verify_dir.as_deref(), decrypt_test, &envs)?;
+    Ok(format_output(&output))
+}
+
+fn format_output(output: &ops::ToolOutput) -> Value {
     let mut text = format!("exit_code: {}\n", output.code);
     if !output.stdout.trim().is_empty() {
         text.push_str("--- stdout ---\n");
@@ -159,7 +214,7 @@ fn call_tool(params: &Value) -> Result<Value, String> {
         text.push_str("--- stderr ---\n");
         text.push_str(&output.stderr);
     }
-    Ok(text_result(text, output.code != 0))
+    text_result(text, output.code != 0)
 }
 
 fn project_version() -> String {

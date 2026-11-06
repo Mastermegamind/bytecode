@@ -186,6 +186,7 @@ fn project_version() -> String {
 }
 
 fn main() {
+    bytecode_tools::reset_sigpipe();
     let argv: Vec<String> = std::env::args().collect();
     let args = &argv[1..];
     let is_help = args.len() == 1 && matches!(args[0].as_str(), "-h" | "--help");

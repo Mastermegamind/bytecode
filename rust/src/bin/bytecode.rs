@@ -23,6 +23,10 @@ fn usage() {
         eprintln!("  {name:<16} {desc}");
     }
     eprintln!();
+    eprintln!();
+    eprintln!("Pipelines:");
+    eprintln!("  {:<16} scan? -> dump -> verify?: bytecode encode [--scan P].. [--verify-dir D] [--decrypt-test] -- <dump args..>", "encode");
+    eprintln!();
     eprintln!("Servers:");
     eprintln!("  {:<16} launch the MCP server (stdio) for agentic control", "mcp");
     eprintln!("  {:<16} launch the HTTP API server (default 127.0.0.1:8787)", "api [addr]");
@@ -50,7 +54,53 @@ fn exec(mut cmd: Command) -> ! {
     }
 }
 
+/// `bytecode encode [--scan P]... [--verify-dir D] [--decrypt-test] [--] <dump args...>`
+fn run_encode(rest: &[String]) -> ! {
+    let mut scan_paths: Vec<String> = Vec::new();
+    let mut verify_dir: Option<String> = None;
+    let mut decrypt = false;
+    let mut dump_args: Vec<String> = Vec::new();
+    let mut it = rest.iter().cloned();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--scan" => match it.next() {
+                Some(p) => scan_paths.push(p),
+                None => {
+                    eprintln!("bytecode encode: --scan requires a path");
+                    exit(2);
+                }
+            },
+            "--verify-dir" => match it.next() {
+                Some(d) => verify_dir = Some(d),
+                None => {
+                    eprintln!("bytecode encode: --verify-dir requires a path");
+                    exit(2);
+                }
+            },
+            "--decrypt-test" => decrypt = true,
+            "--" => {
+                dump_args.extend(it.by_ref());
+                break;
+            }
+            _ => dump_args.push(a),
+        }
+    }
+    match ops::encode(&dump_args, &scan_paths, verify_dir.as_deref(), decrypt, &[]) {
+        Ok(o) => {
+            print!("{}", o.stdout);
+            eprint!("{}", o.stderr);
+            exit(o.code);
+        }
+        Err(e) => {
+            eprintln!("bytecode encode: {e}");
+            exit(1);
+        }
+    }
+}
+
 fn main() {
+    bytecode_tools::reset_sigpipe();
+
     let argv: Vec<String> = std::env::args().collect();
     if argv.len() < 2 || matches!(argv[1].as_str(), "-h" | "--help" | "help") {
         usage();
@@ -65,6 +115,11 @@ fn main() {
         let mut cmd = Command::new(sibling(&format!("bytecode-{sub}")));
         cmd.args(rest);
         exec(cmd);
+    }
+
+    // High-level encode pipeline: scan? -> dump -> verify?.
+    if sub == "encode" {
+        run_encode(rest);
     }
 
     // Any registered tool: resolve (PHP launcher is Rust-first) and exec,

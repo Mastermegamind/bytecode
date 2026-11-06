@@ -2,8 +2,9 @@
 //! runtime) exposing the bytecode tools for agentic control, matching the CLI
 //! and MCP surfaces.
 //!
-//! Set BYTECODE_API_TOKEN to require `Authorization: Bearer <token>` on every
-//! request. With no token, local requests are unauthenticated.
+//! Auth is default-deny: BYTECODE_API_TOKEN is REQUIRED and the server refuses
+//! to start without it. Every request must send `Authorization: Bearer <token>`.
+//! (Env values forwarded to tools are readable via /proc by the same OS user.)
 //!
 //! Network policy:
 //!   * It binds loopback only (127.0.0.1 / ::1). Binding any other address is
@@ -27,9 +28,13 @@ use serde_json::{json, Value};
 fn main() {
     let addr = std::env::args().nth(1).unwrap_or_else(|| "127.0.0.1:8787".to_string());
 
+    // Default-deny: a bearer token is mandatory.
     let token = match std::env::var("BYTECODE_API_TOKEN") {
-        Ok(t) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic()) => Some(t),
-        Err(std::env::VarError::NotPresent) => None,
+        Ok(t) if !t.is_empty() && t.bytes().all(|b| b.is_ascii_graphic()) => t,
+        Err(std::env::VarError::NotPresent) => {
+            eprintln!("bytecode-api: BYTECODE_API_TOKEN is required (default-deny); set a bearer token before starting");
+            std::process::exit(1);
+        }
         _ => {
             eprintln!("bytecode-api: BYTECODE_API_TOKEN must be a nonempty ASCII token without spaces");
             std::process::exit(1);
@@ -54,14 +59,13 @@ fn main() {
             std::process::exit(1);
         }
     };
-    eprintln!("bytecode-api listening on http://{} ({} tools, bearer auth {})",
-        listener.local_addr().unwrap(), ops::TOOLS.len(),
-        if token.is_some() { "enabled" } else { "disabled" });
+    eprintln!("bytecode-api listening on http://{} ({} tools, bearer auth required)",
+        listener.local_addr().unwrap(), ops::TOOLS.len());
 
     for stream in listener.incoming() {
         let Ok(stream) = stream else { continue };
         // Serial execution keeps the number of connections and tool processes bounded.
-        if let Err(e) = handle(stream, token.as_deref()) {
+        if let Err(e) = handle(stream, &token) {
             eprintln!("bytecode-api: connection failed: {e}");
         }
     }
@@ -135,7 +139,7 @@ fn read_request(input: impl Read) -> std::io::Result<Request> {
     Ok(Request { method: parts[0].into(), path: parts[1].into(), auth, body })
 }
 
-fn handle(mut stream: TcpStream, token: Option<&str>) -> std::io::Result<()> {
+fn handle(mut stream: TcpStream, token: &str) -> std::io::Result<()> {
     stream.set_read_timeout(Some(Duration::from_secs(10)))?;
     stream.set_write_timeout(Some(Duration::from_secs(10)))?;
     let req = match read_request(&stream) {
@@ -143,12 +147,13 @@ fn handle(mut stream: TcpStream, token: Option<&str>) -> std::io::Result<()> {
         Err(_) => return respond(&mut stream, 400, &json!({ "error": "bad request" })),
     };
 
-    let authorized = token.map(|expected| {
-        req.auth.as_deref().and_then(|a| a.split_once(' '))
-            .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
-            .map(|(_, supplied)| bytecode_tools::ct_eq(supplied, expected))
-            .unwrap_or(false)
-    }).unwrap_or(true);
+    let authorized = req
+        .auth
+        .as_deref()
+        .and_then(|a| a.split_once(' '))
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("Bearer"))
+        .map(|(_, supplied)| bytecode_tools::ct_eq(supplied, token))
+        .unwrap_or(false);
     if !authorized {
         return respond(&mut stream, 401, &json!({ "error": "unauthorized" }));
     }
@@ -156,9 +161,17 @@ fn handle(mut stream: TcpStream, token: Option<&str>) -> std::io::Result<()> {
     match (req.method.as_str(), req.path.as_str()) {
         ("GET", "/health") => respond(&mut stream, 200, &json!({ "ok": true, "version": project_version() })),
         ("GET", "/tools") => {
-            let tools: Vec<Value> = ops::TOOLS.iter().map(|(n, d)| json!({ "name": n, "description": d })).collect();
+            let mut tools: Vec<Value> = ops::TOOLS
+                .iter()
+                .map(|(n, d)| json!({ "name": n, "description": d, "help": ops::tool_help(n) }))
+                .collect();
+            tools.push(json!({
+                "name": "encode",
+                "description": "Pipeline: scan? -> dump -> verify?. Body: {\"dump_args\":[],\"scan_paths\":[],\"verify_dir\":\"\",\"decrypt_test\":false,\"env\":{}}"
+            }));
             respond(&mut stream, 200, &Value::Array(tools))
         }
+        ("POST", "/tools/encode") => encode_endpoint(&mut stream, &req.body),
         ("POST", p) if p.starts_with("/tools/") => run_tool_endpoint(&mut stream, &p["/tools/".len()..], &req.body),
         _ => respond(&mut stream, 404, &json!({ "error": "not found" })),
     }
@@ -183,6 +196,60 @@ fn run_tool_endpoint(stream: &mut TcpStream, name: &str, body: &[u8]) -> std::io
     };
 
     match ops::run_tool(name, &args, stdin.as_deref().map(str::as_bytes), &envs) {
+        Ok(o) => respond(stream, 200, &json!({ "code": o.code, "stdout": o.stdout, "stderr": o.stderr })),
+        Err(e) => respond(stream, 500, &json!({ "error": e })),
+    }
+}
+
+fn encode_endpoint(stream: &mut TcpStream, body: &[u8]) -> std::io::Result<()> {
+    let v: Value = if body.is_empty() {
+        json!({})
+    } else {
+        match serde_json::from_slice(body) {
+            Ok(v) => v,
+            Err(e) => return respond(stream, 400, &json!({ "error": format!("invalid JSON body: {e}") })),
+        }
+    };
+    let string_array = |key: &str| -> Result<Vec<String>, String> {
+        match v.get(key) {
+            None | Some(Value::Null) => Ok(Vec::new()),
+            Some(Value::Array(a)) => a
+                .iter()
+                .map(|x| x.as_str().map(str::to_string).ok_or_else(|| format!("{key} must be strings")))
+                .collect(),
+            _ => Err(format!("{key} must be an array of strings")),
+        }
+    };
+    let dump_args = match string_array("dump_args") {
+        Ok(a) => a,
+        Err(e) => return respond(stream, 400, &json!({ "error": e })),
+    };
+    let scan_paths = match string_array("scan_paths") {
+        Ok(a) => a,
+        Err(e) => return respond(stream, 400, &json!({ "error": e })),
+    };
+    let verify_dir = v.get("verify_dir").and_then(Value::as_str).map(str::to_string);
+    let decrypt_test = v.get("decrypt_test").and_then(Value::as_bool).unwrap_or(false);
+
+    let mut envs = Vec::new();
+    if let Some(obj) = v.get("env") {
+        match obj.as_object() {
+            Some(m) => {
+                for (k, val) in m {
+                    let Some(val) = val.as_str() else {
+                        return respond(stream, 400, &json!({ "error": "env values must be strings" }));
+                    };
+                    if k.is_empty() || k.contains(['=', '\0']) || val.contains('\0') {
+                        return respond(stream, 400, &json!({ "error": "invalid environment entry" }));
+                    }
+                    envs.push((k.clone(), val.to_string()));
+                }
+            }
+            None => return respond(stream, 400, &json!({ "error": "env must be an object of strings" })),
+        }
+    }
+
+    match ops::encode(&dump_args, &scan_paths, verify_dir.as_deref(), decrypt_test, &envs) {
         Ok(o) => respond(stream, 200, &json!({ "code": o.code, "stdout": o.stdout, "stderr": o.stderr })),
         Err(e) => respond(stream, 500, &json!({ "error": e })),
     }

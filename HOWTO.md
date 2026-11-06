@@ -955,6 +955,8 @@ rust/target/release/bytecode --help          # list all tools
 rust/target/release/bytecode keygen
 rust/target/release/bytecode verify --decrypt-test <output-dir>
 rust/target/release/bytecode dump ...         # the PHP encoder, too
+# one-shot pipeline (scan? -> dump -> verify?):
+rust/target/release/bytecode encode --verify-dir <out> --decrypt-test -- --out <out> <sources...>
 ```
 
 ### MCP server — `php/bin/bytecode-mcp`
@@ -971,9 +973,13 @@ Each tool takes `{ "args": [...], "stdin"?: "...", "env"?: { "KEY": "VALUE" } }`
 
 ### HTTP API — `php/bin/bytecode-api`
 
-A locked-down local HTTP server. Set `BYTECODE_API_TOKEN` to require
-`Authorization: Bearer <token>`; it binds loopback only unless
-`BYTECODE_API_ALLOW_REMOTE=1`.
+A locked-down local HTTP server. It is **default-deny**: `BYTECODE_API_TOKEN` is
+required (it refuses to start without one) and every request must send
+`Authorization: Bearer <token>`. It binds loopback only unless
+`BYTECODE_API_ALLOW_REMOTE=1`. Adapters only forward `BYTECODE_*` / `OPDUMP_*` /
+`PHP_BIN` env to tools; forwarded values are visible via `/proc` to the same OS
+user. There is also a `POST /tools/encode` pipeline endpoint
+(`{dump_args, scan_paths, verify_dir, decrypt_test, env}`).
 
 ```bash
 BYTECODE_API_TOKEN=secret php/bin/bytecode-api 127.0.0.1:8787 &
@@ -989,3 +995,8 @@ Endpoints: `GET /health`, `GET /tools`, `POST /tools/<name>` → `{code, stdout,
 The encoder GUI has an **Agent Control** button (bottom-right): it generates an
 in-process key via the FFI library (`libbytecode_tools`), starts/stops the HTTP
 API with a generated token, and shows the MCP launch command to hand to an agent.
+
+See also: [`docs/CONTAINER-FORMAT.md`](docs/CONTAINER-FORMAT.md) for the on-disk
+format/crypto contract, and `php/tests/run-rust-parity.sh` (run in CI via
+`.github/workflows/rust.yml`) which proves the PHP and Rust tools stay
+byte-compatible.

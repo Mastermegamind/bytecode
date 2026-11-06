@@ -20,6 +20,7 @@ fn usage() {
 }
 
 fn main() {
+    bytecode_tools::reset_sigpipe();
     let argv: Vec<String> = std::env::args().collect();
     let args: Vec<String> = argv[1..].to_vec();
 

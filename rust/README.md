@@ -150,6 +150,7 @@ bytecode keygen
 bytecode pack app.opd2 app.bytc
 bytecode verify --decrypt-test out/
 bytecode dump ...            # the PHP encoder, reachable too
+bytecode encode --verify-dir out --decrypt-test -- --out out src/  # scan?->dump->verify?
 bytecode mcp                 # launch the MCP server
 bytecode api 127.0.0.1:8787  # launch the HTTP API
 bytecode --help              # lists all tools
@@ -166,7 +167,12 @@ surface. Register it with an MCP client, e.g.:
 { "mcpServers": { "bytecode": { "command": "/path/to/bytecode-mcp" } } }
 ```
 
-Implements `initialize`, `tools/list`, `tools/call`, `ping`.
+Each tool's `tools/list` description includes its cached `--help`. A high-level
+`encode` tool runs the whole pipeline in one call
+(`{ "dump_args":[..], "scan_paths"?:[..], "verify_dir"?:"..", "decrypt_test"?:bool, "env"?:{..} }`).
+Adapters only forward `BYTECODE_*` / `OPDUMP_*` / `PHP_BIN` env to tools; other
+keys are rejected (and forwarded values are visible via `/proc` to the same OS
+user). Implements `initialize`, `tools/list`, `tools/call`, `ping`.
 
 ### HTTP API — `bytecode-api` (locked down)
 
@@ -183,4 +189,11 @@ curl -H "Authorization: Bearer secret" -X POST localhost:8787/tools/verify \
      -d '{"args":["--decrypt-test","out/"],"env":{"BYTECODE_KEY":"<64hex>"}}'
 ```
 
-Endpoints: `GET /health`, `GET /tools`, `POST /tools/<name>` → `{code, stdout, stderr}`.
+Endpoints: `GET /health`, `GET /tools` (incl. per-tool `--help`), `POST
+/tools/<name>` → `{code, stdout, stderr}`, and `POST /tools/encode`
+(`{dump_args, scan_paths, verify_dir, decrypt_test, env}`) for the pipeline. The
+same `BYTECODE_*`/`OPDUMP_*`/`PHP_BIN` env allowlist applies.
+
+The on-disk format/crypto contract is specified in
+[`../docs/CONTAINER-FORMAT.md`](../docs/CONTAINER-FORMAT.md); PHP↔Rust parity is
+enforced by `php/tests/run-rust-parity.sh` and the `rust-tools` CI workflow.

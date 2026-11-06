@@ -23,6 +23,26 @@ pub fn fail(msg: impl AsRef<str>) -> ! {
     exit(1);
 }
 
+/// Restore the default SIGPIPE disposition for CLI tools. Rust sets SIGPIPE to
+/// SIG_IGN at startup, which turns a closed stdout (e.g. `bytecode --help |
+/// head`) into an EPIPE that `println!`/`eprintln!` then panics on (exit 101).
+/// Resetting to SIG_DFL makes the process terminate quietly instead.
+///
+/// NOTE: do not call this in a long-lived socket server (e.g. the HTTP API):
+/// there SIG_IGN is what lets a client disconnect surface as an `io::Error`
+/// rather than killing the whole process.
+pub fn reset_sigpipe() {
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn signal(signum: i32, handler: usize) -> usize;
+        }
+        const SIGPIPE: i32 = 13;
+        const SIG_DFL: usize = 0;
+        signal(SIGPIPE, SIG_DFL);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Little-endian reader (mirrors u32le / u64le / take in bytecode-verify)
 // ---------------------------------------------------------------------------

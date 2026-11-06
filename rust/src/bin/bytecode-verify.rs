@@ -72,6 +72,7 @@ fn is_file(p: &Path) -> bool {
 }
 
 fn main() {
+    bytecode_tools::reset_sigpipe();
     let argv: Vec<String> = std::env::args().collect();
     let mut args: Vec<String> = argv[1..].to_vec();
 

@@ -30,6 +30,7 @@ fn chmod_600(path: &Path) {
 fn chmod_600(_path: &Path) {}
 
 fn main() {
+    bytecode_tools::reset_sigpipe();
     let argv: Vec<String> = std::env::args().collect();
     let mut args: VecDeque<String> = argv[1..].iter().cloned().collect();
 

@@ -1,0 +1,56 @@
+name: rust-tools
+
+on:
+  push:
+    paths:
+      - 'rust/**'
+      - 'php/bin/**'
+      - 'php/tests/run-rust-parity.sh'
+      - '.github/workflows/rust.yml'
+  pull_request:
+    paths:
+      - 'rust/**'
+      - 'php/bin/**'
+      - 'php/tests/run-rust-parity.sh'
+      - '.github/workflows/rust.yml'
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          extensions: openssl
+
+      # Style gates. Non-blocking for now (promote to hard gates once the tree
+      # has been run through rustfmt locally); they still surface issues in logs.
+      - name: cargo fmt --check
+        working-directory: rust
+        run: cargo fmt --all --check
+        continue-on-error: true
+
+      - name: cargo clippy
+        working-directory: rust
+        run: cargo clippy --all-targets -- -D warnings
+        continue-on-error: true
+
+      # Hard gates: the build, unit tests, and PHP<->Rust byte-compatibility.
+      - name: cargo build
+        working-directory: rust
+        run: cargo build --release
+
+      - name: cargo test
+        working-directory: rust
+        run: cargo test --release
+
+      - name: php <-> rust parity
+        env:
+          PHP_BIN: php
+        run: bash php/tests/run-rust-parity.sh
