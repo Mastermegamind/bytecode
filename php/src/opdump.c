@@ -2091,11 +2091,42 @@ static void opdump_free_ast(zend_ast *ast)
  * with a computed callable, a variable holding the string "compact") past
  * one level of indirection; those opcodes (INIT_DYNAMIC_CALL/INIT_USER_CALL)
  * are conservatively treated as unsafe outright rather than attempted. */
+/* Case-insensitive match of a NUL-terminated C string against a lowercase
+ * literal, without relying on strcasecmp/feature-test macros. */
+static bool opdump_ci_equals(const char *s, const char *lower_lit)
+{
+    for (; *lower_lit; s++, lower_lit++) {
+        unsigned char c = (unsigned char) *s;
+        if (c >= 'A' && c <= 'Z') {
+            c = (unsigned char) (c + 32);
+        }
+        if (c != (unsigned char) *lower_lit) {
+            return false;
+        }
+    }
+    return *s == '\0';
+}
+
 static bool opdump_is_dynamic_var_fname(zend_string *fname)
 {
-    return zend_string_equals_literal_ci(fname, "compact")
-        || zend_string_equals_literal_ci(fname, "extract")
-        || zend_string_equals_literal_ci(fname, "get_defined_vars");
+    /* Compare the unqualified trailing segment: an unqualified call inside a
+     * namespace compiles to ZEND_INIT_NS_FCALL_BY_NAME whose name literal is
+     * the *qualified* name (e.g. "Demo\\compact"), so a whole-string compare
+     * against "compact" would miss it and wrongly scramble a function that
+     * reads locals by name. Matching the tail also catches a user alias that
+     * resolves to these; over-matching only makes us skip obfuscation, which is
+     * the safe ("fail safe, not fail clever") direction. */
+    const char *s = ZSTR_VAL(fname);
+    size_t len = ZSTR_LEN(fname);
+    const char *tail = s;
+    for (size_t i = 0; i < len; i++) {
+        if (s[i] == '\\') {
+            tail = s + i + 1;
+        }
+    }
+    return opdump_ci_equals(tail, "compact")
+        || opdump_ci_equals(tail, "extract")
+        || opdump_ci_equals(tail, "get_defined_vars");
 }
 
 static bool opdump_op_array_uses_dynamic_vars(zend_op_array *op_array)

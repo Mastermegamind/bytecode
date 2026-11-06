@@ -962,7 +962,12 @@ if (($scannerConfig['fail_on_warning'] ?? false) === true) {
 $scriptDir = __DIR__;
 $phpBin = $phpBinOption ?: (getenv('PHP_BIN') ?: 'php8.4');
 $defaultSoName = PHP_OS_FAMILY === 'Windows' ? 'opdump.dll' : 'opdump.so';
-$opdumpSo = $opdumpSoOption ?: (getenv('OPDUMP_SO') ?: $scriptDir . '/../src/modules/' . $defaultSoName);
+$opdumpSo = resolve_opdump_so(
+    $opdumpSoOption ?: (getenv('OPDUMP_SO') ?: null),
+    $scriptDir,
+    $phpBin,
+    $defaultSoName
+);
 $packer = $scriptDir . '/bytecode-pack';
 $assetPacker = $scriptDir . '/bytecode-pack-asset';
 $scanner = $scriptDir . '/bytecode-scan';
@@ -997,6 +1002,84 @@ function php_version_id(string $phpBin): int
     fclose($pipes[2]);
     proc_close($proc);
     return (int) trim($stdout);
+}
+
+/**
+ * Does $phpBin's dumper .so actually DUMP? A Zend-API mismatch still "loads"
+ * the file as a plain module (extension_loaded() returns true) but leaves the
+ * compile hook inactive, so the only reliable probe is to attempt a real dump
+ * of a trivial file (the same OPDUMP_MODE/OPDUMP_OUT path the encoder uses) and
+ * confirm an OPD2 blob was written.
+ */
+function opdump_can_dump(string $phpBin, string $so): bool
+{
+    if (!is_file($so)) {
+        return false;
+    }
+    $probeSrc = tempnam(sys_get_temp_dir(), 'opd-probe-src');
+    $probeOut = tempnam(sys_get_temp_dir(), 'opd-probe-out');
+    if ($probeSrc === false || $probeOut === false) {
+        return false;
+    }
+    file_put_contents($probeSrc, "<?php \$x = 1;\n");
+    @unlink($probeOut); // let the extension create it
+
+    $env = getenv();
+    $env['OPDUMP_MODE'] = 'dump';
+    $env['OPDUMP_OUT'] = $probeOut;
+
+    $descriptors = [0 => ['pipe', 'r'], 1 => ['pipe', 'w'], 2 => ['pipe', 'w']];
+    $proc = @proc_open(
+        [$phpBin, '-n', '-d', "extension={$so}", '-l', $probeSrc],
+        $descriptors,
+        $pipes,
+        null,
+        $env
+    );
+    if (is_resource($proc)) {
+        fclose($pipes[0]);
+        stream_get_contents($pipes[1]);
+        stream_get_contents($pipes[2]);
+        fclose($pipes[1]);
+        fclose($pipes[2]);
+        proc_close($proc);
+    }
+
+    $ok = is_file($probeOut)
+        && strncmp((string) @file_get_contents($probeOut, false, null, 0, 4), 'OPD2', 4) === 0;
+    @unlink($probeSrc);
+    @unlink($probeOut);
+    return $ok;
+}
+
+/**
+ * Pick a dumper extension whose Zend API matches the target PHP. An explicit
+ * --opdump-so / OPDUMP_SO wins untouched. Otherwise prefer a freshly built
+ * php/src/modules/opdump.so, then the version-matched prebuilt in
+ * build/loaders/opdump-php<MAJ.MIN>.so, verifying each actually loads.
+ */
+function resolve_opdump_so(?string $explicit, string $scriptDir, string $phpBin, string $defaultSoName): string
+{
+    if ($explicit !== null && $explicit !== '') {
+        return $explicit;
+    }
+    $built = $scriptDir . '/../src/modules/' . $defaultSoName;
+    $repoRoot = dirname($scriptDir, 2);
+    $verId = php_version_id($phpBin);
+    $maj = intdiv($verId, 10000);
+    $min = intdiv($verId % 10000, 100);
+    $prebuilt = $repoRoot . '/build/loaders/opdump-php' . $maj . '.' . $min
+        . (PHP_OS_FAMILY === 'Windows' ? '.dll' : '.so');
+
+    foreach ([$built, $prebuilt] as $candidate) {
+        $resolved = is_file($candidate) ? (realpath($candidate) ?: $candidate) : $candidate;
+        if (opdump_can_dump($phpBin, $resolved)) {
+            return $resolved;
+        }
+    }
+    // Nothing loaded cleanly; return the conventional path so the regular
+    // "opdump extension not found / failed" diagnostics report it.
+    return $built;
 }
 
 $phpVersionId = php_version_id($phpBin);
