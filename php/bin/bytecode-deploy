@@ -160,6 +160,16 @@ if (!preg_match('/\A([^:]+):(.+)\z/', $target, $m)) {
 $ssh = $m[1];
 $remoteApp = rtrim($m[2], '/');
 
+// Per-run, unpredictable remote temp namespace. Fixed /tmp names were a
+// symlink/clobber/race vector on multi-tenant hosts, and decrypted ("staged")
+// bytecode transits here, so the directory is created mode 0700 and the
+// plaintext output is removed as soon as it has been rsynced into place.
+$runId = bin2hex(random_bytes(8));
+$remoteTmp = '/tmp/bytecode-deploy.' . $runId;
+$remoteStageOut = $remoteTmp . '/stage-out';
+$remoteHealthchecks = $remoteTmp . '/healthchecks.txt';
+$remoteRunnerLog = $remoteTmp . '/stage-runner.log';
+
 if ($rollback) {
     $remote = 'set -e; backup_dir=' . escapeshellarg($remoteApp . '.bytecode-backups')
         . '; latest=$(ls -1dt "$backup_dir"/* 2>/dev/null | head -1)'
@@ -195,19 +205,21 @@ foreach ([
         array_push($dumpArgs, $opt, $value);
     }
 }
-$remote = 'set -e; cd ' . escapeshellarg($stage)
-    . '; if [ -f bytecode.json ]; then php8.4 -r ' . escapeshellarg('$j=json_decode(file_get_contents("bytecode.json"),true); if(isset($j["healthchecks"])&&is_array($j["healthchecks"])) echo implode(",", $j["healthchecks"]);') . ' > /tmp/bytecode-healthchecks.txt; fi'
-    . '; rm -rf /tmp/bytecode-stage-out'
+$remote = 'set -e; install -d -m 700 ' . escapeshellarg($remoteTmp)
+    . '; cd ' . escapeshellarg($stage)
+    . '; if [ -f bytecode.json ]; then php8.4 -r ' . escapeshellarg('$j=json_decode(file_get_contents("bytecode.json"),true); if(isset($j["healthchecks"])&&is_array($j["healthchecks"])) echo implode(",", $j["healthchecks"]);') . ' > ' . escapeshellarg($remoteHealthchecks) . '; fi'
+    . '; rm -rf ' . escapeshellarg($remoteStageOut)
     . '; BYTECODE_VENDOR_KEY_FILE=' . escapeshellarg($bytecodeRoot . '/build/vendor-secret.key')
     . ' php8.4 ' . escapeshellarg($bytecodeRoot . '/php/bin/bytecode-dump') . ' '
     . implode(' ', array_map('escapeshellarg', $dumpArgs))
-    . ' ' . escapeshellarg($stage) . ' /tmp/bytecode-stage-out'
-    . '; php8.4 ' . escapeshellarg($bytecodeRoot . '/php/bin/bytecode-verify') . ' --decrypt-test /tmp/bytecode-stage-out'
-    . '; rsync -a /tmp/bytecode-stage-out/ ' . escapeshellarg($stage) . '/';
+    . ' ' . escapeshellarg($stage) . ' ' . escapeshellarg($remoteStageOut)
+    . '; php8.4 ' . escapeshellarg($bytecodeRoot . '/php/bin/bytecode-verify') . ' --decrypt-test ' . escapeshellarg($remoteStageOut)
+    . '; rsync -a ' . escapeshellarg($remoteStageOut . '/') . ' ' . escapeshellarg($stage) . '/'
+    . '; rm -rf ' . escapeshellarg($remoteStageOut);
 run(['ssh', $ssh, $remote]);
 
 if ($routes === []) {
-    $routeCapture = trim(shell_exec('ssh ' . escapeshellarg($ssh) . ' ' . escapeshellarg('cat /tmp/bytecode-healthchecks.txt 2>/dev/null || true')) ?: '');
+    $routeCapture = trim(shell_exec('ssh ' . escapeshellarg($ssh) . ' ' . escapeshellarg('cat ' . escapeshellarg($remoteHealthchecks) . ' 2>/dev/null || true')) ?: '');
     if ($routeCapture !== '') {
         $routes = array_filter(array_map('trim', explode(',', $routeCapture)));
     }
@@ -216,12 +228,14 @@ if ($routes === []) {
 if ($startRunner) {
     $tag = 'bytecode-stage-runner-' . preg_replace('/[^0-9A-Za-z_.-]/', '_', $port);
     $relayPort = '6' . substr($port, -3);
-    $remote = 'set -e; cd ' . escapeshellarg($stage)
+    $runnerLog = escapeshellarg($remoteRunnerLog);
+    $remote = 'set -e; install -d -m 700 ' . escapeshellarg($remoteTmp)
+        . '; cd ' . escapeshellarg($stage)
         . '; pkill -f ' . escapeshellarg($tag) . ' 2>/dev/null || true'
         . '; export OPDUMP_MACHINE_ID=' . escapeshellarg($machineId ?? '')
-        . '; if [ -x ./rr ] && [ -f .rr.yaml ]; then sed -e ' . escapeshellarg('s/0.0.0.0:[0-9][0-9]*/127.0.0.1:' . $port . '/') . ' -e ' . escapeshellarg('s/127.0.0.1:[0-9][0-9]*/127.0.0.1:' . $relayPort . '/') . ' .rr.yaml > .rr-bytecode-stage.yaml; BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup ./rr serve -c .rr-bytecode-stage.yaml >/tmp/bytecode-stage-runner.log 2>&1 &'
-        . '; elif [ -f artisan ] || [ -f public/index.php ]; then BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup php8.4 -S 127.0.0.1:' . $port . ' -t public >/tmp/bytecode-stage-runner.log 2>&1 &'
-        . '; else BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup php8.4 -S 127.0.0.1:' . $port . ' >/tmp/bytecode-stage-runner.log 2>&1 & fi'
+        . '; if [ -x ./rr ] && [ -f .rr.yaml ]; then sed -e ' . escapeshellarg('s/0.0.0.0:[0-9][0-9]*/127.0.0.1:' . $port . '/') . ' -e ' . escapeshellarg('s/127.0.0.1:[0-9][0-9]*/127.0.0.1:' . $relayPort . '/') . ' .rr.yaml > .rr-bytecode-stage.yaml; BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup ./rr serve -c .rr-bytecode-stage.yaml >' . $runnerLog . ' 2>&1 &'
+        . '; elif [ -f artisan ] || [ -f public/index.php ]; then BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup php8.4 -S 127.0.0.1:' . $port . ' -t public >' . $runnerLog . ' 2>&1 &'
+        . '; else BYTECODE_STAGE_RUNNER=' . escapeshellarg($tag) . ' nohup php8.4 -S 127.0.0.1:' . $port . ' >' . $runnerLog . ' 2>&1 & fi'
         . '; sleep 2; echo ' . escapeshellarg("stage runner attempted on 127.0.0.1:{$port}");
     run(['ssh', $ssh, $remote]);
 }

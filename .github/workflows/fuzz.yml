@@ -1,0 +1,68 @@
+name: Deserializer fuzz smoke
+
+on:
+  pull_request:
+    paths:
+      - 'php/src/**'
+      - 'php/tests/fuzz/**'
+      - '.github/workflows/fuzz.yml'
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - 'php/src/**'
+      - 'php/tests/fuzz/**'
+      - '.github/workflows/fuzz.yml'
+
+jobs:
+  fuzz-smoke:
+    name: AFL + ASan smoke
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.4'
+          tools: phpize, php-config
+          coverage: none
+
+      - name: Install build + fuzzing dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential autoconf pkg-config libssl-dev \
+            clang llvm afl++
+
+      - name: Build instrumented (ASan/UBSan) loader
+        run: |
+          so=$(php/tests/fuzz/build-fuzzer.sh php-config | tail -1)
+          echo "OPDUMP_SO=$so" >> "$GITHUB_ENV"
+
+      - name: Generate seed corpus
+        run: php/tests/fuzz/make-seeds.sh "$OPDUMP_SO"
+
+      - name: Short fuzz campaign (120s)
+        env:
+          AFL_SKIP_CPUFREQ: '1'
+          AFL_BENCH_UNTIL_CRASH: '1'
+        run: php/tests/fuzz/run-fuzz.sh fuzz "$OPDUMP_SO" 120
+
+      # Blocking: the known parse/teardown backlog is fixed (see
+      # php/tests/fuzz/README.md "Findings fixed with this harness"), so any
+      # crash the smoke campaign saves is a regression and fails the build.
+      - name: Fail if crashes were found
+        run: |
+          crashes=$(find php/tests/fuzz/findings -path '*/crashes/id:*' 2>/dev/null | wc -l)
+          echo "::notice::fuzz smoke saved $crashes crash input(s)"
+          test "$crashes" -eq 0
+
+      - name: Upload findings
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-findings
+          path: php/tests/fuzz/findings/
+          if-no-files-found: ignore

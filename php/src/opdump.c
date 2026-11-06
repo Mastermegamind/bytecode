@@ -219,6 +219,12 @@ static FILE *opdump_fmemopen(const void *buf, size_t len, const char *mode)
 #define OPDUMP_MAX_CLASS_METHODS 10000u
 #define OPDUMP_MAX_CLASS_PROPERTIES 10000u
 #define OPDUMP_MAX_TRY_CATCH 100000u
+/* run_time_cache is a per-op_array byte buffer (ecalloc'd at load). The real
+ * Zend compiler sizes it from the opcode/CV/literal counts, all already capped
+ * above, so a legitimate value is far below this. Bounding it keeps a crafted
+ * container from driving a multi-gigabyte allocation -- the one input-derived
+ * count that was previously only checked for non-negativity. */
+#define OPDUMP_MAX_CACHE_SIZE (64u * 1024u * 1024u)
 
 typedef enum {
     OPDUMP_LIT_NULL  = 0,
@@ -294,6 +300,20 @@ static char *r_str(FILE *f, uint32_t *out_len) {
     buf[len] = '\0';
     if (out_len) *out_len = len;
     return buf;
+}
+/* r_zstr returns NULL when the serialized "present" byte is 0. That is valid
+ * for genuinely optional strings (a parent name, a {main} function name, an
+ * arg default), but a NULL used as a hash key or a required name later
+ * dereferences inside zend_hash_* or destroy_*. r_zstr_req fails closed instead
+ * of threading a NULL into the engine. */
+static zend_string *r_zstr(FILE *f, bool intern);
+static zend_string *r_zstr_req(FILE *f, bool intern, const char *what)
+{
+    zend_string *zs = r_zstr(f, intern);
+    if (!zs) {
+        php_error_docref(NULL, E_ERROR, "opdump: missing required %s in container", what);
+    }
+    return zs;
 }
 static zend_string *r_zstr(FILE *f, bool intern)
 {
@@ -1773,12 +1793,21 @@ static bool opdump_decrypt_bytc(const unsigned char *buf, size_t len, unsigned c
 
 /* ---- dump ---- */
 
-/* Maximum constant-expression AST depth we will (de)serialize, to bound both
- * output size and load-time recursion on a hostile container. */
+/* Maximum constant-expression value nesting (arrays + ASTs, which recurse
+ * through each other) we will (de)serialize, to bound both output size and
+ * load-time stack recursion on a hostile container. A single bound is threaded
+ * through opdump_read_literal/opdump_read_array/opdump_read_ast so that
+ * alternating array/AST nesting cannot slip past it. */
 #define OPDUMP_MAX_AST_DEPTH 256
+/* A fixed (non-list) AST node's child count is inherent to its kind
+ * (kind >> ZEND_AST_NUM_CHILDREN_SHIFT); the largest in this PHP is
+ * ZEND_AST_PARAM at 6. Cap a shade above that so a crafted kind with garbage
+ * high bits cannot drive a large allocation; the exact-match check against the
+ * kind does the real validation. */
+#define OPDUMP_MAX_AST_FIXED_CHILDREN 8
 
 static void opdump_write_array(FILE *f, HashTable *ht);
-static void opdump_read_array(FILE *f, zval *zv);
+static void opdump_read_array(FILE *f, zval *zv, int depth);
 static void opdump_write_ast(FILE *f, zend_ast *ast, int depth);
 static bool opdump_strip_lines(void);
 static zend_ast *opdump_read_ast(FILE *f, int depth);
@@ -1815,7 +1844,7 @@ static void opdump_write_literal(FILE *f, zval *zv)
     }
 }
 
-static void opdump_read_literal(FILE *f, zval *zv)
+static void opdump_read_literal(FILE *f, zval *zv, int depth)
 {
     uint8_t tag = r_u8(f);
     switch (tag) {
@@ -1841,9 +1870,9 @@ static void opdump_read_literal(FILE *f, zval *zv)
             ZVAL_STR(zv, zs);
             break;
         }
-        case OPDUMP_LIT_ARRAY: opdump_read_array(f, zv); break;
+        case OPDUMP_LIT_ARRAY: opdump_read_array(f, zv, depth); break;
         case OPDUMP_LIT_AST: {
-            zend_ast *tmp = opdump_read_ast(f, 0);
+            zend_ast *tmp = opdump_read_ast(f, depth);
             if (tmp) {
                 /* zend_ast_copy consolidates the temporary tree into a single
                  * refcounted zend_ast_ref -- exactly the shape a persistent
@@ -1895,8 +1924,11 @@ static void opdump_write_array(FILE *f, HashTable *ht)
     } ZEND_HASH_FOREACH_END();
 }
 
-static void opdump_read_array(FILE *f, zval *zv)
+static void opdump_read_array(FILE *f, zval *zv, int depth)
 {
+    if (depth > OPDUMP_MAX_AST_DEPTH) {
+        php_error_docref(NULL, E_ERROR, "opdump: constant array nesting too deep");
+    }
     uint32_t n = r_u32(f);
     opdump_guard_u32(n, OPDUMP_MAX_LITERALS, "array element");
     zend_array *arr = zend_new_array(n);
@@ -1905,14 +1937,17 @@ static void opdump_read_array(FILE *f, zval *zv)
         zval tmp;
         if (is_str) {
             zend_string *k = r_zstr(f, false);
-            opdump_read_literal(f, &tmp);
+            if (!k) {
+                php_error_docref(NULL, E_ERROR, "opdump: null string key in constant array");
+            }
+            opdump_read_literal(f, &tmp, depth + 1);
             zend_hash_update(arr, k, &tmp);
             zend_string_release(k);
         } else {
             uint32_t lo = r_u32(f);
             uint32_t hi = r_u32(f);
             zend_ulong k = ((zend_ulong) hi << 32) | lo;
-            opdump_read_literal(f, &tmp);
+            opdump_read_literal(f, &tmp, depth + 1);
             zend_hash_index_update(arr, k, &tmp);
         }
     }
@@ -1972,7 +2007,7 @@ static zend_ast *opdump_read_ast(FILE *f, int depth)
         zend_ast_zval *node = (zend_ast_zval *) emalloc(sizeof(zend_ast_zval));
         node->kind = (zend_ast_kind) kind;
         node->attr = (zend_ast_attr) attr;
-        opdump_read_literal(f, &node->val);
+        opdump_read_literal(f, &node->val, depth);
         Z_LINENO(node->val) = lineno;
         return (zend_ast *) node;
     }
@@ -1994,7 +2029,18 @@ static zend_ast *opdump_read_ast(FILE *f, int depth)
 
     uint32_t lineno = r_u32(f);
     uint32_t children = r_u32(f);
-    opdump_guard_u32(children, OPDUMP_MAX_LITERALS, "AST child");
+    /* For a fixed node the child count is a property of the kind, and Zend's
+     * own AST walkers read exactly kind >> ZEND_AST_NUM_CHILDREN_SHIFT children
+     * no matter what the container claims. Allocating to a serialized count that
+     * disagrees would let those walkers read past the array, so require the two
+     * to match (and bound the kind-derived count against a crafted kind). */
+    uint32_t expected = kind >> ZEND_AST_NUM_CHILDREN_SHIFT;
+    if (expected > OPDUMP_MAX_AST_FIXED_CHILDREN) {
+        php_error_docref(NULL, E_ERROR, "opdump: AST kind %u declares %u children (max %u)", kind, expected, OPDUMP_MAX_AST_FIXED_CHILDREN);
+    }
+    if (children != expected) {
+        php_error_docref(NULL, E_ERROR, "opdump: AST child count %u does not match kind %u (expected %u)", children, kind, expected);
+    }
     zend_ast *node = (zend_ast *) emalloc(sizeof(zend_ast) + (children ? children - 1 : 0) * sizeof(zend_ast *));
     node->kind = (zend_ast_kind) kind;
     node->attr = (zend_ast_attr) attr;
@@ -2411,7 +2457,7 @@ static zend_property_info *opdump_read_property_info(FILE *f, zend_class_entry *
     zend_property_info *prop = (zend_property_info *) ecalloc(1, sizeof(zend_property_info));
     prop->offset = r_u32(f);
     prop->flags = r_u32(f);
-    prop->name = r_zstr(f, true);
+    prop->name = r_zstr_req(f, true, "property_info name");
     prop->doc_comment = r_zstr(f, true);
     prop->type = opdump_read_type(f);
     prop->ce = ce;
@@ -2573,7 +2619,7 @@ static void opdump_build_properties_info_table(zend_class_entry *ce)
 static zend_class_entry *opdump_read_class_entry(FILE *f)
 {
     zend_class_entry *ce = (zend_class_entry *) ecalloc(1, sizeof(zend_class_entry));
-    zend_string *name = r_zstr(f, true);
+    zend_string *name = r_zstr_req(f, true, "class name");
     ce->type = ZEND_USER_CLASS;
     ce->name = name;
     ce->refcount = 1;
@@ -2596,14 +2642,14 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     if (ce->default_properties_count > 0) {
         ce->default_properties_table = (zval *) ecalloc(ce->default_properties_count, sizeof(zval));
         for (int i = 0; i < ce->default_properties_count; i++) {
-            opdump_read_literal(f, &ce->default_properties_table[i]);
+            opdump_read_literal(f, &ce->default_properties_table[i], 0);
         }
     }
 
     uint32_t prop_count = r_u32(f);
     opdump_guard_u32(prop_count, OPDUMP_MAX_CLASS_PROPERTIES, "class property");
     for (uint32_t i = 0; i < prop_count; i++) {
-        zend_string *prop_key = r_zstr(f, true);
+        zend_string *prop_key = r_zstr_req(f, true, "property name");
         zend_property_info *prop = opdump_read_property_info(f, ce);
         zend_hash_add_ptr(&ce->properties_info, prop_key, prop);
         zend_string_release(prop_key);
@@ -2612,7 +2658,7 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     uint32_t method_count = r_u32(f);
     opdump_guard_u32(method_count, OPDUMP_MAX_CLASS_METHODS, "class method");
     for (uint32_t i = 0; i < method_count; i++) {
-        zend_string *key = r_zstr(f, true);
+        zend_string *key = r_zstr_req(f, true, "method name");
         zend_op_array *method = opdump_read_op_array(f);
         method->scope = ce;
         if (method->function_name && zend_string_equals_literal_ci(method->function_name, "__construct")) {
@@ -2626,11 +2672,11 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     uint32_t const_count = r_u32(f);
     opdump_guard_u32(const_count, OPDUMP_MAX_CLASS_METHODS, "class constant");
     for (uint32_t i = 0; i < const_count; i++) {
-        zend_string *cname = r_zstr(f, true);
+        zend_string *cname = r_zstr_req(f, true, "class constant name");
         uint32_t cflags = r_u32(f);
         zend_class_constant *cc = (zend_class_constant *) emalloc(sizeof(zend_class_constant));
         memset(cc, 0, sizeof(zend_class_constant));
-        opdump_read_literal(f, &cc->value);
+        opdump_read_literal(f, &cc->value, 0);
         Z_CONSTANT_FLAGS(cc->value) = cflags;
         cc->ce = ce;
         cc->type = (zend_type) ZEND_TYPE_INIT_NONE(0);
@@ -2642,7 +2688,7 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     if (ce->default_static_members_count > 0) {
         ce->default_static_members_table = (zval *) ecalloc(ce->default_static_members_count, sizeof(zval));
         for (int i = 0; i < ce->default_static_members_count; i++) {
-            opdump_read_literal(f, &ce->default_static_members_table[i]);
+            opdump_read_literal(f, &ce->default_static_members_table[i], 0);
         }
         ZEND_MAP_PTR_NEW(ce->static_members_table);
     } else {
@@ -2657,8 +2703,8 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     if (num_ifaces > 0) {
         iface_names = (zend_class_name *) emalloc(sizeof(zend_class_name) * num_ifaces);
         for (uint32_t i = 0; i < num_ifaces; i++) {
-            iface_names[i].name = r_zstr(f, true);
-            iface_names[i].lc_name = r_zstr(f, true);
+            iface_names[i].name = r_zstr_req(f, true, "interface name");
+            iface_names[i].lc_name = r_zstr_req(f, true, "interface lc_name");
         }
     }
     uint32_t num_tr = r_u32(f);
@@ -2667,8 +2713,8 @@ static zend_class_entry *opdump_read_class_entry(FILE *f)
     if (num_tr > 0) {
         tr_names = (zend_class_name *) emalloc(sizeof(zend_class_name) * num_tr);
         for (uint32_t i = 0; i < num_tr; i++) {
-            tr_names[i].name = r_zstr(f, true);
-            tr_names[i].lc_name = r_zstr(f, true);
+            tr_names[i].name = r_zstr_req(f, true, "trait name");
+            tr_names[i].lc_name = r_zstr_req(f, true, "trait lc_name");
         }
     }
 
@@ -2779,6 +2825,42 @@ static zend_op_array *opdump_dump_compile_file(zend_file_handle *file_handle, in
 
 /* ---- load ---- */
 
+/* Reject an opline whose opcode byte or operand-type bytes are not ones the
+ * Zend VM recognises, BEFORE zend_vm_set_opcode_handler() indexes its handler
+ * tables with them. An out-of-range opcode or a bogus op?_type makes that
+ * lookup walk off the specialised-handler arrays (observed as a SEGV inside
+ * zend_vm_set_opcode_handler on a fuzzed container). zend_get_opcode_name()
+ * returns NULL for any undefined opcode, which is the cheapest reliable
+ * validity oracle the engine exposes. */
+static bool opdump_valid_op_type(uint8_t t)
+{
+    switch (t) {
+        case IS_UNUSED:
+        case IS_CONST:
+        case IS_TMP_VAR:
+        case IS_VAR:
+        case IS_CV:
+            return true;
+        default:
+            return false;
+    }
+}
+
+static void opdump_guard_opline(const zend_op *op)
+{
+    if (zend_get_opcode_name(op->opcode) == NULL) {
+        php_error_docref(NULL, E_ERROR, "opdump: unknown opcode %u in container", op->opcode);
+    }
+    /* Only op1_type/op2_type feed the VM's specialised-handler selection, which
+     * indexes a decode table by the raw type byte -- a garbage value there is
+     * what walked off the table. result_type is not such an index and
+     * legitimately carries extra flag bits (e.g. 0x10 on an INSTANCEOF result),
+     * so it must NOT be range-checked here. */
+    if (!opdump_valid_op_type(op->op1_type) || !opdump_valid_op_type(op->op2_type)) {
+        php_error_docref(NULL, E_ERROR, "opdump: invalid operand type in opcode %u (op1=%u op2=%u)", op->opcode, op->op1_type, op->op2_type);
+    }
+}
+
 static zend_op_array *opdump_read_op_array(FILE *f)
 {
     uint8_t saved_type = r_u8(f);
@@ -2799,7 +2881,7 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         php_error_docref(NULL, E_ERROR, "opdump: required_num_args %u exceeds num_args %u", saved_required_num_args, saved_num_args);
     }
     opdump_guard_u32(saved_T, OPDUMP_MAX_VARS, "temporary variable");
-    opdump_guard_i32_nonnegative(saved_cache_size, UINT32_MAX, "runtime cache size");
+    opdump_guard_i32_nonnegative(saved_cache_size, OPDUMP_MAX_CACHE_SIZE, "runtime cache size");
     opdump_guard_i32_nonnegative(saved_last_var, OPDUMP_MAX_VARS, "compiled variable");
     opdump_guard_i32_nonnegative(saved_last_try_catch, OPDUMP_MAX_TRY_CATCH, "try/catch");
 #if PHP_VERSION_ID < 80200
@@ -2833,6 +2915,13 @@ static zend_op_array *opdump_read_op_array(FILE *f)
     op_array->arg_flags[1] = saved_arg_flags[1];
     op_array->arg_flags[2] = saved_arg_flags[2];
     op_array->fn_flags = saved_fn_flags;
+    /* We always lay opcodes+literals out as a single combined block, exactly as
+     * pass_two() leaves them (see the block allocation below). destroy_op_array
+     * frees that as ONE allocation only when ZEND_ACC_DONE_PASS_TWO is set;
+     * without it, it efree()s op_array->literals separately -- a bad free of an
+     * interior pointer. A container whose fn_flags has this bit cleared (fuzzed
+     * or corrupt) must not dictate that choice, so force it to match our layout. */
+    op_array->fn_flags |= ZEND_ACC_DONE_PASS_TWO;
     op_array->function_name = function_name;
     op_array->num_args = saved_num_args;
     op_array->required_num_args = saved_required_num_args;
@@ -2887,6 +2976,7 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         op->op1.num     = r_u32(f);
         op->op2.num     = r_u32(f);
         op->result.num  = r_u32(f);
+        opdump_guard_opline(op);
     }
     for (uint32_t i = 0; i < last; i++) {
         zend_vm_set_opcode_handler(&op_array->opcodes[i]);
@@ -2894,7 +2984,7 @@ static zend_op_array *opdump_read_op_array(FILE *f)
 
     op_array->last_literal = last_literal;
     for (int i = 0; i < last_literal; i++) {
-        opdump_read_literal(f, &op_array->literals[i]);
+        opdump_read_literal(f, &op_array->literals[i], 0);
     }
 
     if (op_array->last_try_catch > 0) {
@@ -2912,10 +3002,26 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         op_array->vars = (zend_string **) ecalloc(op_array->last_var, sizeof(zend_string *));
         for (int i = 0; i < op_array->last_var; i++) {
             op_array->vars[i] = r_zstr(f, true);
+            /* A CV name is never legitimately null. Leaving a NULL here crashes
+             * destroy_op_array, which releases every vars[] entry unconditionally. */
+            if (!op_array->vars[i]) {
+                php_error_docref(NULL, E_ERROR, "opdump: null compiled-variable name at index %d", i);
+            }
         }
     }
 
     if (op_array->num_args > 0 || (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE)) {
+        /* arg_info memory-safety invariant: Zend stores the return-type info in
+         * a slot BEFORE arg_info[0], and destroy_op_array recovers the real
+         * allocation base by subtracting one iff ZEND_ACC_HAS_RETURN_TYPE, then
+         * frees num_args (+1 for the return slot) entries. So the allocation
+         * here MUST be exactly (num_args + return_slots) with arg_info pointing
+         * return_slots past the base, and return_slots MUST be derived from the
+         * same flag destroy reads -- otherwise destroy frees from the wrong base
+         * or walks off the end. The variadic parameter is already counted in
+         * num_args (no extra slot), verified under ASan. num_args is bounded by
+         * OPDUMP_MAX_ARGS above, so the ecalloc count cannot overflow. Keep this
+         * symmetric with opdump_write_op_array and with destroy_op_array. */
         uint32_t return_slots = (op_array->fn_flags & ZEND_ACC_HAS_RETURN_TYPE) ? 1 : 0;
         zend_arg_info *arg_info_base = (zend_arg_info *) ecalloc(op_array->num_args + return_slots, sizeof(zend_arg_info));
         op_array->arg_info = arg_info_base + return_slots;
@@ -2947,8 +3053,11 @@ static zend_op_array *opdump_read_op_array(FILE *f)
         zend_hash_init(statics, static_var_count, NULL, ZVAL_PTR_DTOR, 0);
         for (uint32_t i = 0; i < static_var_count; i++) {
             zend_string *sv_key = r_zstr(f, false);
+            if (!sv_key) {
+                php_error_docref(NULL, E_ERROR, "opdump: null static-variable name");
+            }
             zval sv_val;
-            opdump_read_literal(f, &sv_val);
+            opdump_read_literal(f, &sv_val, 0);
             zend_hash_update(statics, sv_key, &sv_val);
             zend_string_release(sv_key);
         }
@@ -3178,7 +3287,21 @@ static zend_op_array *opdump_auto_compile_file(zend_file_handle *file_handle, in
         if (getenv("OPDUMP_DEBUG")) {
             fprintf(stderr, "[opdump debug] auto-load %s\n", path);
         }
-        return opdump_read(path);
+        zend_op_array *op_array = opdump_read(path);
+        /* Fuzz harness hook: exercise the deserializer's PARSE + TEARDOWN
+         * memory safety in isolation, without executing the reconstructed
+         * bytecode. Executing a semantically-malformed (but structurally
+         * well-formed) op_array is unsafe by design -- the same trust model as
+         * OPcache loading its cache file -- so it is out of scope for parser
+         * fuzzing. We mirror the engine's own post-execution teardown
+         * (destroy_op_array + efree) and report a compile failure (NULL) so
+         * nothing runs. Never enabled in normal loads. */
+        if (op_array && getenv("OPDUMP_FUZZ_PARSE_ONLY")) {
+            destroy_op_array(op_array);
+            efree(op_array);
+            return NULL;
+        }
+        return op_array;
     }
     return opdump_orig_compile_file(file_handle, type);
 }
