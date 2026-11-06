@@ -1,0 +1,29 @@
+[package]
+name = "bytecode-tools"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+description = "Rust implementations of the Bytecode standalone crypto/format CLIs (verify, pack, keygen, ...). Byte-compatible with the PHP tools in php/bin."
+license = "SEE ../LICENSE"
+publish = false
+
+# One library shared by every tool binary, plus one binary per tool.
+# Binaries are auto-discovered from src/bin/*.rs.
+[lib]
+name = "bytecode_tools"
+path = "src/lib.rs"
+
+[dependencies]
+sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+aes-gcm = "0.10"
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+getrandom = "0.2"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

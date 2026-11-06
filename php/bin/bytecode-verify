@@ -1,6 +1,52 @@
 #!/usr/bin/env php
 <?php
 
+// --- Rust-first dispatch -------------------------------------------------
+// If a compiled Rust `bytecode-verify` is available, hand off to it (it is a
+// byte-compatible reimplementation). Otherwise fall through to the PHP
+// implementation below. Set BYTECODE_NO_RUST=1 to force the PHP path.
+(static function (): void {
+    if (getenv('BYTECODE_NO_RUST') || PHP_SAPI !== 'cli' || !function_exists('proc_open')) {
+        return;
+    }
+    $root = getenv('BYTECODE_ROOT') ?: dirname(__DIR__, 2);
+    $candidates = [];
+    if ($explicit = getenv('BYTECODE_VERIFY_RS')) {
+        $candidates[] = $explicit;
+    }
+    $candidates[] = $root . '/rust/target/release/bytecode-verify';
+    $candidates[] = __DIR__ . '/bytecode-verify-rs';
+    $bin = null;
+    foreach ($candidates as $cand) {
+        if ($cand !== '' && is_file($cand) && is_executable($cand)) {
+            $bin = $cand;
+            break;
+        }
+    }
+    if ($bin === null) {
+        return;
+    }
+    // Hand the Rust tool the authoritative context the PHP version would use:
+    // the running interpreter's PHP_VERSION_ID (the container check pins to it)
+    // and the repo root (default vendor-key / pubkey resolution).
+    putenv('BYTECODE_PHP_VERSION_ID=' . PHP_VERSION_ID);
+    if (getenv('BYTECODE_ROOT') === false) {
+        putenv('BYTECODE_ROOT=' . dirname(__DIR__, 2));
+    }
+    global $argv;
+    $forward = array_slice($argv, 1);
+    $proc = @proc_open(
+        array_merge([$bin], $forward),
+        [0 => STDIN, 1 => STDOUT, 2 => STDERR],
+        $pipes
+    );
+    if (!is_resource($proc)) {
+        return; // could not launch -> fall back to PHP
+    }
+    exit(proc_close($proc));
+})();
+// --- end Rust-first dispatch ---------------------------------------------
+
 function fail(string $message, int $code = 1): never
 {
     fwrite(STDERR, $message . PHP_EOL);

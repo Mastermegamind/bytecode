@@ -3,6 +3,43 @@
 
 declare(strict_types=1);
 
+// --- Rust-first dispatch -------------------------------------------------
+// If a compiled Rust `bytecode-license-keygen` is available, hand off to it (it
+// is a byte-compatible reimplementation). Set BYTECODE_NO_RUST=1 to force PHP.
+(static function (): void {
+    if (getenv('BYTECODE_NO_RUST') || PHP_SAPI !== 'cli' || !function_exists('proc_open')) {
+        return;
+    }
+    $root = getenv('BYTECODE_ROOT') ?: dirname(__DIR__, 2);
+    $candidates = [];
+    if ($explicit = getenv('BYTECODE_LICENSE_KEYGEN_RS')) {
+        $candidates[] = $explicit;
+    }
+    $candidates[] = $root . '/rust/target/release/bytecode-license-keygen';
+    $candidates[] = __DIR__ . '/bytecode-license-keygen-rs';
+    $bin = null;
+    foreach ($candidates as $cand) {
+        if ($cand !== '' && is_file($cand) && is_executable($cand)) {
+            $bin = $cand;
+            break;
+        }
+    }
+    if ($bin === null) {
+        return;
+    }
+    global $argv;
+    $proc = @proc_open(
+        array_merge([$bin], array_slice($argv, 1)),
+        [0 => STDIN, 1 => STDOUT, 2 => STDERR],
+        $pipes
+    );
+    if (!is_resource($proc)) {
+        return; // could not launch -> fall back to PHP
+    }
+    exit(proc_close($proc));
+})();
+// --- end Rust-first dispatch ---------------------------------------------
+
 function fail(string $message, int $code = 1): never
 {
     fwrite(STDERR, $message . PHP_EOL);
