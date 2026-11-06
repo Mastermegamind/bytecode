@@ -1,0 +1,19 @@
+{
+    "format": "bytecode-obfuscate-v1",
+    "tool_version": "v0.0.1phase2",
+    "created_at": "2026-11-06T06:28:13+00:00",
+    "source_root": "/var/www/bytecode/examples",
+    "output_root": "/var/www/bytecode/out-obfuscated",
+    "files": [
+        {
+            "source": "demo.php",
+            "output": "demo.php",
+            "kind": "php",
+            "functions_obfuscated": 2,
+            "functions_skipped": 3,
+            "variables_renamed": 3,
+            "sha256": "9494aeb770b957712382f79d1616aeaa694dd954e3299d77a9122992f33e8ccb",
+            "size": 2382
+        }
+    ]
+}

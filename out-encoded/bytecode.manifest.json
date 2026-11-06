@@ -1,0 +1,44 @@
+{
+    "format": "bytecode-manifest-v1",
+    "tool_version": "v0.0.1phase2",
+    "created_at": "2026-11-06T06:28:13+00:00",
+    "build_id": "8e502a336a50028c",
+    "php_version_id": 80427,
+    "backend": "php-zend-opdump",
+    "container": "BYTC2",
+    "container_version": 2,
+    "protection_mode": "shared-key",
+    "metadata": {
+        "app_id": "examples",
+        "profile": null,
+        "include_assets": false,
+        "workflow": "encode-only",
+        "bytecode_obfuscate": false,
+        "paths_stripped": false,
+        "virtual_root": null,
+        "license_id": null,
+        "customer_id": null,
+        "features": null,
+        "watermark": null,
+        "revocation_url": null,
+        "activation_url": null,
+        "unlock_policy": null,
+        "vendor_key_file": null
+    },
+    "source_root": "/var/www/bytecode/examples",
+    "source_roots": [
+        "/var/www/bytecode/examples/demo.php"
+    ],
+    "map": "bytecode.map",
+    "files": [
+        {
+            "source": "demo.php",
+            "output": "demo.php",
+            "php_version_id": 80427,
+            "backend": "php-zend-opdump",
+            "container": "BYTC2",
+            "sha256": "aa5cf00ae4bc8b7c321a6dfaaea3d0340259bd657b1880cf0a33adc30b416589",
+            "size": 4652
+        }
+    ]
+}

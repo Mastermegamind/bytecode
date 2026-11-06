@@ -14,9 +14,9 @@ Usage:
 
 Conservatively obfuscates PHP source while preserving OOP/PSR/MVC/PDO-facing
 symbols. It renames non-parameter local variables inside safe function/method
-bodies only. Classes, namespaces, methods, functions, properties, constants,
-parameters, superglobals, globals, and dynamic-variable-sensitive bodies are
-left intact.
+bodies only, to random per-build names. Classes, namespaces, methods, functions,
+properties, constants, parameters, superglobals, globals, and
+dynamic-variable-sensitive bodies are left intact.
 
 Options:
   --include-assets         Copy .html/.htm/.css/.js/.mjs/.twig/.blade.php too.
@@ -24,6 +24,11 @@ Options:
   --out <dir>, -o <dir>    Output directory. Alternative to final positional argument.
   --report-json            Print JSON summary.
   -h, --help               Show this help.
+
+Environment:
+  BYTECODE_OBFUSCATE_SEED    Reproducible scrambled names (same seed, same
+                             layout). Omit for fresh random names each build.
+  BYTECODE_OBFUSCATE_LENGTH  Scrambled-name length, 4..24 (default 8).
 
 USAGE);
 }
@@ -244,6 +249,64 @@ function collect_header_variables(array $tokens, int $start, int $bodyOpen): arr
     return $preserve;
 }
 
+/** Scrambled-name length (BYTECODE_OBFUSCATE_LENGTH, 4..24, default 8). */
+function obf_name_length(): int
+{
+    static $len = null;
+    if ($len === null) {
+        $env = getenv('BYTECODE_OBFUSCATE_LENGTH');
+        $len = ($env !== false && ctype_digit((string) $env)) ? max(4, min(24, (int) $env)) : 8;
+    }
+    return $len;
+}
+
+/**
+ * Seed the RNG once per run. BYTECODE_OBFUSCATE_SEED gives reproducible names
+ * (a vendor can regenerate the same layout); otherwise names are fresh random
+ * each build. The names only need to be unpredictable and unique -- the actual
+ * protection is the encrypted bytecode, so mt_rand is sufficient here.
+ */
+function obf_seed_init(): void
+{
+    static $done = false;
+    if ($done) {
+        return;
+    }
+    $done = true;
+    $seed = getenv('BYTECODE_OBFUSCATE_SEED');
+    if ($seed !== false && $seed !== '') {
+        mt_srand(crc32($seed));
+    } else {
+        mt_srand((int) (hrtime(true) & 0x7fffffff));
+    }
+}
+
+function obf_random_ident(int $length): string
+{
+    $first = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_';
+    $rest = $first . '0123456789';
+    $s = $first[mt_rand(0, strlen($first) - 1)];
+    for ($i = 1; $i < $length; $i++) {
+        $s .= $rest[mt_rand(0, strlen($rest) - 1)];
+    }
+    return $s;
+}
+
+/** A fresh scrambled variable name that collides with nothing in this body. */
+function obf_unique_name(array $preserve, array $map): string
+{
+    $len = obf_name_length();
+    for ($attempt = 1; ; $attempt++) {
+        $cand = '$' . obf_random_ident($len);
+        if (!isset($preserve[$cand]) && !is_ignored_variable($cand) && !in_array($cand, $map, true)) {
+            return $cand;
+        }
+        if ($attempt % 16 === 0 && $len < 24) {
+            $len++;
+        }
+    }
+}
+
 function obfuscate_function_body(array &$tokens, int $bodyOpen, int $bodyClose, array $preserve): int
 {
     if (function_body_has_hazard($tokens, $bodyOpen + 1, $bodyClose - 1)) {
@@ -265,7 +328,9 @@ function obfuscate_function_body(array &$tokens, int $bodyOpen, int $bodyClose, 
             continue;
         }
         if (!isset($map[$name])) {
-            $map[$name] = '$_v' . count($map);
+            // Random, per-build name (collision-checked) instead of the old
+            // predictable $_v0/$_v1 sequence. See obf_unique_name().
+            $map[$name] = obf_unique_name($preserve, $map);
             $renamed++;
         }
         $tokens[$i][1] = $map[$name];
@@ -275,6 +340,7 @@ function obfuscate_function_body(array &$tokens, int $bodyOpen, int $bodyClose, 
 
 function obfuscate_php_source(string $source, array &$stats): string
 {
+    obf_seed_init();
     $tokens = token_get_all($source);
     $renamedVariables = 0;
     $processedFunctions = 0;
